@@ -25,9 +25,9 @@ revtty should not implement its own SSH, TLS, SFTP, terminal emulator, SQLite la
 
 ## Rust / runtime
 
-### Rust 1.89+ — selected
+### Rust 1.95+ — selected
 
-The current `russh 0.63.3` release declares Rust 1.89 as its MSRV, so revtty's minimum Rust version is 1.89.
+revtty uses Rust 1.95+ so the v1 dependency set can use the current `rusqlite_migration 2.6.x` release alongside Russh and Tokio without pinning an older migration stack.
 
 ### Tokio 1.x — selected
 
