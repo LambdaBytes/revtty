@@ -62,6 +62,8 @@ revtty agent run --name demo
 revtty probe demo
 ```
 
+CI now validates the reverse rendezvous, portable PTY support on Linux/macOS, and an Ed25519-authenticated SSH handshake carried through the WebSocket relay. The public `probe` command remains the deliberately harmless way to validate the same outbound architecture across a real NAT boundary.
+
 See [docs/PROTOTYPE.md](docs/PROTOTYPE.md) for the exact local and real-NAT validation procedure. The development token is temporary and is **not** the v1 security model.
 
 ## Development
