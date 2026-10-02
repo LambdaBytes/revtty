@@ -623,7 +623,10 @@ mod tests {
             .await
             .expect("authenticate operator key through relay");
 
-        assert!(auth.success(), "Ed25519 SSH auth through relay should succeed");
+        assert!(
+            auth.success(),
+            "Ed25519 SSH auth through relay should succeed"
+        );
 
         drop(session);
         client_bridge.abort();
