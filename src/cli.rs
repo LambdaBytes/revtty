@@ -145,13 +145,8 @@ mod tests {
 
     #[test]
     fn parses_relay_serve() {
-        let args = Args::try_parse_from([
-            "revtty",
-            "relay",
-            "serve",
-            "--token",
-            "development-token",
-        ]);
+        let args =
+            Args::try_parse_from(["revtty", "relay", "serve", "--token", "development-token"]);
         assert!(args.is_ok());
     }
 }
