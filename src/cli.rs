@@ -1,13 +1,13 @@
 use clap::{Parser, Subcommand};
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "revtty", version, about)]
 pub struct Args {
     #[command(subcommand)]
     pub command: Command,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum Command {
     /// Initialize local operator state.
     Init,
@@ -19,6 +19,20 @@ pub enum Command {
     Status {
         /// Machine name or stable identifier.
         target: String,
+    },
+
+    /// Validate reverse connectivity to an online agent.
+    Probe {
+        /// Machine name.
+        target: String,
+
+        /// Relay base URL. http(s) is converted to ws(s).
+        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
+        relay: String,
+
+        /// Development-only shared token for the transport proof.
+        #[arg(long, env = "REVTTY_DEV_TOKEN")]
+        token: String,
     },
 
     /// Open an interactive remote terminal.
@@ -43,7 +57,7 @@ pub enum Command {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum AgentCommand {
     /// Enroll this machine with a relay.
     Enroll {
@@ -56,8 +70,20 @@ pub enum AgentCommand {
         token: String,
     },
 
-    /// Run the long-lived agent process.
-    Run,
+    /// Run the long-lived transport-proof agent.
+    Run {
+        /// Relay base URL. http(s) is converted to ws(s).
+        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
+        relay: String,
+
+        /// Stable development machine name.
+        #[arg(long)]
+        name: String,
+
+        /// Development-only shared token for the transport proof.
+        #[arg(long, env = "REVTTY_DEV_TOKEN")]
+        token: String,
+    },
 
     /// Show local agent status.
     Status,
@@ -66,13 +92,21 @@ pub enum AgentCommand {
     Doctor,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum RelayCommand {
     /// Initialize relay state.
     Init,
 
-    /// Serve the relay API and WebSocket endpoints.
-    Serve,
+    /// Serve the transport-proof relay.
+    Serve {
+        /// Bind address. Keep loopback when terminating TLS with Caddy.
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: String,
+
+        /// Development-only shared token for the transport proof.
+        #[arg(long, env = "REVTTY_DEV_TOKEN")]
+        token: String,
+    },
 
     /// Run relay-specific diagnostics.
     Doctor,
@@ -84,21 +118,39 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn parses_connect_target() {
-        let args = Args::try_parse_from(["revtty", "connect", "store-042"]);
+    fn parses_probe_target() {
+        let args = Args::try_parse_from([
+            "revtty",
+            "probe",
+            "store-042",
+            "--token",
+            "development-token",
+        ]);
         assert!(args.is_ok());
     }
 
     #[test]
-    fn parses_agent_enroll() {
+    fn parses_agent_run() {
         let args = Args::try_parse_from([
             "revtty",
             "agent",
-            "enroll",
-            "--relay",
-            "https://relay.example.com",
+            "run",
+            "--name",
+            "store-042",
             "--token",
-            "token",
+            "development-token",
+        ]);
+        assert!(args.is_ok());
+    }
+
+    #[test]
+    fn parses_relay_serve() {
+        let args = Args::try_parse_from([
+            "revtty",
+            "relay",
+            "serve",
+            "--token",
+            "development-token",
         ]);
         assert!(args.is_ok());
     }
