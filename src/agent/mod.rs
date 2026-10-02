@@ -1,4 +1,7 @@
+use std::io::Read;
 use std::time::Duration;
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::Message;
@@ -171,6 +174,56 @@ async fn send_probe(
         .close(reqwest_websocket::CloseCode::Normal, None)
         .await
         .map_err(|error| RevttyError::runtime("close probe session", error))
+}
+
+pub fn pty_test() -> Result<(), RevttyError> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| RevttyError::runtime("open local PTY", error))?;
+
+    let mut command = CommandBuilder::new("/bin/sh");
+    command.args(["-c", "printf 'revtty-pty-ok\\n'"]);
+
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| RevttyError::runtime("spawn PTY smoke command", error))?;
+    drop(pair.slave);
+
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| RevttyError::runtime("take PTY writer", error))?;
+    drop(writer);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| RevttyError::runtime("clone PTY reader", error))?;
+
+    let mut output = String::new();
+    reader
+        .read_to_string(&mut output)
+        .map_err(|error| RevttyError::runtime("read PTY output", error))?;
+
+    let status = child
+        .wait()
+        .map_err(|error| RevttyError::runtime("wait for PTY smoke command", error))?;
+
+    if !status.success() || !output.contains("revtty-pty-ok") {
+        return Err(RevttyError::message("local PTY smoke test failed"));
+    }
+
+    println!("pty      ok");
+    println!("os       {}", std::env::consts::OS);
+    println!("arch     {}", std::env::consts::ARCH);
+    Ok(())
 }
 
 pub fn status() -> Result<(), RevttyError> {
