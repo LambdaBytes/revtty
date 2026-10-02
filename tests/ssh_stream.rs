@@ -1,11 +1,11 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use russh::Preferred;
 use russh::client;
 use russh::keys::key::{PrivateKeyWithHashAlg, safe_rng};
 use russh::keys::{Algorithm, PrivateKey, PublicKey, PublicKeyOrCertificate};
 use russh::server;
-use russh::Preferred;
 
 struct TestServer {
     authorized_client: PublicKey,
