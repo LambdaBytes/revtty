@@ -45,6 +45,25 @@ revtty connect store-042
 
 See [docs/BRIEF.md](docs/BRIEF.md) for the architecture, [docs/V1_SCOPE.md](docs/V1_SCOPE.md) for the approved v1 scope, [docs/STACK.md](docs/STACK.md) for the vetted build-vs-reuse technology choices, and [docs/ROADMAP.md](docs/ROADMAP.md) for delivery order and v2.
 
+## Current proof
+
+The first implemented slice validates outbound reverse connectivity without exposing a remote shell yet:
+
+```bash
+export REVTTY_DEV_TOKEN='replace-with-a-long-random-value'
+
+# public/local relay
+revtty relay serve
+
+# target machine
+revtty agent run --name demo
+
+# operator
+revtty probe demo
+```
+
+See [docs/PROTOTYPE.md](docs/PROTOTYPE.md) for the exact local and real-NAT validation procedure. The development token is temporary and is **not** the v1 security model.
+
 ## Development
 
 The repository currently contains a compileable scaffold only.
