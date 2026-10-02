@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::Message;
 
 use crate::error::RevttyError;
-use crate::protocol::{ControlMessage, ProbeResult, CONTROL_PROTOCOL_VERSION};
+use crate::protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage, ProbeResult};
 use crate::transport::{connect_websocket, valid_name};
 
 pub async fn enroll(_relay: &str, _token: &str) -> Result<(), RevttyError> {
