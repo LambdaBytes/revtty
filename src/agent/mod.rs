@@ -14,6 +14,9 @@ pub fn status() -> Result<(), RevttyError> {
 
 pub fn doctor() -> Result<(), RevttyError> {
     println!("agent scaffold: ok");
-    println!("control protocol v{}", crate::protocol::CONTROL_PROTOCOL_VERSION);
+    println!(
+        "control protocol v{}",
+        crate::protocol::CONTROL_PROTOCOL_VERSION
+    );
     Ok(())
 }
