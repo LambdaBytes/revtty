@@ -8,11 +8,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-v2-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   rust:
+    timeout-minutes: 10
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
