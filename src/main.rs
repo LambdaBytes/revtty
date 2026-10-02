@@ -4,6 +4,7 @@ mod cli;
 mod client;
 mod config;
 mod error;
+mod identity;
 mod protocol;
 mod relay;
 mod transport;
