@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -97,18 +99,51 @@ pub enum AgentCommand {
 
 #[derive(Subcommand)]
 pub enum RelayCommand {
-    /// Initialize relay state.
-    Init,
+    /// Initialize or migrate the relay SQLite database.
+    Init {
+        /// Relay SQLite database path.
+        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
+        db: PathBuf,
+    },
 
-    /// Serve the transport-proof relay.
+    /// Create a single-use enrollment token from the relay host.
+    Enroll {
+        /// Stable agent name reserved by this enrollment.
+        name: String,
+
+        /// Operator Ed25519 public key file authorized on the new agent.
+        #[arg(long)]
+        operator_key: PathBuf,
+
+        /// Enrollment lifetime in seconds.
+        #[arg(long, default_value_t = 600)]
+        ttl: u64,
+
+        /// Relay SQLite database path.
+        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
+        db: PathBuf,
+    },
+
+    /// List agents persisted by the relay.
+    Agents {
+        /// Relay SQLite database path.
+        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
+        db: PathBuf,
+    },
+
+    /// Serve the relay.
     Serve {
         /// Bind address. Keep loopback when terminating TLS with Caddy.
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
 
-        /// Development-only shared token for the transport proof.
+        /// Development-only shared token for the /v0 transport proof.
         #[arg(long, env = "REVTTY_DEV_TOKEN")]
         token: String,
+
+        /// Relay SQLite database path used by /v1 endpoints.
+        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
+        db: PathBuf,
     },
 
     /// Run relay-specific diagnostics.
@@ -142,6 +177,19 @@ mod tests {
             "store-042",
             "--token",
             "development-token",
+        ]);
+        assert!(args.is_ok());
+    }
+
+    #[test]
+    fn parses_relay_enroll() {
+        let args = Args::try_parse_from([
+            "revtty",
+            "relay",
+            "enroll",
+            "store-042",
+            "--operator-key",
+            "operator.pub",
         ]);
         assert!(args.is_ok());
     }
