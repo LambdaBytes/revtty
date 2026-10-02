@@ -11,9 +11,16 @@ keywords = ["ssh", "terminal", "remote", "nat", "sysadmin"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+reqwest = "0.13"
+reqwest-websocket = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 strip = true
