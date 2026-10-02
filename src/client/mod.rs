@@ -7,7 +7,17 @@ use crate::protocol::ProbeResult;
 use crate::transport::{connect_websocket, valid_name};
 
 pub fn init() -> Result<(), RevttyError> {
-    Err(RevttyError::NotImplemented("operator initialization"))
+    let paths = Paths::discover()?;
+    let identity = crate::identity::ensure_operator(&paths)?;
+
+    println!(
+        "identity {}",
+        if identity.created { "created" } else { "existing" }
+    );
+    println!("fingerprint {}", identity.fingerprint);
+    println!("private {}", identity.private_key_path.display());
+    println!("public  {}", identity.public_key_path.display());
+    Ok(())
 }
 
 pub fn list() -> Result<(), RevttyError> {
@@ -58,7 +68,7 @@ pub async fn connect(_target: &str) -> Result<(), RevttyError> {
 }
 
 pub fn doctor() -> Result<(), RevttyError> {
-    let paths = Paths::new("~/.config/revtty", "~/.local/share/revtty");
+    let paths = Paths::discover()?;
     println!("revtty {}", env!("CARGO_PKG_VERSION"));
     println!(
         "control protocol v{}",
