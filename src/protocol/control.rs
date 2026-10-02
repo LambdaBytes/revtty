@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
     Hello {
