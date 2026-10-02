@@ -147,7 +147,86 @@ fn router(state: RelayState) -> Router {
         .route("/v0/agent/{name}", get(agent_upgrade))
         .route("/v0/probe/{name}", get(probe_upgrade))
         .route("/v0/session/{session_id}", get(session_upgrade))
+        .route("/v1/enroll", post(enroll_agent))
+        .route("/v1/agent/{name}", get(persistent_agent_upgrade))
         .with_state(state)
+}
+
+async fn enroll_agent(
+    State(state): State<RelayState>,
+    Json(request): Json<EnrollRequest>,
+) -> Response {
+    let host_key = match PublicKey::from_openssh(&request.host_key) {
+        Ok(key) if key.algorithm() == Algorithm::Ed25519 => key,
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "v1 enrollment requires an Ed25519 host key",
+            )
+                .into_response();
+        }
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid SSH host key").into_response(),
+    };
+
+    let host_key = match host_key.to_openssh() {
+        Ok(key) => key,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    match state
+        .store
+        .consume_enrollment(&request.token, &host_key, Some(&request.version))
+        .await
+    {
+        Ok(credential) => (
+            StatusCode::CREATED,
+            Json(EnrollResponse {
+                agent_id: credential.id,
+                name: credential.name,
+                control_token: credential.control_token.expose().to_owned(),
+                operator_key: credential.operator_key,
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            eprintln!("enrollment rejected: {error}");
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+    }
+}
+
+async fn persistent_agent_upgrade(
+    State(state): State<RelayState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !valid_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
+    }
+
+    let Some(token) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    match state.store.authenticate_agent(&name, token).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            eprintln!("agent authentication failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    if let Err(error) = state.store.mark_seen(&name, None).await {
+        eprintln!("failed to update agent presence: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    ws.max_message_size(MAX_MESSAGE_SIZE)
+        .max_frame_size(MAX_MESSAGE_SIZE)
+        .on_upgrade(move |socket| handle_agent(socket, state, name))
+        .into_response()
 }
 
 async fn agent_upgrade(
@@ -249,6 +328,31 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
             }
             message = receiver.next() => {
                 match message {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(control) = serde_json::from_str::<ControlMessage>(&text) {
+                            match control {
+                                ControlMessage::Hello {
+                                    version,
+                                    name: hello_name,
+                                    agent_version,
+                                } if version == CONTROL_PROTOCOL_VERSION && hello_name == name => {
+                                    if let Err(error) =
+                                        state.store.mark_seen(&name, Some(&agent_version)).await
+                                    {
+                                        eprintln!("failed to persist agent hello: {error}");
+                                    }
+                                }
+                                ControlMessage::Heartbeat { version }
+                                    if version == CONTROL_PROTOCOL_VERSION =>
+                                {
+                                    if let Err(error) = state.store.mark_seen(&name, None).await {
+                                        eprintln!("failed to persist agent heartbeat: {error}");
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     Some(Ok(_)) => {}
                 }
@@ -340,12 +444,21 @@ async fn bridge_websockets(left: WebSocket, right: WebSocket) {
     }
 }
 
-fn authorized(headers: &HeaderMap, token: &str) -> bool {
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|candidate| candidate == token)
+}
+
+fn authorized(headers: &HeaderMap, token: &str) -> bool {
+    bearer_token(headers).is_some_and(|candidate| candidate == token)
+}
+
+fn public_key_fingerprint(encoded: &str) -> Result<String, RevttyError> {
+    let key = PublicKey::from_openssh(encoded)
+        .map_err(|error| RevttyError::runtime("parse persisted SSH public key", error))?;
+    Ok(key.fingerprint(HashAlg::Sha256).to_string())
 }
 
 pub fn doctor() -> Result<(), RevttyError> {
