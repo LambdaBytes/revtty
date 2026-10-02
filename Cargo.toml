@@ -18,7 +18,7 @@ directories = "6"
 futures-util = "0.3"
 getrandom = "0.4"
 portable-pty = "0.9"
-reqwest = "0.13"
+reqwest = { version = "0.13", features = ["json"] }
 reqwest-websocket = "0.6"
 rusqlite_migration = "2.6"
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +29,7 @@ ssh-key = { version = "0.6.7", default-features = false, features = ["ed25519", 
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rusqlite = { version = "0.8", features = ["bundled"] }
+toml = "1.1"
 uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
