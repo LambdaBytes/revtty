@@ -168,7 +168,7 @@ async fn send_probe(
         .map_err(|error| RevttyError::runtime("send probe result", error))?;
 
     websocket
-        .close()
+        .close(reqwest_websocket::CloseCode::Normal, None)
         .await
         .map_err(|error| RevttyError::runtime("close probe session", error))
 }
