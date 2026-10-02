@@ -3,7 +3,6 @@ use reqwest_websocket::Message;
 
 use crate::config::Paths;
 use crate::error::RevttyError;
-use crate::identity;
 use crate::protocol::ProbeResult;
 use crate::transport::{connect_websocket, valid_name};
 
