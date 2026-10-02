@@ -238,3 +238,13 @@ pub fn doctor() -> Result<(), RevttyError> {
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::pty_test;
+
+    #[test]
+    fn portable_pty_smoke_test() {
+        pty_test().expect("portable PTY smoke test");
+    }
+}
