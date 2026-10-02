@@ -1,383 +1,228 @@
-# revtty — Candidate v1 / v2 Scope
+# revtty Roadmap
 
-This is a **decision document**, not a promise. Items are grouped so the v1 boundary can be chosen deliberately before implementation expands.
+The v1 feature boundary is approved and frozen in [V1_SCOPE.md](V1_SCOPE.md).
 
-The product invariant is unchanged:
+The vetted implementation stack is documented in [STACK.md](STACK.md).
 
-> Secure remote terminal access to known machines behind NAT, with no inbound ports on the target.
+This file tracks delivery order and the v2+ backlog. It is not a second definition of v1 scope.
 
----
+## v1 delivery plan
 
-## v1 candidates
+### M0 — Scaffold
 
-### Product core
+- repository structure;
+- strict CI;
+- architecture/security/protocol docs;
+- vetted dependency strategy;
+- Linux + macOS build validation;
+- command surface.
 
-- One Rust repository and one `revtty` binary.
-- Linux-first target support.
-- Linux x86_64 release artifact.
-- Linux aarch64 release artifact.
-- Human-readable stable machine names.
-- `revtty init`.
-- `revtty list`.
-- `revtty status <target>`.
-- `revtty connect <target>`.
-- `revtty doctor`.
-- `revtty agent enroll`.
-- `revtty agent run`.
-- `revtty agent status`.
-- `revtty agent doctor`.
-- `revtty relay init`.
-- `revtty relay serve`.
-- `revtty relay doctor`.
+### M1 — First Shell / Linux
 
-### Agent lifecycle
+- relay HTTP/WSS skeleton;
+- SQLite schema and migrations;
+- enrollment;
+- operator identity;
+- agent identity;
+- persistent WSS control channel;
+- presence and heartbeats;
+- session rendezvous;
+- SSH over paired WSS tunnels;
+- Linux PTY;
+- systemd service;
+- reconnect/backoff;
+- `list`, `status`, `connect`;
+- baseline doctor commands;
+- core fault/E2E tests.
 
-- Persistent outbound control connection only.
-- WSS over TCP/443 as the initial control transport.
-- No required inbound listener.
-- Heartbeats.
-- Online/offline state.
-- Last-seen timestamp.
-- Agent version reporting.
-- Automatic reconnect.
-- Bounded exponential reconnect backoff with jitter.
-- Graceful shutdown.
-- systemd service.
-- Start on boot.
-- Restart on crash.
-- systemd readiness notification.
-- systemd watchdog support.
-- journald-compatible logging.
-- Explicit configurable shell account.
-- Clean child/PTY teardown after disconnect.
+### M2 — macOS parity
 
-### Enrollment and identities
+- macOS operator CLI;
+- macOS agent;
+- shared portable PTY boundary;
+- launchd service;
+- platform-correct paths;
+- Apple Silicon build;
+- Intel build;
+- PTY/session E2E tests on macOS.
 
-- Single-use enrollment tokens.
-- Enrollment token expiration.
-- Cryptographically random enrollment tokens.
-- Persistent Ed25519 agent SSH host key.
-- Dedicated Ed25519 operator identity by default.
-- Option to import/use a chosen existing operator key if explicitly requested.
-- SSH public-key authentication only.
-- No password authentication.
-- Agent host-key pinning.
-- Hard failure on host-key mismatch.
-- First operator authorization installed during enrollment.
-- Agent control-plane credential distinct from SSH credentials.
-- Store only hashes of high-entropy relay bearer credentials where practical.
-- Secret files created with restrictive permissions.
-- No credentials in URL query strings.
-- No secrets in normal logs/debug representations.
+### M3 — Access management and automation
 
-### Session lifecycle
+- multiple authorized operators;
+- operator list/add/revoke;
+- SSHSIG-based operator control-plane authentication;
+- operator key rotation;
+- agent credential rotation;
+- `revtty exec`;
+- machine-readable status/exec output where useful;
+- audit metadata.
 
-- Session creation API.
-- Versioned control protocol.
-- `hello`.
-- `heartbeat`.
-- `session_offer`.
-- `session_accept`.
-- `session_reject`.
-- `session_cancel`.
-- Separate ephemeral data tunnel from persistent control channel.
-- WSS data tunnel over TCP/443.
-- Different one-time credentials for operator and agent tunnel sides.
-- Short session-token TTL.
-- One-time session-token use.
-- Pair each tunnel side exactly once.
-- Connection timeout.
-- Agent acceptance timeout.
-- Idle/handshake timeout.
-- Explicit session state machine.
-- Deterministic cleanup on failure.
-- Configurable maximum concurrent sessions per agent.
-- Relay restart may terminate active sessions; agents reconnect automatically.
+### M4 — SSH capabilities
 
-### Terminal / SSH
+- SFTP integration;
+- `revtty cp` upload/download;
+- transfer progress/cancellation;
+- local SSH forwarding;
+- safe loopback bind defaults;
+- E2E tests for both.
 
-- Real SSH session between operator and agent.
-- Existing Rust SSH implementation; no custom shell crypto/protocol.
-- End-to-end SSH encryption through the relay.
-- Relay does not interpret terminal content.
-- Native Linux PTY.
-- Interactive shell request.
-- stdin.
-- stdout/stderr.
-- terminal resize propagation.
-- signal handling needed for normal interactive use.
-- exit status.
-- Ctrl-C behavior.
-- Ctrl-D/normal shell exit.
-- Local terminal raw-mode lifecycle.
-- Guaranteed local terminal restoration on normal exit, errors, Ctrl-C, and panic.
+### M5 — Web console
 
-### Relay
+- `revtty web serve`;
+- authenticated web sessions;
+- machine list/search;
+- xterm.js 6 stable;
+- fit/resize;
+- browser session lifecycle;
+- desktop/mobile emergency use;
+- explicit web plaintext trust boundary;
+- no target-side GoTTY/ttyd service.
 
-- Small HTTP/WebSocket service.
-- Agent registry.
-- In-memory live connection registry.
-- In-memory pending-session rendezvous.
-- SQLite persistent state.
-- Agents table.
-- Enrollments table.
-- Session metadata table.
-- Store start/end/result metadata, not terminal contents.
-- Health endpoint.
-- Graceful shutdown.
-- Basic rate limiting on enrollment/session creation/auth failures.
-- Bounded memory/queue usage.
-- Stale-agent expiry.
-- Caddy-compatible reverse-proxy deployment.
-- Caddy as recommended initial TLS/ACME termination.
-- No Redis/Postgres requirement.
-- No session reconstruction after relay restart.
+### M6 — v1 release hardening
 
-### Operator / authorization management
-
-- List authorized operator keys for an agent or fleet scope.
-- Add an operator public key.
-- Revoke an operator public key.
-- Rotate the local operator identity.
-- Rotate/reissue an agent control credential.
-- Clear, explicit fingerprint display.
-- No implicit trust of changed host keys.
-
-### Configuration
-
-- Predictable config paths.
-- TOML configuration.
-- Environment overrides only where useful for service deployment.
-- CLI flags override config values.
-- Secure defaults.
-- Config validation before opening network connections.
-- Explicit relay URL.
-- Explicit run-as shell user.
-- Timeouts configurable within safe bounds.
-
-### Diagnostics
-
-- Operator doctor: config, identity, DNS, relay reachability, API compatibility.
-- Agent doctor: config, host key, credential presence, DNS, relay reachability, WSS auth.
-- Relay doctor: storage, bind address, schema state, runtime config.
-- Useful error messages for DNS/TLS/auth/host-key/session-timeout failures.
-- Structured debug logging via `RUST_LOG`.
-- Never log terminal content or bearer secrets.
-
-### Protocol and compatibility
-
-- Control protocol version starts at v1.
-- Document message schemas and invariants.
-- Unknown message handling is explicit.
-- Reject incompatible major/control protocol versions cleanly.
-- Stable machine/session identifiers.
-- Contract tests for serialization.
-- Migration strategy for SQLite schema from the first persistent release.
-
-### Testing
-
-- Unit tests for protocol round trips.
-- Unit tests for token expiry/reuse.
-- Unit tests for session state transitions.
-- Unit tests for config validation.
-- Unit tests for host-key checks.
-- Integration test for agent registration/presence.
-- Integration test for session rendezvous.
-- Integration test for relay restart → agent reconnect.
-- E2E SSH authentication tests.
-- E2E Linux PTY test.
-- Resize test.
-- Ctrl-C test.
-- Exit/cleanup test.
-- Unauthorized operator test.
-- Changed host-key rejection test.
-- Expired enrollment token test.
-- Reused enrollment token test.
-- Reused session token test.
-- Concurrency-limit test.
-
-### Packaging / release
-
-- `cargo fmt --check`.
-- `cargo clippy --all-targets --all-features -- -D warnings`.
-- `cargo test`.
-- GitHub Actions CI.
-- Release profile with LTO/strip.
-- Linux tar.gz binaries.
-- Debian/Ubuntu `.deb`.
-- systemd unit packaged with `.deb`.
-- SHA256SUMS.
-- README quick start.
-- `docs/BRIEF.md`.
-- protocol documentation.
-- security/threat-model documentation.
-- CHANGELOG.
-- MIT license.
-- SemVer.
-- Define a compatibility promise before calling the protocol 1.0 stable.
-
-### Optional v1 candidates — choose deliberately
-
-These fit the product but are not required to prove First Shell:
-
-- `revtty exec <target> -- <command>` for non-interactive commands.
-- `--json` output for `list`, `status`, and `doctor`.
-- Agent rename.
-- Tags/groups for machine selection.
-- Multiple simultaneously authorized operators.
-- Local machine alias support.
-- Shell selection.
-- Per-agent session concurrency policy.
-- Operator/session audit query command.
-- Docker image for relay.
-- Minimal docker-compose example with Caddy + relay.
-- IPv6-aware diagnostics.
-- Shell completion and man page generation.
-
----
+- protocol compatibility contract;
+- bounded-frame/buffer review;
+- security/threat-model review;
+- dependency audit/deny policy;
+- fault tests;
+- soak tests;
+- Linux packages;
+- macOS release artifacts;
+- systemd/launchd assets;
+- completions/man page;
+- install/upgrade/deployment docs;
+- v1.0 release.
 
 ## v2 candidates
 
-### Web console
+### Windows
 
-- Optional `revtty web serve` role.
-- Browser machine list.
-- Search/filter machines.
-- Online/offline/last-seen display.
-- Browser connect action.
-- xterm.js terminal.
-- Terminal resize.
-- Multiple browser terminal tabs.
-- Mobile-friendly emergency terminal.
-- Web session close/status UX.
-- Web authentication.
-- OIDC support for external identity providers.
-- Optional TOTP/local-login mode for small self-hosted deployments.
-- Explicitly document that the web gateway can see terminal plaintext unless a later browser-E2E design is implemented.
-- Keep the target agent unchanged; no GoTTY/ttyd process on targets.
+Windows is the primary platform expansion planned for v2.
 
-### Richer operator authorization
-
-- Named operators rather than raw key-only management.
-- Fleet/group-scoped authorization.
-- Per-agent authorization.
-- Read-only metadata roles separate from shell permission.
-- Time-limited operator grants.
-- Approval-required sessions as an optional policy.
-- API tokens for automation.
-- Operator activity/audit views.
-
-### Remote command mode
-
-- `revtty exec <target> -- <command>` if not selected for v1.
-- Structured exit code.
-- stdout/stderr separation.
-- Non-interactive timeout.
-- Machine-readable JSON result.
-- Multi-target exec considered only after single-target semantics are stable.
-
-### Files
-
-- SFTP using the existing SSH session layer.
-- `revtty cp`.
-- Upload.
-- Download.
-- Directory transfer if underlying implementation supports it safely.
-- Transfer cancellation.
-- Transfer progress.
-- Explicit path/permission handling.
-
-### Port forwarding
-
-- SSH local forwarding.
-- Remote forwarding only if the threat model remains clear.
-- `revtty forward <target> <local>:<remote>`.
-- Strong defaults that bind local forwards to loopback.
-- Clear audit metadata for forwards.
-- No general VPN behavior.
-
-### MQTT control backend
-
-- MQTT as an alternative control/wakeup plane.
-- TLS-authenticated MQTT.
-- Per-agent topics.
-- Signed/authenticated session requests.
-- Replay protection.
-- WSS data tunnel remains available.
-- Do not carry interactive terminal bytes over MQTT.
-- Useful for fleets already connected to an MQTT broker.
-
-### Additional target platforms
-
-- macOS agent.
-- launchd service packaging.
+- Windows operator CLI.
 - Windows agent.
-- Windows Service packaging.
-- ConPTY terminal backend.
-- Cross-platform config/state path handling.
-- Cross-platform E2E tests.
+- Windows Service lifecycle.
+- ConPTY backend.
+- Windows config/state paths.
+- x86_64 Windows release.
+- Windows ARM64 if demand/build support justifies it.
+- Windows E2E terminal tests.
+- Preserve v1 wire protocol and SSH semantics.
 
-### Direct data paths
+The v1 PTY/service boundaries must not make this harder than adding a new platform backend.
 
-- Evaluate iroh or another maintained Rust NAT-traversal layer.
-- Direct QUIC path when peers can establish it.
-- Relay fallback when direct path fails.
-- Never implement STUN/hole punching from scratch.
-- Preserve the same session/auth model regardless of transport.
-- WSS/TCP fallback for UDP-blocked networks.
-- Transport diagnostics showing direct vs relayed path.
+### MQTT control plane
 
-### Fleet usability
+For appliance/IoT environments already using MQTT:
 
-- Tags/groups if not selected for v1.
-- Saved filters.
-- Agent version visibility.
-- Controlled agent credential rotation at fleet scale.
-- Controlled agent upgrade mechanism only if it can remain simple and explicit.
-- Bulk status queries.
-- Fleet-level doctor/compatibility report.
+- MQTT as alternative control/signaling transport;
+- TLS-authenticated broker connection;
+- per-agent routing;
+- replay-safe session signaling;
+- WSS remains available;
+- terminal data never carried over MQTT.
 
-### Session usability
+Use a mature MQTT implementation such as `rumqttc`; do not create an MQTT client.
 
-- Reconnect/resume semantics evaluated carefully; do not pretend a dead SSH session survived.
-- Optional tmux/screen integration for durable user workflows.
-- Shared/view-only session considered separately from shell authorization.
-- Session history metadata.
-- Optional session recording only as an explicit, opt-in feature with a clear privacy/security model.
+### Direct/P2P data path
 
-### API
+Only if measurements or relay cost/latency justify it:
 
-- Documented external API.
-- Stable JSON schemas.
-- API authentication.
-- Webhooks for agent online/offline/session events if real integrations require them.
-- No plugin framework unless multiple real integrations prove the need.
+- evaluate Iroh or another mature Rust NAT-traversal stack;
+- direct QUIC when available;
+- relay fallback always remains;
+- path diagnostics;
+- no custom STUN;
+- no custom ICE;
+- no custom hole punching.
 
-### Packaging / distribution
+Reliability remains more important than forcing P2P.
 
-- Homebrew package.
-- RPM.
-- Windows installer.
-- macOS package.
-- Container image hardening for relay/web.
-- Upgrade documentation.
-- Backward-compatibility test matrix across supported versions.
+### Remote forwarding
 
----
+Local forwarding is v1.
 
-## Explicit non-goals unless the product thesis changes
+Remote SSH forwarding can be added in v2 if a concrete maintenance use case justifies the additional exposure/security policy.
 
-- Full VPN/mesh networking.
-- General-purpose TCP/UDP tunneling suite.
-- Exit nodes.
-- Remote desktop.
-- Endpoint monitoring platform.
-- Package/patch management platform.
-- Hardware/software asset inventory platform.
-- Stealth agent behavior.
-- Persistence evasion.
-- Custom cryptographic primitives.
-- Home-grown NAT traversal.
-- Kubernetes requirement.
-- Mandatory cloud/SaaS account.
-- AI features without a concrete remote-terminal use case.
+No exit-node or VPN behavior.
+
+### Web identity expansion
+
+- OIDC;
+- external identity providers;
+- optional MFA flows where appropriate;
+- named web operators;
+- tighter per-agent policies.
+
+Do not turn this into an enterprise IAM platform unless users actually need it.
+
+### Advanced key support
+
+- SSH agent integration;
+- hardware-backed/FIDO keys where the Rust/OpenSSH ecosystem supports the required signing path;
+- optional short-lived SSH certificates if fleet scale justifies a CA.
+
+### Fleet ergonomics
+
+Only after simple named-machine workflows become insufficient:
+
+- tags/groups;
+- saved filters;
+- bulk status;
+- fleet compatibility report;
+- controlled agent upgrades.
+
+Avoid generic orchestration.
+
+### Session ergonomics
+
+- optional tmux integration for durable remote workflows;
+- shared/view-only sessions if there is a real support use case;
+- session metadata/history improvements;
+- optional recording only with an explicit opt-in security/privacy model.
+
+Do not claim transparent session resume for a dead SSH session.
+
+### Relay scaling
+
+Only when single-node measurements prove it necessary:
+
+- multiple relay instances;
+- shared persistence;
+- distributed presence/rendezvous;
+- rolling upgrades;
+- multi-region;
+- relay federation.
+
+Do not introduce Redis/PostgreSQL/distributed coordination preemptively.
+
+## Explicit non-goals
+
+Unless the product thesis is deliberately changed, revtty is not:
+
+- a full VPN/mesh network;
+- a generic TCP/UDP tunneling suite;
+- an exit node;
+- remote desktop/screen sharing;
+- endpoint monitoring;
+- a metrics dashboard;
+- patch/package management;
+- asset inventory;
+- ticketing;
+- generic orchestration;
+- a Kubernetes access platform;
+- covert/stealth persistence;
+- a custom cryptography project;
+- a custom NAT-traversal implementation.
+
+## Product guardrail
+
+A feature should materially improve one of:
+
+- obtaining a secure terminal;
+- maintaining access reliability;
+- operator authorization;
+- safe shell-adjacent workflows such as exec/copy/forward;
+- diagnosing revtty itself.
+
+If it does not, it probably belongs elsewhere.
