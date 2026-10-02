@@ -63,6 +63,7 @@ async fn run_control_once(
         ControlMessage::Hello {
             version: CONTROL_PROTOCOL_VERSION,
             name: name.to_owned(),
+            agent_version: env!("CARGO_PKG_VERSION").to_owned(),
         },
     )
     .await?;
