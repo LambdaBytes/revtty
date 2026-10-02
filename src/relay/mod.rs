@@ -27,6 +27,16 @@ struct RelayState {
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<WebSocket>>>>,
 }
 
+impl RelayState {
+    fn new(token: String) -> Self {
+        Self {
+            token: Arc::from(token),
+            agents: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AgentHandle {
     connection_id: Uuid,
@@ -42,24 +52,22 @@ pub async fn serve(bind: &str, token: String) -> Result<(), RevttyError> {
         .await
         .map_err(|error| RevttyError::runtime("bind relay", error))?;
 
-    let state = RelayState {
-        token: Arc::from(token),
-        agents: Arc::new(Mutex::new(HashMap::new())),
-        pending: Arc::new(Mutex::new(HashMap::new())),
-    };
-
-    let app = Router::new()
-        .route("/health", get(|| async { StatusCode::NO_CONTENT }))
-        .route("/v0/agent/{name}", get(agent_upgrade))
-        .route("/v0/probe/{name}", get(probe_upgrade))
-        .route("/v0/session/{session_id}", get(session_upgrade))
-        .with_state(state);
+    let app = router(RelayState::new(token));
 
     eprintln!("revtty relay transport proof listening on {bind}");
 
     axum::serve(listener, app)
         .await
         .map_err(|error| RevttyError::runtime("serve relay", error))
+}
+
+fn router(state: RelayState) -> Router {
+    Router::new()
+        .route("/health", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/v0/agent/{name}", get(agent_upgrade))
+        .route("/v0/probe/{name}", get(probe_upgrade))
+        .route("/v0/session/{session_id}", get(session_upgrade))
+        .with_state(state)
 }
 
 async fn agent_upgrade(
@@ -271,9 +279,15 @@ pub fn doctor() -> Result<(), RevttyError> {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+    use std::time::Duration;
 
-    use super::authorized;
+    use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+    use futures_util::{SinkExt, StreamExt};
+    use reqwest_websocket::Message as ClientMessage;
+
+    use super::{RelayState, authorized, router};
+    use crate::protocol::{ControlMessage, ProbeResult};
+    use crate::transport::connect_websocket;
 
     #[test]
     fn bearer_auth_requires_exact_token() {
@@ -282,5 +296,113 @@ mod tests {
 
         assert!(authorized(&headers, "secret"));
         assert!(!authorized(&headers, "other"));
+    }
+
+    #[tokio::test]
+    async fn reverse_probe_round_trip() {
+        let state = RelayState::new("secret".to_owned());
+        let app = router(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test relay");
+        let address = listener.local_addr().expect("test relay address");
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test relay");
+        });
+
+        let relay = format!("ws://{address}");
+        let client = reqwest::Client::new();
+        let agent = connect_websocket(&client, &relay, "/v0/agent/demo", "secret")
+            .await
+            .expect("connect test agent");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.agents.lock().await.contains_key("demo") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("agent becomes visible");
+
+        let (mut agent_sender, mut agent_receiver) = agent.split();
+        let agent_client = client.clone();
+        let agent_relay = relay.clone();
+
+        let agent_task = tokio::spawn(async move {
+            while let Some(message) = agent_receiver.next().await {
+                match message.expect("agent control message") {
+                    ClientMessage::Text(text) => {
+                        let control: ControlMessage =
+                            serde_json::from_str(&text).expect("decode probe offer");
+
+                        if let ControlMessage::ProbeOffer { session_id, .. } = control {
+                            let path = format!("/v0/session/{session_id}");
+                            let mut session =
+                                connect_websocket(&agent_client, &agent_relay, &path, "secret")
+                                    .await
+                                    .expect("connect agent session");
+
+                            let result = ProbeResult {
+                                name: "demo".to_owned(),
+                                os: "test-os".to_owned(),
+                                arch: "test-arch".to_owned(),
+                                version: "test-version".to_owned(),
+                            };
+
+                            session
+                                .send(ClientMessage::Text(
+                                    serde_json::to_string(&result).expect("encode probe result"),
+                                ))
+                                .await
+                                .expect("send probe result");
+
+                            session
+                                .close(reqwest_websocket::CloseCode::Normal, None)
+                                .await
+                                .expect("close agent session");
+                            return;
+                        }
+                    }
+                    ClientMessage::Ping(data) => {
+                        agent_sender
+                            .send(ClientMessage::Pong(data))
+                            .await
+                            .expect("send pong");
+                    }
+                    _ => {}
+                }
+            }
+
+            panic!("agent control connection ended before probe offer");
+        });
+
+        let mut operator = connect_websocket(&client, &relay, "/v0/probe/demo", "secret")
+            .await
+            .expect("connect operator probe");
+
+        let message = tokio::time::timeout(Duration::from_secs(2), operator.next())
+            .await
+            .expect("probe result timeout")
+            .expect("operator websocket closed")
+            .expect("operator websocket error");
+
+        let ClientMessage::Text(text) = message else {
+            panic!("expected text probe result");
+        };
+
+        let result: ProbeResult = serde_json::from_str(&text).expect("decode probe result");
+        assert_eq!(result.name, "demo");
+        assert_eq!(result.os, "test-os");
+        assert_eq!(result.arch, "test-arch");
+        assert_eq!(result.version, "test-version");
+
+        agent_task.await.expect("agent test task");
+        server.abort();
+        let _ = server.await;
     }
 }
