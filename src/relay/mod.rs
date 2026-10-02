@@ -487,7 +487,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::{RelayState, authorized, router};
-    use crate::protocol::{ControlMessage, ProbeResult};
+    use crate::protocol::{ControlMessage, EnrollRequest, EnrollResponse, ProbeResult};
+    use crate::storage::Store;
     use crate::transport::connect_websocket;
 
     struct TestServer {
@@ -600,8 +601,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_enrollment_and_agent_auth_round_trip() {
+        let store = Store::open_in_memory().await.expect("open in-memory relay store");
+        let state = RelayState::new("secret".to_owned(), store.clone());
+        let app = router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test relay");
+        let address = listener.local_addr().expect("test relay address");
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test relay");
+        });
+
+        let operator_key = ed25519_key().public_key().to_openssh().expect("operator key");
+        let host_key = ed25519_key().public_key().to_openssh().expect("host key");
+
+        let enrollment = store
+            .create_enrollment("persistent-demo", &operator_key, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+
+        let http = reqwest::Client::new();
+        let response = http
+            .post(format!("http://{address}/v1/enroll"))
+            .json(&EnrollRequest {
+                token: enrollment.token.expose().to_owned(),
+                host_key,
+                version: "0.1.0".to_owned(),
+            })
+            .send()
+            .await
+            .expect("send enrollment request");
+
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+
+        let enrolled: EnrollResponse = response.json().await.expect("decode enrollment response");
+        assert_eq!(enrolled.name, "persistent-demo");
+        assert_eq!(enrolled.operator_key, operator_key);
+
+        let websocket = connect_websocket(
+            &http,
+            &format!("ws://{address}"),
+            "/v1/agent/persistent-demo",
+            &enrolled.control_token,
+        )
+        .await
+        .expect("connect persistent agent");
+
+        drop(websocket);
+
+        let reuse = http
+            .post(format!("http://{address}/v1/enroll"))
+            .json(&EnrollRequest {
+                token: enrollment.token.expose().to_owned(),
+                host_key: ed25519_key().public_key().to_openssh().expect("second host key"),
+                version: "0.1.0".to_owned(),
+            })
+            .send()
+            .await
+            .expect("send reused enrollment");
+
+        assert_eq!(reuse.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn reverse_probe_round_trip() {
-        let state = RelayState::new("secret".to_owned());
+        let store = Store::open_in_memory().await.expect("open in-memory relay store");
+        let state = RelayState::new("secret".to_owned(), store);
         let app = router(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -709,7 +780,8 @@ mod tests {
 
     #[tokio::test]
     async fn ssh_authenticates_through_reverse_relay() {
-        let state = RelayState::new("secret".to_owned());
+        let store = Store::open_in_memory().await.expect("open in-memory relay store");
+        let state = RelayState::new("secret".to_owned(), store);
         let app = router(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
