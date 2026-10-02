@@ -6,6 +6,8 @@ This document is the source of truth for features required before revtty is call
 
 The implementation may be delivered through smaller pre-1.0 milestones, but features listed here belong to the v1 product unless explicitly moved in a later scope decision.
 
+The vetted package/build-vs-reuse decisions live in [STACK.md](STACK.md).
+
 ## Product promise
 
 > Secure, on-demand terminal access to known Linux and macOS machines behind NAT, with no inbound ports required on the target.
@@ -134,6 +136,7 @@ The agent runs as one explicit OS account. v1 does not implement a complex PAM/d
 
 - Dedicated Ed25519 operator identity by default.
 - Ability to explicitly use/import an existing compatible operator key.
+- Operator-to-relay control API authentication uses an OpenSSH SSHSIG challenge/response flow rather than a proprietary signature format, followed by a short-lived opaque API session token.
 - Persistent Ed25519 SSH host identity per agent.
 - Separate high-entropy agent-to-relay control credential.
 - Single-use enrollment token.
