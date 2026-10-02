@@ -86,8 +86,9 @@ fn secure_private_key_permissions(path: &Path) -> Result<(), RevttyError> {
             .map_err(|error| RevttyError::runtime("inspect operator private key", error))?;
         let mut permissions = metadata.permissions();
         permissions.set_mode(0o600);
-        fs::set_permissions(path, permissions)
-            .map_err(|error| RevttyError::runtime("secure operator private key permissions", error))?;
+        fs::set_permissions(path, permissions).map_err(|error| {
+            RevttyError::runtime("secure operator private key permissions", error)
+        })?;
     }
 
     Ok(())
