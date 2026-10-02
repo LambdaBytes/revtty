@@ -71,9 +71,24 @@ Reasons:
 - modern SSH algorithms;
 - no need to run or expose OpenSSH `sshd` on the target.
 
-Use Russh's normal modern defaults and do not opt into explicitly legacy DSA/3DES support.
+Russh supports broad SSH interoperability, but revtty controls both ends and does not need that full surface.
 
-Start with the upstream-default crypto backend unless cross-build or packaging evidence gives a concrete reason to change it.
+V1 policy:
+
+- Ed25519 host/operator keys only;
+- use the upstream-default `aws-lc-rs` crypto backend;
+- do not enable DSA or 3DES;
+- do not enable optional SSH compression unless a measured use case appears;
+- do not enable RSA support unless a later compatibility requirement justifies it;
+- retain Russh's safe default KEX/cipher/MAC ordering and explicitly constrain key algorithms to Ed25519.
+
+When the dependency is introduced, start by validating a narrow feature set equivalent to:
+
+```toml
+russh = { version = "0.63", default-features = false, features = ["aws-lc-rs"] }
+```
+
+If Russh's feature/API requirements change, preserve the policy rather than blindly preserving that exact Cargo line.
 
 ### ssh-key 0.6.x — selected where direct key handling is required
 
