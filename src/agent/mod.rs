@@ -187,8 +187,8 @@ pub fn pty_test() -> Result<(), RevttyError> {
         })
         .map_err(|error| RevttyError::runtime("open local PTY", error))?;
 
-    let mut command = CommandBuilder::new("/bin/sh");
-    command.args(["-c", "printf 'revtty-pty-ok\\n'"]);
+    let mut command = CommandBuilder::new("/bin/echo");
+    command.arg("revtty-pty-ok");
 
     let mut child = pair
         .slave
@@ -196,25 +196,36 @@ pub fn pty_test() -> Result<(), RevttyError> {
         .map_err(|error| RevttyError::runtime("spawn PTY smoke command", error))?;
     drop(pair.slave);
 
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|error| RevttyError::runtime("take PTY writer", error))?;
-    drop(writer);
-
     let mut reader = pair
         .master
         .try_clone_reader()
         .map_err(|error| RevttyError::runtime("clone PTY reader", error))?;
 
-    let mut output = String::new();
-    reader
-        .read_to_string(&mut output)
-        .map_err(|error| RevttyError::runtime("read PTY output", error))?;
+    let reader_thread = std::thread::spawn(move || -> std::io::Result<String> {
+        let mut output = String::new();
+        reader.read_to_string(&mut output)?;
+        Ok(output)
+    });
+
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| RevttyError::runtime("take PTY writer", error))?;
+
+    if cfg!(target_os = "macos") {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(writer);
 
     let status = child
         .wait()
         .map_err(|error| RevttyError::runtime("wait for PTY smoke command", error))?;
+    drop(pair.master);
+
+    let output = reader_thread
+        .join()
+        .map_err(|_| RevttyError::message("PTY reader thread panicked"))?
+        .map_err(|error| RevttyError::runtime("read PTY output", error))?;
 
     if !status.success() || !output.contains("revtty-pty-ok") {
         return Err(RevttyError::message("local PTY smoke test failed"));
