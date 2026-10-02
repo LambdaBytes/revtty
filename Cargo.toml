@@ -2,7 +2,7 @@
 name = "revtty"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Outbound-only remote terminal for machines behind NAT"
 license = "MIT"
 readme = "README.md"
