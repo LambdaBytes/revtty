@@ -24,7 +24,9 @@ The current proof answers only that question.
 - WebSocket frame/message limits;
 - Linux and macOS CI;
 - automated end-to-end reverse-rendezvous test;
-- local `portable-pty` smoke test on both Linux and macOS.
+- local `portable-pty` smoke test on both Linux and macOS;
+- Russh handshake and Ed25519 authentication over an arbitrary Tokio duplex stream;
+- Russh handshake, pinned host key and Ed25519 operator authentication through the actual WebSocket rendezvous relay.
 
 The probe result contains only:
 
@@ -39,8 +41,8 @@ It does not execute a command supplied by the operator.
 
 - remote shell;
 - **remote** PTY transport;
-- SSH;
-- Ed25519 identity;
+- persistent on-disk SSH identities and enrollment;
+- production Ed25519 identity lifecycle;
 - enrollment;
 - host-key pinning;
 - SQLite;
@@ -149,14 +151,32 @@ A successful result proves:
 4. a second on-demand outbound connection from the target;
 5. bidirectional relay pairing across NAT.
 
+## Validation status
+
+The core architecture is now independently proven in CI on Linux and macOS:
+
+1. outbound agent control connection: validated;
+2. operator-triggered second outbound connection: validated;
+3. relay rendezvous and bidirectional forwarding: validated;
+4. portable PTY backend: validated;
+5. SSH over arbitrary non-TCP stream: validated;
+6. SSH through the WebSocket relay itself: validated;
+7. pinned SSH host key: validated;
+8. Ed25519 public-key operator authentication: validated.
+
+The relay test does not open a shell or execute remote commands; it stops after successful SSH authentication.
+
 ## Next validation gate
 
-After this proof works over a real NAT boundary:
+The next meaningful validation is **real NAT/CGNAT**, using the documented `probe` command against a public HTTPS/WSS relay.
 
-1. put Russh over the already validated paired transport;
-2. add Ed25519 agent and operator identities;
-3. validate host-key pinning and operator public-key authorization;
-4. replace the shared development token with the intended enrollment/authentication model;
-5. only then add durable state and convenience features.
+After that succeeds, implementation should move from proof credentials to the intended product security/lifecycle:
 
-This keeps transport, PTY, and SSH failures independently observable.
+1. persistent Ed25519 agent host identity;
+2. persistent Ed25519 operator identity;
+3. enrollment and revocation;
+4. session-specific one-time credentials;
+5. SQLite durable state;
+6. then connect the already validated PTY to authenticated SSH session channels.
+
+This ordering keeps networking, identity, SSH, and PTY failures independently observable.
