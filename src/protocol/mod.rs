@@ -5,17 +5,9 @@ pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
-    Hello {
-        version: u16,
-        name: String,
-    },
-    Heartbeat {
-        version: u16,
-    },
-    ProbeOffer {
-        version: u16,
-        session_id: String,
-    },
+    Hello { version: u16, name: String },
+    Heartbeat { version: u16 },
+    ProbeOffer { version: u16, session_id: String },
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
