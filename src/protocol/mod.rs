@@ -17,6 +17,6 @@ mod tests {
         let decoded: ControlMessage =
             serde_json::from_str(&json).expect("deserialize control message");
 
-        assert_eq!(decoded, message);
+        assert!(decoded == message);
     }
 }
