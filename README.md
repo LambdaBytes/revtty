@@ -10,19 +10,19 @@ No inbound ports. No VPN. No exposed SSH daemon — just secure, on-demand shell
 
 `revtty` is a small, terminal-first remote maintenance tool. A persistent agent on the target machine keeps an outbound control connection to a relay. When an authorized operator requests a session, the agent opens an ephemeral outbound data tunnel and serves a real SSH-backed PTY through it.
 
-The first milestone is intentionally narrow: **reliable shell access to a Linux machine behind NAT with zero inbound ports.**
+The first milestone is intentionally narrow: **reliable shell access to Linux and macOS machines behind NAT with zero inbound ports.**
 
 ## Design principles
 
 - Outbound-only agent.
 - SSH for session semantics and cryptography; do not invent a terminal protocol.
 - Relay routes sessions; it should not interpret terminal contents.
-- Linux-first.
+- Linux and macOS in v1; Windows is planned for v2.
 - One Rust binary with client, agent, and relay roles.
 - Small control plane: identity, presence, enrollment, authorization, rendezvous, lifecycle.
 - Boring transport first: HTTPS/WSS on TCP/443.
 - SQLite for relay persistence.
-- systemd for long-running agent lifecycle.
+- Native service lifecycle: systemd on Linux and launchd on macOS.
 - Stable, versioned protocol contracts before feature growth.
 - No speculative abstraction: extract interfaces only when a second implementation exists.
 
@@ -42,7 +42,7 @@ revtty list
 revtty connect store-042
 ```
 
-See [docs/BRIEF.md](docs/BRIEF.md) for the product and architecture brief, and [docs/ROADMAP.md](docs/ROADMAP.md) for candidate v1/v2 scope.
+See [docs/BRIEF.md](docs/BRIEF.md) for the product and architecture brief, [docs/V1_SCOPE.md](docs/V1_SCOPE.md) for the approved v1 scope, and [docs/ROADMAP.md](docs/ROADMAP.md) for the release plan.
 
 ## Development
 
