@@ -1,19 +1,25 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
+use axum::{Json, Router};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use futures_util::{SinkExt, StreamExt};
+use ssh_key::{Algorithm, HashAlg, PublicKey};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::error::RevttyError;
-use crate::protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage};
+use crate::protocol::{
+    CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse,
+};
+use crate::storage::Store;
 use crate::transport::valid_name;
 
 const CONTROL_QUEUE_DEPTH: usize = 16;
@@ -23,14 +29,16 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 #[derive(Clone)]
 struct RelayState {
     token: Arc<str>,
+    store: Store,
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<WebSocket>>>>,
 }
 
 impl RelayState {
-    fn new(token: String) -> Self {
+    fn new(token: String, store: Store) -> Self {
         Self {
             token: Arc::from(token),
+            store,
             agents: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -43,16 +51,88 @@ struct AgentHandle {
     control: mpsc::Sender<ControlMessage>,
 }
 
-pub fn init() -> Result<(), RevttyError> {
-    Err(RevttyError::NotImplemented("relay initialization"))
+pub async fn init(db: &FsPath) -> Result<(), RevttyError> {
+    let _store = Store::open(db).await?;
+    println!("relay database {}", db.display());
+    println!("schema   ready");
+    Ok(())
 }
 
-pub async fn serve(bind: &str, token: String) -> Result<(), RevttyError> {
+pub async fn create_enrollment(
+    db: &FsPath,
+    name: &str,
+    operator_key_path: &FsPath,
+    ttl_secs: u64,
+) -> Result<(), RevttyError> {
+    if !valid_name(name) {
+        return Err(RevttyError::message(
+            "agent names may contain only letters, digits, '.', '_' and '-'",
+        ));
+    }
+
+    let encoded = fs::read_to_string(operator_key_path)
+        .map_err(|error| RevttyError::runtime("read operator public key", error))?;
+    let operator_key = PublicKey::from_openssh(&encoded)
+        .map_err(|error| RevttyError::runtime("parse operator public key", error))?;
+
+    if operator_key.algorithm() != Algorithm::Ed25519 {
+        return Err(RevttyError::message(
+            "v1 enrollment requires an Ed25519 operator key",
+        ));
+    }
+
+    let operator_key = operator_key
+        .to_openssh()
+        .map_err(|error| RevttyError::runtime("encode operator public key", error))?;
+
+    let store = Store::open(db).await?;
+    let enrollment = store
+        .create_enrollment(name, &operator_key, Duration::from_secs(ttl_secs))
+        .await?;
+
+    println!("enrollment {}", enrollment.id);
+    println!("target     {name}");
+    println!("expires    {}", enrollment.expires_at);
+    println!("token      {}", enrollment.token.expose());
+    Ok(())
+}
+
+pub async fn list_agents(db: &FsPath) -> Result<(), RevttyError> {
+    let store = Store::open(db).await?;
+    let agents = store.list_agents().await?;
+
+    if agents.is_empty() {
+        println!("No enrolled agents.");
+        return Ok(());
+    }
+
+    for agent in agents {
+        let host_fingerprint = public_key_fingerprint(&agent.host_key)?;
+        let operator_fingerprint = public_key_fingerprint(&agent.operator_key)?;
+        println!(
+            "{}\tid={}\tcreated={}\tlast_seen={}\tversion={}\thost={}\toperator={}",
+            agent.name,
+            agent.id,
+            agent.created_at,
+            agent
+                .last_seen
+                .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+            agent.version.as_deref().unwrap_or("-"),
+            host_fingerprint,
+            operator_fingerprint
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn serve(bind: &str, token: String, db: &FsPath) -> Result<(), RevttyError> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| RevttyError::runtime("bind relay", error))?;
 
-    let app = router(RelayState::new(token));
+    let store = Store::open(db).await?;
+    let app = router(RelayState::new(token, store));
 
     eprintln!("revtty relay transport proof listening on {bind}");
 
