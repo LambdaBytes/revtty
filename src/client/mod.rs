@@ -12,7 +12,11 @@ pub fn init() -> Result<(), RevttyError> {
 
     println!(
         "identity {}",
-        if identity.created { "created" } else { "existing" }
+        if identity.created {
+            "created"
+        } else {
+            "existing"
+        }
     );
     println!("fingerprint {}", identity.fingerprint);
     println!("private {}", identity.private_key_path.display());
