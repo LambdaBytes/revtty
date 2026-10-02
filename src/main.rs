@@ -7,6 +7,8 @@ mod error;
 mod identity;
 mod protocol;
 mod relay;
+mod storage;
+mod token;
 mod transport;
 
 use clap::Parser;
