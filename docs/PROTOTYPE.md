@@ -22,7 +22,9 @@ The current proof answers only that question.
 - opaque WebSocket forwarding through the relay;
 - bounded relay control queues;
 - WebSocket frame/message limits;
-- Linux and macOS CI.
+- Linux and macOS CI;
+- automated end-to-end reverse-rendezvous test;
+- local `portable-pty` smoke test on both Linux and macOS.
 
 The probe result contains only:
 
@@ -36,7 +38,7 @@ It does not execute a command supplied by the operator.
 ## Deliberately not implemented yet
 
 - remote shell;
-- PTY transport;
+- **remote** PTY transport;
 - SSH;
 - Ed25519 identity;
 - enrollment;
@@ -84,6 +86,24 @@ os       linux
 arch     x86_64
 revtty   0.1.0
 ```
+
+## Local PTY validation
+
+The PTY backend is validated independently from the network path:
+
+```bash
+cargo run -- agent pty-test
+```
+
+Expected shape:
+
+```text
+pty      ok
+os       linux
+arch     x86_64
+```
+
+The smoke test uses a fixed local `/bin/echo` command; it does not accept or execute remote input. The same test runs in Ubuntu and macOS CI.
 
 ## Real NAT validation
 
@@ -133,9 +153,9 @@ A successful result proves:
 
 After this proof works over a real NAT boundary:
 
-1. validate `portable-pty` locally on Linux and macOS;
-2. put Russh over the paired byte stream;
-3. add Ed25519 agent and operator identities;
+1. put Russh over the already validated paired transport;
+2. add Ed25519 agent and operator identities;
+3. validate host-key pinning and operator public-key authorization;
 4. replace the shared development token with the intended enrollment/authentication model;
 5. only then add durable state and convenience features.
 
