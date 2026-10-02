@@ -27,3 +27,6 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --all-features
+
+      - name: Release build
+        run: cargo build --release
