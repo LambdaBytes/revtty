@@ -1,3 +1,5 @@
+mod config;
+
 use std::io::Read;
 use std::time::Duration;
 
@@ -5,26 +7,103 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::Message;
+use ssh_key::{Algorithm, PublicKey};
+
+use self::config::AgentConfig;
+use crate::config::Paths;
+use crate::identity::ensure_agent;
 
 use crate::error::RevttyError;
-use crate::protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage, ProbeResult};
-use crate::transport::{connect_websocket, valid_name};
+use crate::protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse, ProbeResult};
+use crate::transport::{connect_websocket, http_url, valid_name};
 
-pub async fn enroll(_relay: &str, _token: &str) -> Result<(), RevttyError> {
-    Err(RevttyError::NotImplemented("agent enrollment"))
+pub async fn enroll(relay: &str, token: &str) -> Result<(), RevttyError> {
+    let paths = Paths::discover()?;
+    let identity = ensure_agent(&paths)?;
+    let url = http_url(relay, "/v1/enroll")?;
+    let request = EnrollRequest {
+        token: token.to_owned(),
+        host_key: identity.public_key.clone(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| RevttyError::runtime("send enrollment request", error))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(RevttyError::message(format!(
+            "enrollment rejected ({status}){}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        )));
+    }
+
+    let enrolled: EnrollResponse = response
+        .json()
+        .await
+        .map_err(|error| RevttyError::runtime("decode enrollment response", error))?;
+
+    if !valid_name(&enrolled.name) {
+        return Err(RevttyError::message(
+            "relay returned an invalid enrolled agent name",
+        ));
+    }
+
+    let operator_key = PublicKey::from_openssh(&enrolled.operator_key)
+        .map_err(|error| RevttyError::runtime("parse enrolled operator key", error))?;
+    if operator_key.algorithm() != Algorithm::Ed25519 {
+        return Err(RevttyError::message(
+            "v1 requires an Ed25519 operator key",
+        ));
+    }
+
+    AgentConfig {
+        relay: relay.trim_end_matches('/').to_owned(),
+        agent_id: enrolled.agent_id,
+        name: enrolled.name.clone(),
+        control_token: enrolled.control_token,
+        operator_key: enrolled.operator_key,
+    }
+    .save(&paths)?;
+
+    println!("agent      {}", enrolled.name);
+    println!("host       {}", identity.fingerprint);
+    println!(
+        "identity   {}",
+        if identity.created { "created" } else { "existing" }
+    );
+    println!("config     {}", AgentConfig::path(&paths).display());
+    Ok(())
 }
 
-pub async fn run(relay: &str, name: &str, token: &str) -> Result<(), RevttyError> {
-    if !valid_name(name) {
+pub async fn run() -> Result<(), RevttyError> {
+    let paths = Paths::discover()?;
+    let config = AgentConfig::load(&paths)?;
+
+    if !valid_name(&config.name) {
         return Err(RevttyError::message(
-            "agent names may contain only letters, digits, '.', '_' and '-'",
+            "stored agent name is invalid; re-enroll this agent",
         ));
     }
 
     let client = reqwest::Client::new();
 
     loop {
-        let control = run_control_once(&client, relay, name, token);
+        let control = run_control_once(
+            &client,
+            &config.relay,
+            &config.name,
+            &config.control_token,
+        );
 
         tokio::select! {
             result = control => {
@@ -54,7 +133,7 @@ async fn run_control_once(
     name: &str,
     token: &str,
 ) -> Result<(), RevttyError> {
-    let path = format!("/v0/agent/{name}");
+    let path = format!("/v1/agent/{name}");
     let websocket = connect_websocket(client, relay, &path, token).await?;
     let (mut sender, mut receiver) = websocket.split();
 
@@ -153,7 +232,7 @@ async fn send_probe(
     session_id: &str,
     name: &str,
 ) -> Result<(), RevttyError> {
-    let path = format!("/v0/session/{session_id}");
+    let path = format!("/v1/session/{session_id}");
     let mut websocket = connect_websocket(client, relay, &path, token).await?;
 
     let result = ProbeResult {
@@ -239,13 +318,28 @@ pub fn pty_test() -> Result<(), RevttyError> {
 }
 
 pub fn status() -> Result<(), RevttyError> {
-    Err(RevttyError::NotImplemented("agent status"))
+    let paths = Paths::discover()?;
+    let config = AgentConfig::load(&paths)?;
+    let identity = ensure_agent(&paths)?;
+
+    println!("agent      {}", config.name);
+    println!("relay      {}", config.relay);
+    println!("id         {}", config.agent_id);
+    println!("host       {}", identity.fingerprint);
+    println!("config     {}", AgentConfig::path(&paths).display());
+    Ok(())
 }
 
 pub fn doctor() -> Result<(), RevttyError> {
-    println!("agent transport proof: available");
+    let paths = Paths::discover()?;
+    let config = AgentConfig::load(&paths)?;
+    let identity = ensure_agent(&paths)?;
+
+    println!("agent      configured");
+    println!("name       {}", config.name);
+    println!("host key   {}", identity.fingerprint);
     println!(
-        "control protocol v{}",
+        "protocol   v{}",
         crate::protocol::CONTROL_PROTOCOL_VERSION
     );
     Ok(())
