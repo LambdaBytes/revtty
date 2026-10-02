@@ -1,6 +1,6 @@
 mod control;
 
-pub use control::{ControlMessage, CONTROL_PROTOCOL_VERSION};
+pub use control::{CONTROL_PROTOCOL_VERSION, ControlMessage};
 
 #[cfg(test)]
 mod tests {
