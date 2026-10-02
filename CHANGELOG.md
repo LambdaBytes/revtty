@@ -8,6 +8,9 @@ The format follows Keep a Changelog principles and the project intends to use Se
 
 ### Added
 
+- Reverse transport proof: outbound agent control WebSocket, on-demand second connection, relay rendezvous and operator `probe` command.
+- Development-only shared-token authentication for the transport proof.
+
 - Initial Rust project scaffold.
 - CLI command surface for client, agent, and relay roles.
 - Draft versioned control-protocol documentation.
