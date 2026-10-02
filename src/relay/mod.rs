@@ -31,7 +31,7 @@ struct RelayState {
     token: Arc<str>,
     store: Store,
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<WebSocket>>>>,
+    pending: Arc<Mutex<HashMap<String, PendingSession>>>,
 }
 
 impl RelayState {
@@ -49,6 +49,11 @@ impl RelayState {
 struct AgentHandle {
     connection_id: Uuid,
     control: mpsc::Sender<ControlMessage>,
+}
+
+struct PendingSession {
+    agent_name: String,
+    sender: oneshot::Sender<WebSocket>,
 }
 
 pub async fn init(db: &FsPath) -> Result<(), RevttyError> {
@@ -149,6 +154,7 @@ fn router(state: RelayState) -> Router {
         .route("/v0/session/{session_id}", get(session_upgrade))
         .route("/v1/enroll", post(enroll_agent))
         .route("/v1/agent/{name}", get(persistent_agent_upgrade))
+        .route("/v1/session/{session_id}", get(persistent_session_upgrade))
         .with_state(state)
 }
 
@@ -229,6 +235,42 @@ async fn persistent_agent_upgrade(
         .into_response()
 }
 
+async fn persistent_session_upgrade(
+    State(state): State<RelayState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let Some(token) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    let agent_name = {
+        let pending = state.pending.lock().await;
+        pending
+            .get(&session_id)
+            .map(|session| session.agent_name.clone())
+    };
+
+    let Some(agent_name) = agent_name else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    match state.store.authenticate_agent(&agent_name, token).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            eprintln!("session authentication failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    ws.max_message_size(MAX_MESSAGE_SIZE)
+        .max_frame_size(MAX_MESSAGE_SIZE)
+        .on_upgrade(move |socket| attach_agent_session(socket, state, session_id))
+        .into_response()
+}
+
 async fn agent_upgrade(
     State(state): State<RelayState>,
     Path(name): Path<String>,
@@ -272,7 +314,7 @@ async fn probe_upgrade(
 
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_probe(socket, state, control))
+        .on_upgrade(move |socket| handle_probe(socket, state, name, control))
         .into_response()
 }
 
@@ -373,6 +415,7 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
 async fn handle_probe(
     operator_socket: WebSocket,
     state: RelayState,
+    agent_name: String,
     control: mpsc::Sender<ControlMessage>,
 ) {
     let session_id = Uuid::new_v4().simple().to_string();
@@ -380,7 +423,13 @@ async fn handle_probe(
 
     {
         let mut pending = state.pending.lock().await;
-        pending.insert(session_id.clone(), session_tx);
+        pending.insert(
+            session_id.clone(),
+            PendingSession {
+                agent_name,
+                sender: session_tx,
+            },
+        );
     }
 
     let offer = ControlMessage::ProbeOffer {
@@ -414,7 +463,7 @@ async fn attach_agent_session(socket: WebSocket, state: RelayState, session_id: 
     };
 
     if let Some(pending) = pending {
-        let _ = pending.send(socket);
+        let _ = pending.sender.send(socket);
     }
 }
 
