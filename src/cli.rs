@@ -72,20 +72,8 @@ pub enum AgentCommand {
         token: String,
     },
 
-    /// Run the long-lived transport-proof agent.
-    Run {
-        /// Relay base URL. http(s) is converted to ws(s).
-        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
-        relay: String,
-
-        /// Stable development machine name.
-        #[arg(long)]
-        name: String,
-
-        /// Development-only shared token for the transport proof.
-        #[arg(long, env = "REVTTY_DEV_TOKEN")]
-        token: String,
-    },
+    /// Run the enrolled long-lived agent using its persisted configuration.
+    Run,
 
     /// Validate the local PTY backend without any remote connection.
     PtyTest,
@@ -169,15 +157,7 @@ mod tests {
 
     #[test]
     fn parses_agent_run() {
-        let args = Args::try_parse_from([
-            "revtty",
-            "agent",
-            "run",
-            "--name",
-            "store-042",
-            "--token",
-            "development-token",
-        ]);
+        let args = Args::try_parse_from(["revtty", "agent", "run"]);
         assert!(args.is_ok());
     }
 
