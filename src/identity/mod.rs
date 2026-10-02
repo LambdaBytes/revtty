@@ -13,12 +13,58 @@ use crate::error::RevttyError;
 
 const OPERATOR_KEY_FILE: &str = "id_ed25519";
 const OPERATOR_PUBLIC_KEY_FILE: &str = "id_ed25519.pub";
+const AGENT_KEY_FILE: &str = "agent_ed25519";
+const AGENT_PUBLIC_KEY_FILE: &str = "agent_ed25519.pub";
+
+pub struct AgentIdentity {
+    pub private_key_path: PathBuf,
+    pub public_key: String,
+    pub fingerprint: String,
+    pub created: bool,
+}
 
 pub struct OperatorIdentity {
     pub private_key_path: PathBuf,
     pub public_key_path: PathBuf,
     pub fingerprint: String,
     pub created: bool,
+}
+
+pub fn ensure_agent(paths: &Paths) -> Result<AgentIdentity, RevttyError> {
+    fs::create_dir_all(&paths.state_dir)
+        .map_err(|error| RevttyError::runtime("create agent state directory", error))?;
+
+    let private_key_path = paths.state_dir.join(AGENT_KEY_FILE);
+    let public_key_path = paths.state_dir.join(AGENT_PUBLIC_KEY_FILE);
+
+    let (private_key, created) = if private_key_path.exists() {
+        let key = PrivateKey::read_openssh_file(&private_key_path)
+            .map_err(|error| RevttyError::runtime("read agent private key", error))?;
+        (key, false)
+    } else {
+        let mut key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+            .map_err(|error| RevttyError::runtime("generate agent Ed25519 key", error))?;
+        key.set_comment("revtty-agent");
+        write_private_key(&private_key_path, &key)?;
+        (key, true)
+    };
+
+    secure_private_key_permissions(&private_key_path)?;
+
+    let public_key = private_key.public_key();
+    let public_text = public_key
+        .to_openssh()
+        .map_err(|error| RevttyError::runtime("encode agent public key", error))?;
+
+    fs::write(&public_key_path, format!("{public_text}\n"))
+        .map_err(|error| RevttyError::runtime("write agent public key", error))?;
+
+    Ok(AgentIdentity {
+        private_key_path,
+        public_key: public_text,
+        fingerprint: public_key.fingerprint(HashAlg::Sha256).to_string(),
+        created,
+    })
 }
 
 pub fn ensure_operator(paths: &Paths) -> Result<OperatorIdentity, RevttyError> {
