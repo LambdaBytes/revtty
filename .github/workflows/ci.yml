@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     name: ${{ matrix.os }}
@@ -24,6 +28,9 @@ jobs:
         uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Format
         run: cargo fmt --check
