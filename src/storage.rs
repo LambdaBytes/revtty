@@ -97,7 +97,7 @@ impl Store {
     }
 
     #[cfg(test)]
-    async fn open_in_memory() -> Result<Self, RevttyError> {
+    pub(crate) async fn open_in_memory() -> Result<Self, RevttyError> {
         let conn = Connection::open_in_memory()
             .await
             .map_err(|error| RevttyError::runtime("open in-memory relay database", error))?;
@@ -300,34 +300,7 @@ impl Store {
             .map_err(|error| RevttyError::runtime("list enrolled agents", error))
     }
 
-    pub async fn get_agent(&self, agent_name: &str) -> Result<Option<AgentRecord>, RevttyError> {
-        let name = agent_name.to_owned();
 
-        self.conn
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT id, name, host_key, operator_key, created_at, last_seen, version
-                     FROM agents
-                     WHERE name = ?1",
-                    params![name],
-                    |row| {
-                        Ok(AgentRecord {
-                            id: row.get(0)?,
-                            name: row.get(1)?,
-                            host_key: row.get(2)?,
-                            operator_key: row.get(3)?,
-                            created_at: row.get(4)?,
-                            last_seen: row.get(5)?,
-                            version: row.get(6)?,
-                        })
-                    },
-                )
-                .optional()
-                .map_err(StoreError::from)
-            })
-            .await
-            .map_err(|error| RevttyError::runtime("read enrolled agent", error))
-    }
 }
 
 async fn initialize(conn: &Connection) -> Result<(), RevttyError> {
@@ -434,11 +407,8 @@ mod tests {
             .await
             .expect("mark seen");
 
-        let agent = store
-            .get_agent("demo")
-            .await
-            .expect("get agent")
-            .expect("agent exists");
+        let agents = store.list_agents().await.expect("list agents");
+        let agent = agents.first().expect("agent exists");
 
         assert!(agent.last_seen.is_some());
         assert_eq!(agent.version.as_deref(), Some("0.2.0"));
