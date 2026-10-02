@@ -18,7 +18,7 @@ The first milestone is intentionally narrow: **reliable shell access to Linux an
 - SSH for session semantics and cryptography; do not invent a terminal protocol.
 - Relay routes sessions; it should not interpret terminal contents.
 - Linux and macOS in v1; Windows is planned for v2.
-- One Rust binary with client, agent, and relay roles.
+- One Rust binary with client, agent, relay, and optional web-console roles.
 - Small control plane: identity, presence, enrollment, authorization, rendezvous, lifecycle.
 - Boring transport first: HTTPS/WSS on TCP/443.
 - SQLite for relay persistence.
@@ -32,7 +32,8 @@ The first milestone is intentionally narrow: **reliable shell access to Linux an
 revtty
 ├── client
 ├── agent
-└── relay
+├── relay
+└── web
 ```
 
 The intended operator experience is:
@@ -42,7 +43,7 @@ revtty list
 revtty connect store-042
 ```
 
-See [docs/BRIEF.md](docs/BRIEF.md) for the product and architecture brief, [docs/V1_SCOPE.md](docs/V1_SCOPE.md) for the approved v1 scope, and [docs/ROADMAP.md](docs/ROADMAP.md) for the release plan.
+See [docs/BRIEF.md](docs/BRIEF.md) for the architecture, [docs/V1_SCOPE.md](docs/V1_SCOPE.md) for the approved v1 scope, [docs/STACK.md](docs/STACK.md) for the vetted build-vs-reuse technology choices, and [docs/ROADMAP.md](docs/ROADMAP.md) for delivery order and v2.
 
 ## Development
 
