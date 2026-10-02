@@ -66,12 +66,16 @@ async fn ssh_authenticates_over_arbitrary_duplex_stream() {
     let client_key = ed25519_key();
     let authorized_client = client_key.public_key().clone();
 
-    let mut server_config = server::Config::default();
-    server_config.keys = vec![server_key];
-    server_config.preferred = ed25519_only();
+    let server_config = server::Config {
+        keys: vec![server_key],
+        preferred: ed25519_only(),
+        ..Default::default()
+    };
 
-    let mut client_config = client::Config::default();
-    client_config.preferred = ed25519_only();
+    let client_config = client::Config {
+        preferred: ed25519_only(),
+        ..Default::default()
+    };
 
     let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
 
