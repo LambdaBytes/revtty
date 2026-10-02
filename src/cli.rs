@@ -85,6 +85,9 @@ pub enum AgentCommand {
         token: String,
     },
 
+    /// Validate the local PTY backend without any remote connection.
+    PtyTest,
+
     /// Show local agent status.
     Status,
 
