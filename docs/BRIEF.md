@@ -21,7 +21,7 @@ A useful shorthand is:
 
 ## 2. The problem
 
-Remote maintenance is easy when the operator controls both sides of the network. It becomes fragile when the target is an appliance, Raspberry Pi, gateway, home server, customer installation, or remote Linux host behind NAT/CGNAT or a restrictive firewall.
+Remote maintenance is easy when the operator controls both sides of the network. It becomes fragile when the target is an appliance, Raspberry Pi, gateway, home server, customer installation, or remote Linux/macOS host behind NAT/CGNAT or a restrictive firewall.
 
 Common workarounds add operational state:
 
@@ -80,7 +80,7 @@ The project should reject scope that does not directly make a secure remote term
 4. **Control plane and data plane are separate.** Presence/rendezvous should not be coupled to terminal data.
 5. **Relay is a router, not a shell server.** CLI-to-agent terminal traffic remains SSH encrypted end to end.
 6. **Boring transport first.** WSS over TCP/443 is preferred initially because reliability through unknown networks matters more than bandwidth or minimum latency.
-7. **Linux first.** Prove one platform properly before adding ConPTY/macOS variants.
+7. **Unix-first v1.** Linux and macOS are first-class v1 client/agent platforms. Keep the PTY and service boundaries clean so Windows/ConPTY can be added in v2 without changing the wire protocol.
 8. **One Rust package, one binary.** Client, agent, and relay are roles of the same codebase until there is a real reason to split them.
 9. **No speculative abstraction.** Add a transport trait only when a second transport exists; extract crates only when reuse actually appears.
 10. **Stable contracts before feature growth.** Version control-plane messages explicitly.
@@ -306,27 +306,36 @@ A relay restart may drop active sessions. Agents reconnect automatically. Attemp
 
 ## 13. Target runtime
 
-The Linux agent should be installed as an ordinary, visible system service.
+The agent is installed as an ordinary, visible native system service.
 
-Expected files:
+### Linux
 
-```text
-/usr/bin/revtty
-/etc/revtty/agent.toml
-/etc/revtty/authorized_keys
-/var/lib/revtty/
-```
-
-systemd is responsible for process lifetime:
+Use systemd for:
 
 - start on boot;
 - restart on crash;
-- watchdog restart if the event loop becomes unhealthy;
-- normal logs through journald.
+- readiness/watchdog signaling;
+- journald-compatible logs.
 
-revtty should not implement hidden persistence mechanisms.
+Expected system-level state follows normal Linux conventions such as `/etc/revtty` and `/var/lib/revtty`.
 
-The account used for the remote shell is configuration, not magic. Running as root must be an explicit administrator choice.
+### macOS
+
+Use launchd for:
+
+- persistent startup;
+- restart behavior;
+- normal macOS service lifecycle.
+
+Use standard macOS application/service locations rather than hard-coded Linux/XDG paths.
+
+### Common rules
+
+- no stealth persistence;
+- secrets use restrictive filesystem permissions;
+- the shell account is explicit configuration;
+- running as root is an administrator choice, not an implicit behavior;
+- PTY/process cleanup must be deterministic on disconnect.
 
 ## 14. Relay deployment
 
@@ -347,14 +356,21 @@ A container deployment may package Caddy + revtty relay, but Docker must not be 
 
 ## 15. CLI surface
 
-The scaffold reserves this small surface:
+The approved v1 surface includes:
 
 ```text
 revtty init
 revtty list
 revtty status <target>
 revtty connect <target>
+revtty exec <target> -- <command...>
+revtty cp <source> <destination>
+revtty forward <target> <local>:<remote>
 revtty doctor
+
+revtty operator list <target>
+revtty operator add <target> --key <public-key>
+revtty operator revoke <target> <fingerprint>
 
 revtty agent enroll --relay <url> --token <token>
 revtty agent run
@@ -364,29 +380,38 @@ revtty agent doctor
 revtty relay init
 revtty relay serve
 revtty relay doctor
+
+revtty web serve
 ```
 
-Commands should remain scriptable and predictable. A machine-readable output contract can be added where it has real operational value.
+Commands remain scriptable and predictable. No TUI is required for v1.
 
-No TUI is needed for the first product.
+The exact approved scope lives in [V1_SCOPE.md](V1_SCOPE.md).
 
 ## 16. Technology choices
 
-These are intended implementation choices, not dependencies that must be added before use:
+The vetted dependency baseline is maintained in [STACK.md](STACK.md). The key rule is to reuse mature protocol/system implementations and keep revtty-specific code focused on lifecycle and policy.
 
-- **Rust / Tokio** — async runtime and one deployable native binary;
+Selected direction:
+
+- **Rust 1.89+ / Tokio** — runtime;
 - **clap** — CLI;
-- **axum** — relay HTTP/WebSocket API;
-- **tokio-tungstenite / axum WebSocket support** — WSS session transport as appropriate;
-- **russh** — SSH session semantics and cryptography;
-- **pty-process or equivalent maintained PTY abstraction** — Linux PTY;
-- **SQLite + rusqlite/tokio-rusqlite** — relay persistence;
-- **crossterm** — local terminal raw mode/resize;
-- **tracing** — structured diagnostics;
-- **sd-notify** — systemd readiness/watchdog;
-- **Caddy** — public TLS termination.
+- **Axum + Tower** — relay/web HTTP and server WebSockets;
+- **Reqwest + reqwest-websocket** — outbound HTTP/WSS with platform trust/proxy behavior;
+- **Russh** — SSH client/server, exec and forwarding;
+- **ssh-key** — OpenSSH key formats, fingerprints and SSHSIG;
+- **russh-sftp** — file transfer;
+- **portable-pty** — cross-platform PTY boundary for Linux/macOS v1 and Windows path later;
+- **crossterm** — local operator terminal;
+- **tokio-rusqlite + bundled SQLite** — relay persistence;
+- **rusqlite_migration** — schema migrations;
+- **directories + Serde/TOML** — portable configuration paths and config;
+- **tracing** — diagnostics;
+- **sd-notify** on Linux; native **launchd plist** on macOS;
+- **xterm.js** — browser terminal;
+- **Caddy** — public TLS/ACME termination.
 
-Every dependency should enter Cargo.toml only when the code actually uses it.
+Dependencies enter `Cargo.toml` only when their code path is implemented. Do not add packages speculatively.
 
 ## 17. Clean-code constraints
 
@@ -457,9 +482,9 @@ Important behaviors:
 - Ctrl-D/exit closes the session;
 - child process is reaped.
 
-## 20. Browser client — future layer
+## 20. Browser client — v1 operator surface
 
-A browser client makes sense after CLI session semantics are stable.
+The browser console is part of the approved v1 scope, implemented after the core CLI session semantics are stable.
 
 The browser should be another operator surface, not another agent-side service:
 
@@ -495,16 +520,21 @@ WSS relay fallback should remain available for restrictive networks.
 
 ## 22. v1 success criterion
 
-v1 is successful when this test is boring and repeatable:
+v1 is successful when the following is boring and repeatable:
 
-1. install a Linux agent on a machine behind NAT;
-2. expose no inbound ports;
-3. reboot target and relay independently;
-4. observe the agent return online automatically;
-5. run `revtty connect <name>` from an authorized operator machine;
-6. receive a real interactive PTY;
-7. resize, interrupt, exit, and reconnect repeatedly without corruption;
-8. reject unauthorized keys and host-key mismatches;
-9. diagnose common failures with `revtty doctor`.
+1. install persistent outbound-only agents on Linux and macOS;
+2. expose no inbound target ports;
+3. reboot targets and relay independently and observe automatic recovery;
+4. list/status targets by stable human-readable name;
+5. open reliable interactive PTYs from authorized Linux/macOS operators;
+6. resize, interrupt, exit, and reconnect without terminal corruption;
+7. reject unauthorized operators and host-key changes;
+8. add/revoke operators without reinstalling the target;
+9. run non-interactive commands through SSH exec;
+10. upload/download files through SFTP;
+11. create safe loopback-by-default local SSH forwards;
+12. access the same targets through the authenticated xterm.js web console;
+13. diagnose common failures with the doctor commands;
+14. keep the relay deployable as one process + SQLite behind ordinary HTTPS/WSS termination.
 
-Everything else is secondary.
+Windows, MQTT, and direct/P2P networking remain v2 work.
