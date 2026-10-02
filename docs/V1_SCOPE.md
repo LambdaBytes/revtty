@@ -135,7 +135,7 @@ The agent runs as one explicit OS account. v1 does not implement a complex PAM/d
 ## 4. Enrollment and identities
 
 - Dedicated Ed25519 operator identity by default.
-- Ability to explicitly use/import an existing compatible operator key.
+- Ability to explicitly use/import an existing compatible Ed25519 operator key.
 - Operator-to-relay control API authentication uses an OpenSSH SSHSIG challenge/response flow rather than a proprietary signature format, followed by a short-lived opaque API session token.
 - Persistent Ed25519 SSH host identity per agent.
 - Separate high-entropy agent-to-relay control credential.
