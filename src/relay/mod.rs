@@ -279,27 +279,132 @@ pub fn doctor() -> Result<(), RevttyError> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
     use futures_util::{SinkExt, StreamExt};
     use reqwest_websocket::Message as ClientMessage;
+    use russh::Preferred;
+    use russh::client as ssh_client;
+    use russh::keys::key::{PrivateKeyWithHashAlg, safe_rng};
+    use russh::keys::{Algorithm, PrivateKey, PublicKey, PublicKeyOrCertificate};
+    use russh::server as ssh_server;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::task::JoinHandle;
 
     use super::{RelayState, authorized, router};
     use crate::protocol::{ControlMessage, ProbeResult};
     use crate::transport::connect_websocket;
 
-    #[test]
-    fn bearer_auth_requires_exact_token() {
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
-
-        assert!(authorized(&headers, "secret"));
-        assert!(!authorized(&headers, "other"));
+    struct TestSshServer {
+        authorized_client: PublicKey,
     }
 
-    #[tokio::test]
-    async fn reverse_probe_round_trip() {
+    impl ssh_server::Handler for TestSshServer {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            public_key: &PublicKey,
+        ) -> Result<ssh_server::Auth, Self::Error> {
+            if public_key == &self.authorized_client {
+                Ok(ssh_server::Auth::Accept)
+            } else {
+                Ok(ssh_server::Auth::reject())
+            }
+        }
+    }
+
+    struct TestSshClient {
+        expected_server_key: PublicKey,
+    }
+
+    impl ssh_client::Handler for TestSshClient {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            server_public_key: &PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(matches!(
+                server_public_key,
+                PublicKeyOrCertificate::PublicKey { key, .. }
+                    if key == &self.expected_server_key
+            ))
+        }
+    }
+
+    fn ed25519_key() -> PrivateKey {
+        let mut rng = safe_rng();
+        PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("generate Ed25519 key")
+    }
+
+    fn ed25519_only() -> Preferred {
+        Preferred {
+            key: Cow::Owned(vec![Algorithm::Ed25519]),
+            ..Preferred::default()
+        }
+    }
+
+    fn websocket_stream(
+        websocket: reqwest_websocket::WebSocket,
+    ) -> (DuplexStream, JoinHandle<()>) {
+        let (application, bridge) = tokio::io::duplex(64 * 1024);
+        let (mut bridge_reader, mut bridge_writer) = tokio::io::split(bridge);
+        let (mut websocket_sender, mut websocket_receiver) = websocket.split();
+
+        let task = tokio::spawn(async move {
+            let outbound = async {
+                let mut buffer = [0_u8; 8192];
+
+                loop {
+                    let read = match bridge_reader.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+
+                    if websocket_sender
+                        .send(ClientMessage::Binary(buffer[..read].to_vec().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            };
+
+            let inbound = async {
+                while let Some(message) = websocket_receiver.next().await {
+                    match message {
+                        Ok(ClientMessage::Binary(data)) => {
+                            if bridge_writer.write_all(&data).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(ClientMessage::Close { .. }) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            };
+
+            tokio::select! {
+                _ = outbound => {}
+                _ = inbound => {}
+            }
+        });
+
+        (application, task)
+    }
+
+    async fn test_relay() -> (
+        RelayState,
+        String,
+        reqwest::Client,
+        JoinHandle<()>,
+    ) {
         let state = RelayState::new("secret".to_owned());
         let app = router(state.clone());
 
@@ -312,15 +417,18 @@ mod tests {
             axum::serve(listener, app).await.expect("serve test relay");
         });
 
-        let relay = format!("ws://{address}");
-        let client = reqwest::Client::new();
-        let agent = connect_websocket(&client, &relay, "/v0/agent/demo", "secret")
-            .await
-            .expect("connect test agent");
+        (
+            state,
+            format!("ws://{address}"),
+            reqwest::Client::new(),
+            server,
+        )
+    }
 
+    async fn wait_for_agent(state: &RelayState, name: &str) {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if state.agents.lock().await.contains_key("demo") {
+                if state.agents.lock().await.contains_key(name) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -328,6 +436,25 @@ mod tests {
         })
         .await
         .expect("agent becomes visible");
+    }
+
+    #[test]
+    fn bearer_auth_requires_exact_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+
+        assert!(authorized(&headers, "secret"));
+        assert!(!authorized(&headers, "other"));
+    }
+
+    #[tokio::test]
+    async fn reverse_probe_round_trip() {
+        let (state, relay, client, server) = test_relay().await;
+        let agent = connect_websocket(&client, &relay, "/v0/agent/demo", "secret")
+            .await
+            .expect("connect test agent");
+
+        wait_for_agent(&state, "demo").await;
 
         let (mut agent_sender, mut agent_receiver) = agent.split();
         let agent_client = client.clone();
@@ -404,5 +531,116 @@ mod tests {
         agent_task.await.expect("agent test task");
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn ssh_authenticates_through_reverse_rendezvous() {
+        let (state, relay, client, relay_task) = test_relay().await;
+
+        let server_key = ed25519_key();
+        let expected_server_key = server_key.public_key().clone();
+
+        let client_key = ed25519_key();
+        let authorized_client = client_key.public_key().clone();
+
+        let agent = connect_websocket(&client, &relay, "/v0/agent/ssh-demo", "secret")
+            .await
+            .expect("connect SSH test agent");
+
+        wait_for_agent(&state, "ssh-demo").await;
+
+        let (mut agent_sender, mut agent_receiver) = agent.split();
+        let agent_client = client.clone();
+        let agent_relay = relay.clone();
+
+        let agent_task = tokio::spawn(async move {
+            while let Some(message) = agent_receiver.next().await {
+                match message.expect("agent control message") {
+                    ClientMessage::Text(text) => {
+                        let control: ControlMessage =
+                            serde_json::from_str(&text).expect("decode session offer");
+
+                        if let ControlMessage::ProbeOffer { session_id, .. } = control {
+                            let path = format!("/v0/session/{session_id}");
+                            let websocket =
+                                connect_websocket(&agent_client, &agent_relay, &path, "secret")
+                                    .await
+                                    .expect("connect SSH agent data path");
+
+                            let (server_stream, bridge_task) = websocket_stream(websocket);
+                            let server_config = ssh_server::Config {
+                                keys: vec![server_key],
+                                preferred: ed25519_only(),
+                                ..Default::default()
+                            };
+
+                            let running = ssh_server::run_stream(
+                                Arc::new(server_config),
+                                server_stream,
+                                TestSshServer { authorized_client },
+                            )
+                            .await
+                            .expect("start SSH server over reverse stream");
+
+                            let _ = running.await;
+                            bridge_task.abort();
+                            let _ = bridge_task.await;
+                            return;
+                        }
+                    }
+                    ClientMessage::Ping(data) => {
+                        agent_sender
+                            .send(ClientMessage::Pong(data))
+                            .await
+                            .expect("send control pong");
+                    }
+                    _ => {}
+                }
+            }
+
+            panic!("agent control connection ended before SSH offer");
+        });
+
+        let operator_websocket =
+            connect_websocket(&client, &relay, "/v0/probe/ssh-demo", "secret")
+                .await
+                .expect("connect SSH operator data path");
+        let (client_stream, operator_bridge) = websocket_stream(operator_websocket);
+
+        let client_config = ssh_client::Config {
+            preferred: ed25519_only(),
+            ..Default::default()
+        };
+
+        let mut session = ssh_client::connect_stream(
+            Arc::new(client_config),
+            client_stream,
+            TestSshClient {
+                expected_server_key,
+            },
+        )
+        .await
+        .expect("connect SSH through reverse relay");
+
+        let auth = session
+            .authenticate_publickey(
+                "revtty",
+                PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
+            )
+            .await
+            .expect("authenticate SSH operator through relay");
+
+        assert!(
+            auth.success(),
+            "Ed25519 authentication should succeed through relay"
+        );
+
+        drop(session);
+        operator_bridge.abort();
+        let _ = operator_bridge.await;
+        agent_task.abort();
+        let _ = agent_task.await;
+        relay_task.abort();
+        let _ = relay_task.await;
     }
 }
