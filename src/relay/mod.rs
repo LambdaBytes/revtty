@@ -2,18 +2,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::error::RevttyError;
-use crate::protocol::{ControlMessage, CONTROL_PROTOCOL_VERSION};
+use crate::protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage};
 use crate::transport::valid_name;
 
 const CONTROL_QUEUE_DEPTH: usize = 16;
