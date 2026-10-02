@@ -293,7 +293,8 @@ impl Store {
                     })
                 })?;
 
-                rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StoreError::from)
             })
             .await
             .map_err(|error| RevttyError::runtime("list enrolled agents", error))
