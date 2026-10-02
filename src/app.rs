@@ -15,7 +15,7 @@ pub async fn run(args: Args) -> Result<(), RevttyError> {
         Command::Doctor => crate::client::doctor(),
         Command::Agent { command } => match command {
             AgentCommand::Enroll { relay, token } => crate::agent::enroll(&relay, &token).await,
-            AgentCommand::Run => crate::agent::run().await
+            AgentCommand::Run => crate::agent::run().await,
             AgentCommand::PtyTest => crate::agent::pty_test(),
             AgentCommand::Status => crate::agent::status(),
             AgentCommand::Doctor => crate::agent::doctor(),
