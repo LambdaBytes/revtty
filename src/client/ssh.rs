@@ -134,7 +134,7 @@ pub async fn connect_terminal(
                         }
                         Ok(read) => {
                             channel
-                                .data(&input[..read])
+                                .data_bytes(input[..read].to_vec())
                                 .await
                                 .map_err(|error| RevttyError::runtime("send terminal input", error))?;
                         }

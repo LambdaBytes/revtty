@@ -470,7 +470,7 @@ mod tests {
     use std::time::Duration;
 
     use russh::ChannelMsg;
-    use russh::client;
+    use russh::{client, server};
     use russh::keys::key::{PrivateKeyWithHashAlg, safe_rng};
     use russh::keys::{Algorithm, PrivateKey, PublicKey, PublicKeyOrCertificate};
 
@@ -569,7 +569,7 @@ mod tests {
         ]
         .concat();
         channel
-            .data(command)
+            .data_bytes(command)
             .await
             .expect("send shell command");
 
