@@ -95,8 +95,7 @@ mod tests {
             session_id: "shell-session".to_owned(),
         };
         let json = serde_json::to_string(&message).expect("serialize shell offer");
-        let decoded: ControlMessage =
-            serde_json::from_str(&json).expect("deserialize shell offer");
+        let decoded: ControlMessage = serde_json::from_str(&json).expect("deserialize shell offer");
         assert!(decoded == message);
     }
 
