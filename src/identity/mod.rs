@@ -17,7 +17,6 @@ const AGENT_KEY_FILE: &str = "agent_ed25519";
 const AGENT_PUBLIC_KEY_FILE: &str = "agent_ed25519.pub";
 
 pub struct AgentIdentity {
-    pub private_key_path: PathBuf,
     pub public_key: String,
     pub fingerprint: String,
     pub created: bool,
@@ -60,7 +59,6 @@ pub fn ensure_agent(paths: &Paths) -> Result<AgentIdentity, RevttyError> {
         .map_err(|error| RevttyError::runtime("write agent public key", error))?;
 
     Ok(AgentIdentity {
-        private_key_path,
         public_key: public_text,
         fingerprint: public_key.fingerprint(HashAlg::Sha256).to_string(),
         created,
