@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::error::RevttyError;
 use crate::protocol::{
-    CONTROL_PROTOCOL_VERSION, OPERATOR_AUTH_NAMESPACE, ControlMessage, EnrollRequest,
-    EnrollResponse, OperatorAuthRequest, OperatorAuthResponse, OperatorChallengeResponse,
+    CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse,
+    OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest, OperatorAuthResponse, OperatorChallengeResponse,
     operator_auth_message,
 };
 use crate::storage::Store;
@@ -224,10 +224,7 @@ async fn enroll_agent(
     }
 }
 
-async fn operator_challenge(
-    State(state): State<RelayState>,
-    Path(name): Path<String>,
-) -> Response {
+async fn operator_challenge(State(state): State<RelayState>, Path(name): Path<String>) -> Response {
     if !valid_name(&name) {
         return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
     }
