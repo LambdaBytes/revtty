@@ -98,6 +98,11 @@ pub async fn probe(target: &str, relay: &str) -> Result<(), RevttyError> {
         .await
         .map_err(|error| RevttyError::runtime("decode operator authentication", error))?;
 
+    let host_pin = crate::identity::pin_agent_host_key(&paths, relay, target, &auth.host_key)?;
+    if host_pin.created {
+        eprintln!("pinned host key {}", host_pin.fingerprint);
+    }
+
     let path = format!("/v1/probe/{target}");
     let mut websocket = connect_websocket(&client, relay, &path, &auth.session_token).await?;
 
