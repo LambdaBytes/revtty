@@ -692,10 +692,7 @@ async fn handle_operator_session(
     }
 
     if control
-        .send(kind.offer(
-            session_id.clone(),
-            agent_token.expose().to_owned(),
-        ))
+        .send(kind.offer(session_id.clone(), agent_token.expose().to_owned()))
         .await
         .is_err()
     {
@@ -1036,7 +1033,10 @@ mod tests {
                         let replay =
                             connect_websocket(&agent_http, &agent_relay, &path, &tunnel_token)
                                 .await;
-                        assert!(replay.is_err(), "agent tunnel credential must be single-use");
+                        assert!(
+                            replay.is_err(),
+                            "agent tunnel credential must be single-use"
+                        );
 
                         let result = ProbeResult {
                             name: "signed-demo".to_owned(),
