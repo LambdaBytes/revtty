@@ -1096,6 +1096,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_operator_ssh_uses_enrolled_keys() {
+        let store = Store::open_in_memory()
+            .await
+            .expect("open in-memory relay store");
+        let state = RelayState::new("secret".to_owned(), store.clone());
+        let app = router(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test relay");
+        let address = listener.local_addr().expect("test relay address");
+
+        let relay_server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test relay");
+        });
+
+        let operator_private = ed25519_key();
+        let operator_public = operator_private.public_key().clone();
+        let operator_key = operator_public.to_openssh().expect("operator key");
+
+        let agent_private = ed25519_key();
+        let expected_server_key = agent_private.public_key().clone();
+        let host_key = expected_server_key.to_openssh().expect("agent host key");
+
+        let enrollment = store
+            .create_enrollment("signed-ssh", &operator_key, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        let credential = store
+            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .await
+            .expect("consume enrollment");
+
+        let relay = format!("ws://{address}");
+        let http = reqwest::Client::new();
+        let agent = connect_websocket(
+            &http,
+            &relay,
+            "/v1/agent/signed-ssh",
+            credential.control_token.expose(),
+        )
+        .await
+        .expect("connect persistent agent");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.agents.lock().await.contains_key("signed-ssh") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("agent becomes visible");
+
+        let (_agent_sender, mut agent_receiver) = agent.split();
+        let agent_http = http.clone();
+        let agent_relay = relay.clone();
+        let control_token = credential.control_token.expose().to_owned();
+
+        let agent_task = tokio::spawn(async move {
+            while let Some(message) = agent_receiver.next().await {
+                if let ClientMessage::Text(text) = message.expect("agent control message") {
+                    let control: ControlMessage =
+                        serde_json::from_str(&text).expect("decode SSH session offer");
+
+                    if let ControlMessage::ProbeOffer { session_id, .. } = control {
+                        let path = format!("/v1/session/{session_id}");
+                        let websocket =
+                            connect_websocket(&agent_http, &agent_relay, &path, &control_token)
+                                .await
+                                .expect("connect authenticated agent SSH session");
+                        let (server_stream, bridge_task) = websocket_byte_stream(websocket);
+
+                        let server_config = server::Config {
+                            keys: vec![agent_private],
+                            preferred: ed25519_only(),
+                            ..Default::default()
+                        };
+
+                        let running = server::run_stream(
+                            Arc::new(server_config),
+                            server_stream,
+                            TestServer {
+                                authorized_client: operator_public,
+                            },
+                        )
+                        .await
+                        .expect("start enrolled SSH server through relay");
+
+                        let _ = running.await;
+                        bridge_task.abort();
+                        let _ = bridge_task.await;
+                        return;
+                    }
+                }
+            }
+
+            panic!("agent control connection ended before signed SSH offer");
+        });
+
+        let challenge_response = http
+            .post(format!(
+                "http://{address}/v1/operator/challenge/signed-ssh"
+            ))
+            .send()
+            .await
+            .expect("request operator challenge");
+        assert_eq!(challenge_response.status(), reqwest::StatusCode::OK);
+
+        let challenge: OperatorChallengeResponse = challenge_response
+            .json()
+            .await
+            .expect("decode operator challenge");
+        let message = operator_auth_message("signed-ssh", &challenge.challenge);
+        let signature = operator_private
+            .sign(
+                OPERATOR_AUTH_NAMESPACE,
+                RusshHashAlg::Sha256,
+                message.as_bytes(),
+            )
+            .expect("sign operator challenge")
+            .to_pem(ssh_key::LineEnding::LF)
+            .expect("encode operator signature");
+
+        let auth_response = http
+            .post(format!("http://{address}/v1/operator/auth/signed-ssh"))
+            .json(&OperatorAuthRequest {
+                challenge: challenge.challenge,
+                signature,
+            })
+            .send()
+            .await
+            .expect("authenticate operator");
+        assert_eq!(auth_response.status(), reqwest::StatusCode::CREATED);
+
+        let auth: OperatorAuthResponse = auth_response
+            .json()
+            .await
+            .expect("decode operator auth response");
+
+        let operator_websocket =
+            connect_websocket(&http, &relay, "/v1/probe/signed-ssh", &auth.session_token)
+                .await
+                .expect("connect signed SSH operator path");
+        let (client_stream, client_bridge) = websocket_byte_stream(operator_websocket);
+
+        let client_config = client::Config {
+            preferred: ed25519_only(),
+            ..Default::default()
+        };
+
+        let mut session = client::connect_stream(
+            Arc::new(client_config),
+            client_stream,
+            TestClient {
+                expected_server_key,
+            },
+        )
+        .await
+        .expect("connect SSH client through signed v1 path");
+
+        let auth = session
+            .authenticate_publickey(
+                "revtty",
+                PrivateKeyWithHashAlg::new(Arc::new(operator_private), None),
+            )
+            .await
+            .expect("authenticate enrolled operator SSH key");
+
+        assert!(
+            auth.success(),
+            "enrolled operator key should authenticate to enrolled host key"
+        );
+
+        drop(session);
+        client_bridge.abort();
+        let _ = client_bridge.await;
+        agent_task.abort();
+        let _ = agent_task.await;
+        relay_server.abort();
+        let _ = relay_server.await;
+    }
+
+    #[tokio::test]
     async fn reverse_probe_round_trip() {
         let store = Store::open_in_memory()
             .await
