@@ -7,7 +7,6 @@ pub fn operator_auth_message(agent_name: &str, challenge: &str) -> String {
     format!("revtty-control-v1\nagent={agent_name}\nchallenge={challenge}\n")
 }
 
-
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
