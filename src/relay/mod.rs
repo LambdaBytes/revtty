@@ -727,7 +727,6 @@ mod tests {
         Algorithm, HashAlg as RusshHashAlg, PrivateKey, PublicKey, PublicKeyOrCertificate,
     };
     use russh::server;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::{RelayState, authorized, router};
     use crate::protocol::{
@@ -736,7 +735,7 @@ mod tests {
         operator_auth_message,
     };
     use crate::storage::Store;
-    use crate::transport::connect_websocket;
+    use crate::transport::{connect_websocket, websocket_byte_stream};
 
     struct TestServer {
         authorized_client: PublicKey,
@@ -787,55 +786,6 @@ mod tests {
             key: Cow::Owned(vec![Algorithm::Ed25519]),
             ..Preferred::default()
         }
-    }
-
-    async fn websocket_byte_stream(
-        websocket: reqwest_websocket::WebSocket,
-    ) -> (DuplexStream, tokio::task::JoinHandle<()>) {
-        let (application, bridge) = tokio::io::duplex(64 * 1024);
-        let (mut websocket_tx, mut websocket_rx) = websocket.split();
-        let (mut bridge_rx, mut bridge_tx) = tokio::io::split(bridge);
-
-        let task = tokio::spawn(async move {
-            let websocket_to_stream = async {
-                while let Some(message) = websocket_rx.next().await {
-                    match message {
-                        Ok(ClientMessage::Binary(data)) => {
-                            bridge_tx.write_all(&data).await?;
-                        }
-                        Ok(ClientMessage::Close { .. }) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
-
-                Ok::<(), std::io::Error>(())
-            };
-
-            let stream_to_websocket = async {
-                let mut buffer = [0_u8; 8192];
-
-                loop {
-                    let read = bridge_rx.read(&mut buffer).await?;
-                    if read == 0 {
-                        break;
-                    }
-
-                    websocket_tx
-                        .send(ClientMessage::Binary(buffer[..read].to_vec().into()))
-                        .await
-                        .map_err(std::io::Error::other)?;
-                }
-
-                Ok::<(), std::io::Error>(())
-            };
-
-            tokio::select! {
-                _ = websocket_to_stream => {}
-                _ = stream_to_websocket => {}
-            }
-        });
-
-        (application, task)
     }
 
     #[test]
@@ -1169,7 +1119,7 @@ mod tests {
                             connect_websocket(&agent_http, &agent_relay, &path, &control_token)
                                 .await
                                 .expect("connect authenticated agent SSH session");
-                        let (server_stream, bridge_task) = websocket_byte_stream(websocket).await;
+                        let (server_stream, bridge_task) = websocket_byte_stream(websocket);
 
                         let server_config = server::Config {
                             keys: vec![agent_private],
@@ -1240,7 +1190,7 @@ mod tests {
             connect_websocket(&http, &relay, "/v1/probe/signed-ssh", &auth.session_token)
                 .await
                 .expect("connect signed SSH operator path");
-        let (client_stream, client_bridge) = websocket_byte_stream(operator_websocket).await;
+        let (client_stream, client_bridge) = websocket_byte_stream(operator_websocket);
 
         let client_config = client::Config {
             preferred: ed25519_only(),
@@ -1448,7 +1398,7 @@ mod tests {
                                 .await
                                 .expect("connect agent SSH session");
 
-                        let (server_stream, bridge_task) = websocket_byte_stream(websocket).await;
+                        let (server_stream, bridge_task) = websocket_byte_stream(websocket);
                         let server_config = server::Config {
                             keys: vec![server_key],
                             preferred: ed25519_only(),
@@ -1477,7 +1427,7 @@ mod tests {
         let operator = connect_websocket(&http, &relay, "/v0/probe/demo", "secret")
             .await
             .expect("connect operator SSH session");
-        let (client_stream, client_bridge) = websocket_byte_stream(operator).await;
+        let (client_stream, client_bridge) = websocket_byte_stream(operator);
 
         let client_config = client::Config {
             preferred: ed25519_only(),
