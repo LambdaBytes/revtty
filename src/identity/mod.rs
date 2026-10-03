@@ -260,10 +260,67 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    use ssh_key::rand_core::OsRng;
+    use ssh_key::{Algorithm, PrivateKey};
     use uuid::Uuid;
 
-    use super::ensure_operator;
+    use super::{ensure_operator, pin_agent_host_key};
     use crate::config::Paths;
+
+    #[test]
+    fn host_key_pinning_is_stable_and_rejects_changes() {
+        let root = std::env::temp_dir().join(format!("revtty-known-hosts-{}", Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+
+        let first_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+            .expect("first agent key")
+            .public_key()
+            .to_openssh()
+            .expect("first agent public key");
+        let second_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+            .expect("second agent key")
+            .public_key()
+            .to_openssh()
+            .expect("second agent public key");
+
+        let first = pin_agent_host_key(
+            &paths,
+            "https://relay.example.com/",
+            "store-042",
+            &first_key,
+        )
+        .expect("pin first host key");
+        assert!(first.created);
+
+        let same = pin_agent_host_key(
+            &paths,
+            "wss://relay.example.com",
+            "store-042",
+            &first_key,
+        )
+        .expect("reuse same host key");
+        assert!(!same.created);
+        assert_eq!(same.fingerprint, first.fingerprint);
+
+        let mismatch =
+            pin_agent_host_key(&paths, "https://relay.example.com", "store-042", &second_key);
+        assert!(mismatch.is_err());
+
+        let other_relay = pin_agent_host_key(
+            &paths,
+            "https://other-relay.example.com",
+            "store-042",
+            &second_key,
+        )
+        .expect("pin same name on another relay");
+        assert!(other_relay.created);
+
+        let known_hosts = fs::read_to_string(paths.config_dir.join("known_hosts"))
+            .expect("read known_hosts");
+        assert_eq!(known_hosts.lines().count(), 2);
+
+        fs::remove_dir_all(root).expect("clean known_hosts test directory");
+    }
 
     #[test]
     fn operator_identity_is_stable_and_private() {
