@@ -272,6 +272,35 @@ impl Store {
             .map_err(|error| RevttyError::runtime("update agent presence", error))
     }
 
+    pub async fn get_agent(&self, agent_name: &str) -> Result<Option<AgentRecord>, RevttyError> {
+        let name = agent_name.to_owned();
+
+        self.conn
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT id, name, host_key, operator_key, created_at, last_seen, version
+                     FROM agents
+                     WHERE name = ?1",
+                    params![name],
+                    |row| {
+                        Ok(AgentRecord {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            host_key: row.get(2)?,
+                            operator_key: row.get(3)?,
+                            created_at: row.get(4)?,
+                            last_seen: row.get(5)?,
+                            version: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(StoreError::from)
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("get enrolled agent", error))
+    }
+
     pub async fn list_agents(&self) -> Result<Vec<AgentRecord>, RevttyError> {
         self.conn
             .call(|conn| {
