@@ -29,7 +29,7 @@ secrecy = "0.10"
 sha2 = "0.11"
 ssh-key = { version = "0.6.7", default-features = false, features = ["ed25519", "getrandom", "std"] }
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rusqlite = { version = "0.8", features = ["bundled"] }
 toml = "1.1"
 uuid = { version = "1", features = ["v4"] }

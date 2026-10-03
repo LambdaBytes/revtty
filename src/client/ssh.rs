@@ -2,10 +2,12 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use reqwest_websocket::WebSocket;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{Algorithm, PrivateKey, PublicKey, PublicKeyOrCertificate};
-use russh::{Disconnect, Preferred, client};
+use russh::{ChannelMsg, Disconnect, Preferred, client};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::RevttyError;
 use crate::transport::websocket_byte_stream;
@@ -29,6 +31,22 @@ impl client::Handler for ClientHandler {
     }
 }
 
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> Result<Self, RevttyError> {
+        enable_raw_mode()
+            .map_err(|error| RevttyError::runtime("enable local terminal raw mode", error))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
 fn ed25519_only() -> Preferred {
     Preferred {
         key: Cow::Owned(vec![Algorithm::Ed25519]),
@@ -36,11 +54,11 @@ fn ed25519_only() -> Preferred {
     }
 }
 
-pub async fn authenticate(
+pub async fn connect_terminal(
     websocket: WebSocket,
     operator_key_path: &Path,
     encoded_host_key: &str,
-) -> Result<(), RevttyError> {
+) -> Result<u32, RevttyError> {
     let operator_key = PrivateKey::read_openssh_file(operator_key_path)
         .map_err(|error| RevttyError::runtime("read operator SSH private key", error))?;
     let expected_server_key = PublicKey::from_openssh(encoded_host_key)
@@ -82,10 +100,86 @@ pub async fn authenticate(
             return Err(RevttyError::message("SSH public-key authentication failed"));
         }
 
-        session
-            .disconnect(Disconnect::ByApplication, "", "English")
+        let mut channel = session
+            .channel_open_session()
             .await
-            .map_err(|error| RevttyError::runtime("close SSH transport", error))
+            .map_err(|error| RevttyError::runtime("open SSH terminal channel", error))?;
+
+        let (cols, rows) = size().unwrap_or((80, 24));
+        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
+
+        channel
+            .request_pty(false, &term, u32::from(cols), u32::from(rows), 0, 0, &[])
+            .await
+            .map_err(|error| RevttyError::runtime("request remote PTY", error))?;
+        channel
+            .request_shell(false)
+            .await
+            .map_err(|error| RevttyError::runtime("request remote shell", error))?;
+
+        let _raw_mode = RawModeGuard::enter()?;
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+        let mut input = [0_u8; 4096];
+        let mut stdin_closed = false;
+        let mut exit_status = None;
+
+        loop {
+            tokio::select! {
+                read = stdin.read(&mut input), if !stdin_closed => {
+                    match read {
+                        Ok(0) => {
+                            stdin_closed = true;
+                            let _ = channel.eof().await;
+                        }
+                        Ok(read) => {
+                            channel
+                                .data(&input[..read])
+                                .await
+                                .map_err(|error| RevttyError::runtime("send terminal input", error))?;
+                        }
+                        Err(error) => {
+                            return Err(RevttyError::runtime("read local terminal input", error));
+                        }
+                    }
+                }
+                message = channel.wait() => {
+                    match message {
+                        Some(ChannelMsg::Data { data }) => {
+                            stdout
+                                .write_all(&data)
+                                .await
+                                .map_err(|error| RevttyError::runtime("write terminal output", error))?;
+                            stdout
+                                .flush()
+                                .await
+                                .map_err(|error| RevttyError::runtime("flush terminal output", error))?;
+                        }
+                        Some(ChannelMsg::ExtendedData { data, .. }) => {
+                            stdout
+                                .write_all(&data)
+                                .await
+                                .map_err(|error| RevttyError::runtime("write terminal output", error))?;
+                            stdout
+                                .flush()
+                                .await
+                                .map_err(|error| RevttyError::runtime("flush terminal output", error))?;
+                        }
+                        Some(ChannelMsg::ExitStatus { exit_status: status }) => {
+                            exit_status = Some(status);
+                        }
+                        Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let _ = session
+            .disconnect(Disconnect::ByApplication, "", "English")
+            .await;
+
+        Ok(exit_status.unwrap_or(0))
     }
     .await;
 

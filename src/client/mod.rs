@@ -159,15 +159,14 @@ pub async fn connect(target: &str, relay: &str) -> Result<(), RevttyError> {
     let websocket =
         connect_websocket(&operator.client, relay, &path, &operator.auth.session_token).await?;
 
-    ssh::authenticate(
+    let status = ssh::connect_terminal(
         websocket,
         &operator.private_key_path,
         &operator.auth.host_key,
     )
     .await?;
 
-    println!("target   {target}");
-    println!("status   secure SSH transport established");
+    eprintln!("\r\nconnection closed (exit {status})");
     Ok(())
 }
 
