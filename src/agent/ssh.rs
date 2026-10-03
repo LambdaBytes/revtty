@@ -468,9 +468,9 @@ mod tests {
     use std::time::Duration;
 
     use russh::ChannelMsg;
-    use russh::{client, server};
     use russh::keys::key::{PrivateKeyWithHashAlg, safe_rng};
     use russh::keys::{Algorithm, PrivateKey, PublicKey, PublicKeyOrCertificate};
+    use russh::{client, server};
 
     use super::{AgentSshHandler, ed25519_only};
 
@@ -564,7 +564,10 @@ mod tests {
             b"\n".as_slice(),
         ]
         .concat();
-        channel.data_bytes(command).await.expect("send shell command");
+        channel
+            .data_bytes(command)
+            .await
+            .expect("send shell command");
 
         let output = tokio::time::timeout(Duration::from_secs(8), async {
             let mut output = Vec::new();
