@@ -2,7 +2,7 @@ mod config;
 mod ssh;
 
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -19,6 +19,59 @@ use crate::protocol::{
     CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse, ProbeResult,
 };
 use crate::transport::{connect_websocket, http_url, valid_name};
+
+const RECONNECT_BASE_MILLIS: u64 = 1_000;
+const RECONNECT_CAP_MILLIS: u64 = 30_000;
+const RECONNECT_JITTER_PERCENT: u64 = 20;
+
+#[derive(Debug, Default)]
+struct ReconnectBackoff {
+    failures: u32,
+}
+
+impl ReconnectBackoff {
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let failures = self.failures;
+        self.failures = self.failures.saturating_add(1);
+
+        Duration::from_millis(reconnect_delay_millis(failures, jitter_sample(failures)))
+    }
+}
+
+fn reconnect_base_millis(failures: u32) -> u64 {
+    let multiplier = 1_u64 << failures.min(31);
+    RECONNECT_BASE_MILLIS
+        .saturating_mul(multiplier)
+        .min(RECONNECT_CAP_MILLIS)
+}
+
+fn reconnect_delay_millis(failures: u32, sample: u64) -> u64 {
+    let base = reconnect_base_millis(failures);
+    let spread = base.saturating_mul(RECONNECT_JITTER_PERCENT) / 100;
+    let floor = base.saturating_sub(spread);
+
+    floor + sample % (spread + 1)
+}
+
+fn jitter_sample(failures: u32) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut value = (now as u64)
+        ^ ((now >> 64) as u64)
+        ^ (u64::from(std::process::id()) << 32)
+        ^ u64::from(failures);
+
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    value
+}
 
 pub async fn enroll(relay: &str, token: &str) -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
@@ -101,6 +154,7 @@ pub async fn run() -> Result<(), RevttyError> {
     }
 
     let client = reqwest::Client::new();
+    let mut backoff = ReconnectBackoff::default();
 
     loop {
         let control = run_control_once(
@@ -109,6 +163,7 @@ pub async fn run() -> Result<(), RevttyError> {
             &config.name,
             &config.control_token,
             &config.operator_key,
+            &mut backoff,
         );
 
         tokio::select! {
@@ -123,8 +178,11 @@ pub async fn run() -> Result<(), RevttyError> {
             }
         }
 
+        let delay = backoff.next_delay();
+        eprintln!("reconnecting in {:.1}s", delay.as_secs_f64());
+
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = tokio::time::sleep(delay) => {}
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| RevttyError::runtime("wait for Ctrl-C", error))?;
                 return Ok(());
@@ -139,6 +197,7 @@ async fn run_control_once(
     name: &str,
     token: &str,
     operator_key: &str,
+    backoff: &mut ReconnectBackoff,
 ) -> Result<(), RevttyError> {
     let path = format!("/v1/agent/{name}");
     let websocket = connect_websocket(client, relay, &path, token).await?;
@@ -154,6 +213,7 @@ async fn run_control_once(
     )
     .await?;
 
+    backoff.reset();
     eprintln!("agent {name} connected to {relay}");
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
@@ -378,7 +438,52 @@ pub fn doctor() -> Result<(), RevttyError> {
 
 #[cfg(test)]
 mod tests {
-    use super::pty_test;
+    use super::{
+        RECONNECT_JITTER_PERCENT, ReconnectBackoff, pty_test, reconnect_base_millis,
+        reconnect_delay_millis,
+    };
+
+    #[test]
+    fn reconnect_backoff_grows_and_caps() {
+        let expected = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+
+        for (failures, expected_millis) in expected.into_iter().enumerate() {
+            assert_eq!(
+                reconnect_base_millis(failures as u32),
+                expected_millis,
+                "unexpected delay at failure {failures}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_jitter_stays_bounded() {
+        for failures in 0..10 {
+            let base = reconnect_base_millis(failures);
+            let spread = base * RECONNECT_JITTER_PERCENT / 100;
+            let floor = base - spread;
+
+            assert_eq!(reconnect_delay_millis(failures, 0), floor);
+
+            let high = reconnect_delay_millis(failures, u64::MAX);
+            assert!(high >= floor);
+            assert!(high <= base);
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_reset_restarts_sequence() {
+        let mut backoff = ReconnectBackoff::default();
+        let first = backoff.next_delay();
+        let second = backoff.next_delay();
+
+        assert!(first <= std::time::Duration::from_secs(1));
+        assert!(second >= std::time::Duration::from_millis(1_600));
+
+        backoff.reset();
+        let reset = backoff.next_delay();
+        assert!(reset <= std::time::Duration::from_secs(1));
+    }
 
     #[test]
     fn portable_pty_smoke_test() {
