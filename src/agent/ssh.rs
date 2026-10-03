@@ -57,9 +57,7 @@ pub async fn serve(
             .map_err(|error| RevttyError::runtime("parse authorized operator key", error))?;
 
         if authorized_operator.algorithm() != Algorithm::Ed25519 {
-            return Err(RevttyError::message(
-                "v1 requires an Ed25519 operator key",
-            ));
+            return Err(RevttyError::message("v1 requires an Ed25519 operator key"));
         }
 
         let config = server::Config {
