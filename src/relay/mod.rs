@@ -4,21 +4,19 @@ use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{Json, Router};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use ssh_key::{Algorithm, HashAlg, PublicKey};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::error::RevttyError;
-use crate::protocol::{
-    CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse,
-};
+use crate::protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse};
 use crate::storage::Store;
 use crate::transport::valid_name;
 
@@ -651,7 +649,9 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_enrollment_and_agent_auth_round_trip() {
-        let store = Store::open_in_memory().await.expect("open in-memory relay store");
+        let store = Store::open_in_memory()
+            .await
+            .expect("open in-memory relay store");
         let state = RelayState::new("secret".to_owned(), store.clone());
         let app = router(state);
 
@@ -664,7 +664,10 @@ mod tests {
             axum::serve(listener, app).await.expect("serve test relay");
         });
 
-        let operator_key = ed25519_key().public_key().to_openssh().expect("operator key");
+        let operator_key = ed25519_key()
+            .public_key()
+            .to_openssh()
+            .expect("operator key");
         let host_key = ed25519_key().public_key().to_openssh().expect("host key");
 
         let enrollment = store
@@ -705,7 +708,10 @@ mod tests {
             .post(format!("http://{address}/v1/enroll"))
             .json(&EnrollRequest {
                 token: enrollment.token.expose().to_owned(),
-                host_key: ed25519_key().public_key().to_openssh().expect("second host key"),
+                host_key: ed25519_key()
+                    .public_key()
+                    .to_openssh()
+                    .expect("second host key"),
                 version: "0.1.0".to_owned(),
             })
             .send()
@@ -720,7 +726,9 @@ mod tests {
 
     #[tokio::test]
     async fn reverse_probe_round_trip() {
-        let store = Store::open_in_memory().await.expect("open in-memory relay store");
+        let store = Store::open_in_memory()
+            .await
+            .expect("open in-memory relay store");
         let state = RelayState::new("secret".to_owned(), store);
         let app = router(state.clone());
 
@@ -829,7 +837,9 @@ mod tests {
 
     #[tokio::test]
     async fn ssh_authenticates_through_reverse_relay() {
-        let store = Store::open_in_memory().await.expect("open in-memory relay store");
+        let store = Store::open_in_memory()
+            .await
+            .expect("open in-memory relay store");
         let state = RelayState::new("secret".to_owned(), store);
         let app = router(state.clone());
 

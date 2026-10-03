@@ -299,8 +299,6 @@ impl Store {
             .await
             .map_err(|error| RevttyError::runtime("list enrolled agents", error))
     }
-
-
 }
 
 async fn initialize(conn: &Connection) -> Result<(), RevttyError> {

@@ -10,8 +10,13 @@ pub enum ControlMessage {
         name: String,
         agent_version: String,
     },
-    Heartbeat { version: u16 },
-    ProbeOffer { version: u16, session_id: String },
+    Heartbeat {
+        version: u16,
+    },
+    ProbeOffer {
+        version: u16,
+        session_id: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -14,7 +14,9 @@ use crate::config::Paths;
 use crate::identity::ensure_agent;
 
 use crate::error::RevttyError;
-use crate::protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse, ProbeResult};
+use crate::protocol::{
+    CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse, ProbeResult,
+};
 use crate::transport::{connect_websocket, http_url, valid_name};
 
 pub async fn enroll(relay: &str, token: &str) -> Result<(), RevttyError> {
@@ -61,9 +63,7 @@ pub async fn enroll(relay: &str, token: &str) -> Result<(), RevttyError> {
     let operator_key = PublicKey::from_openssh(&enrolled.operator_key)
         .map_err(|error| RevttyError::runtime("parse enrolled operator key", error))?;
     if operator_key.algorithm() != Algorithm::Ed25519 {
-        return Err(RevttyError::message(
-            "v1 requires an Ed25519 operator key",
-        ));
+        return Err(RevttyError::message("v1 requires an Ed25519 operator key"));
     }
 
     AgentConfig {
@@ -79,7 +79,11 @@ pub async fn enroll(relay: &str, token: &str) -> Result<(), RevttyError> {
     println!("host       {}", identity.fingerprint);
     println!(
         "identity   {}",
-        if identity.created { "created" } else { "existing" }
+        if identity.created {
+            "created"
+        } else {
+            "existing"
+        }
     );
     println!("config     {}", AgentConfig::path(&paths).display());
     Ok(())
@@ -98,12 +102,7 @@ pub async fn run() -> Result<(), RevttyError> {
     let client = reqwest::Client::new();
 
     loop {
-        let control = run_control_once(
-            &client,
-            &config.relay,
-            &config.name,
-            &config.control_token,
-        );
+        let control = run_control_once(&client, &config.relay, &config.name, &config.control_token);
 
         tokio::select! {
             result = control => {
@@ -338,10 +337,7 @@ pub fn doctor() -> Result<(), RevttyError> {
     println!("agent      configured");
     println!("name       {}", config.name);
     println!("host key   {}", identity.fingerprint);
-    println!(
-        "protocol   v{}",
-        crate::protocol::CONTROL_PROTOCOL_VERSION
-    );
+    println!("protocol   v{}", crate::protocol::CONTROL_PROTOCOL_VERSION);
     Ok(())
 }
 
