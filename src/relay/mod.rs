@@ -209,10 +209,7 @@ fn router(state: RelayState) -> Router {
         .route("/v0/probe/{name}", get(probe_upgrade))
         .route("/v0/session/{session_id}", get(session_upgrade))
         .route("/v1/enroll", post(enroll_agent))
-        .route(
-            "/v1/operator/list/challenge",
-            post(operator_list_challenge),
-        )
+        .route("/v1/operator/list/challenge", post(operator_list_challenge))
         .route("/v1/operator/list", post(operator_list))
         .route("/v1/operator/challenge/{name}", post(operator_challenge))
         .route("/v1/operator/auth/{name}", post(operator_auth))
@@ -288,10 +285,7 @@ async fn operator_list_challenge(State(state): State<RelayState>) -> Response {
     issue_operator_challenge(&state, OperatorChallengeScope::List).await
 }
 
-async fn issue_operator_challenge(
-    state: &RelayState,
-    scope: OperatorChallengeScope,
-) -> Response {
+async fn issue_operator_challenge(state: &RelayState, scope: OperatorChallengeScope) -> Response {
     let challenge = match SecretToken::generate("rvc") {
         Ok(challenge) => challenge.expose().to_owned(),
         Err(error) => {
@@ -457,7 +451,10 @@ async fn operator_list(
 
     let online = {
         let connected = state.agents.lock().await;
-        connected.keys().cloned().collect::<std::collections::HashSet<_>>()
+        connected
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
     };
 
     let mut visible = Vec::new();
@@ -1132,9 +1129,7 @@ mod tests {
 
         let http = reqwest::Client::new();
         let challenge_response = http
-            .post(format!(
-                "http://{address}/v1/operator/list/challenge"
-            ))
+            .post(format!("http://{address}/v1/operator/list/challenge"))
             .send()
             .await
             .expect("request operator list challenge");
