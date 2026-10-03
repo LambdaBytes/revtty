@@ -14,12 +14,14 @@ categories = ["command-line-utilities", "network-programming"]
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.29"
 directories = "6"
 futures-util = "0.3"
 getrandom = "0.4"
 portable-pty = "0.9"
 reqwest = { version = "0.13", features = ["json"] }
 reqwest-websocket = "0.6"
+russh = { version = "0.63", default-features = false, features = ["aws-lc-rs"] }
 rusqlite_migration = "2.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -37,5 +39,3 @@ strip = true
 lto = true
 codegen-units = 1
 
-[dev-dependencies]
-russh = { version = "0.63", default-features = false, features = ["aws-lc-rs"] }
