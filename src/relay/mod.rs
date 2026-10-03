@@ -1169,7 +1169,7 @@ mod tests {
                             connect_websocket(&agent_http, &agent_relay, &path, &control_token)
                                 .await
                                 .expect("connect authenticated agent SSH session");
-                        let (server_stream, bridge_task) = websocket_byte_stream(websocket);
+                        let (server_stream, bridge_task) = websocket_byte_stream(websocket).await;
 
                         let server_config = server::Config {
                             keys: vec![agent_private],
@@ -1240,7 +1240,7 @@ mod tests {
             connect_websocket(&http, &relay, "/v1/probe/signed-ssh", &auth.session_token)
                 .await
                 .expect("connect signed SSH operator path");
-        let (client_stream, client_bridge) = websocket_byte_stream(operator_websocket);
+        let (client_stream, client_bridge) = websocket_byte_stream(operator_websocket).await;
 
         let client_config = client::Config {
             preferred: ed25519_only(),
