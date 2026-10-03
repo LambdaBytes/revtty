@@ -22,6 +22,10 @@ pub enum ControlMessage {
         version: u16,
         session_id: String,
     },
+    ShellOffer {
+        version: u16,
+        session_id: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +85,18 @@ mod tests {
         };
         let json = serde_json::to_string(&message).expect("serialize");
         let decoded: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(decoded == message);
+    }
+
+    #[test]
+    fn shell_offer_round_trips() {
+        let message = ControlMessage::ShellOffer {
+            version: 1,
+            session_id: "shell-session".to_owned(),
+        };
+        let json = serde_json::to_string(&message).expect("serialize shell offer");
+        let decoded: ControlMessage =
+            serde_json::from_str(&json).expect("deserialize shell offer");
         assert!(decoded == message);
     }
 
