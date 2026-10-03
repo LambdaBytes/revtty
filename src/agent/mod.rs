@@ -180,15 +180,21 @@ async fn run_control_once(
                             ControlMessage::ProbeOffer {
                                 version,
                                 session_id,
+                                tunnel_token,
                             } if version == CONTROL_PROTOCOL_VERSION => {
                                 let client = client.clone();
                                 let relay = relay.to_owned();
-                                let token = token.to_owned();
                                 let name = name.to_owned();
 
                                 tokio::spawn(async move {
-                                    if let Err(error) =
-                                        send_probe(&client, &relay, &token, &session_id, &name).await
+                                    if let Err(error) = send_probe(
+                                        &client,
+                                        &relay,
+                                        &tunnel_token,
+                                        &session_id,
+                                        &name,
+                                    )
+                                    .await
                                     {
                                         eprintln!("probe {session_id} failed: {error}");
                                     }
@@ -197,17 +203,17 @@ async fn run_control_once(
                             ControlMessage::ShellOffer {
                                 version,
                                 session_id,
+                                tunnel_token,
                             } if version == CONTROL_PROTOCOL_VERSION => {
                                 let client = client.clone();
                                 let relay = relay.to_owned();
-                                let token = token.to_owned();
                                 let operator_key = operator_key.to_owned();
 
                                 tokio::spawn(async move {
                                     if let Err(error) = ssh::serve(
                                         &client,
                                         &relay,
-                                        &token,
+                                        &tunnel_token,
                                         &session_id,
                                         &operator_key,
                                     )
@@ -256,12 +262,12 @@ async fn send_control(
 async fn send_probe(
     client: &reqwest::Client,
     relay: &str,
-    token: &str,
+    tunnel_token: &str,
     session_id: &str,
     name: &str,
 ) -> Result<(), RevttyError> {
     let path = format!("/v1/session/{session_id}");
-    let mut websocket = connect_websocket(client, relay, &path, token).await?;
+    let mut websocket = connect_websocket(client, relay, &path, tunnel_token).await?;
 
     let result = ProbeResult {
         name: name.to_owned(),

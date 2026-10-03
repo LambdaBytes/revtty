@@ -21,10 +21,12 @@ pub enum ControlMessage {
     ProbeOffer {
         version: u16,
         session_id: String,
+        tunnel_token: String,
     },
     ShellOffer {
         version: u16,
         session_id: String,
+        tunnel_token: String,
     },
 }
 
@@ -82,6 +84,7 @@ mod tests {
         let message = ControlMessage::ProbeOffer {
             version: 1,
             session_id: "session".to_owned(),
+            tunnel_token: "rvs_probe".to_owned(),
         };
         let json = serde_json::to_string(&message).expect("serialize");
         let decoded: ControlMessage = serde_json::from_str(&json).expect("deserialize");
@@ -93,6 +96,7 @@ mod tests {
         let message = ControlMessage::ShellOffer {
             version: 1,
             session_id: "shell-session".to_owned(),
+            tunnel_token: "rvs_shell".to_owned(),
         };
         let json = serde_json::to_string(&message).expect("serialize shell offer");
         let decoded: ControlMessage = serde_json::from_str(&json).expect("deserialize shell offer");

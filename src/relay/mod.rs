@@ -62,7 +62,7 @@ struct AgentHandle {
 }
 
 struct PendingSession {
-    agent_name: String,
+    agent_token_hash: [u8; 32],
     sender: oneshot::Sender<WebSocket>,
 }
 
@@ -73,15 +73,17 @@ enum SessionKind {
 }
 
 impl SessionKind {
-    fn offer(self, session_id: String) -> ControlMessage {
+    fn offer(self, session_id: String, tunnel_token: String) -> ControlMessage {
         match self {
             Self::Probe => ControlMessage::ProbeOffer {
                 version: CONTROL_PROTOCOL_VERSION,
                 session_id,
+                tunnel_token,
             },
             Self::Shell => ControlMessage::ShellOffer {
                 version: CONTROL_PROTOCOL_VERSION,
                 session_id,
+                tunnel_token,
             },
         }
     }
@@ -490,30 +492,31 @@ async fn persistent_session_upgrade(
     let Some(token) = bearer_token(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    let token_hash = hash_token(token);
 
-    let agent_name = {
-        let pending = state.pending.lock().await;
-        pending
+    let pending = {
+        let mut pending = state.pending.lock().await;
+        let Some(expected_token_hash) = pending
             .get(&session_id)
-            .map(|session| session.agent_name.clone())
+            .map(|session| session.agent_token_hash)
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+
+        if expected_token_hash != token_hash {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+
+        pending.remove(&session_id)
     };
 
-    let Some(agent_name) = agent_name else {
+    let Some(pending) = pending else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    match state.store.authenticate_agent(&agent_name, token).await {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(error) => {
-            eprintln!("session authentication failed: {error}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    }
-
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| attach_agent_session(socket, state, session_id))
+        .on_upgrade(move |socket| attach_reserved_agent_session(socket, pending))
         .into_response()
 }
 
@@ -668,6 +671,13 @@ async fn handle_operator_session(
     kind: SessionKind,
 ) {
     let session_id = Uuid::new_v4().simple().to_string();
+    let agent_token = match SecretToken::generate("rvs") {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("session token generation failed: {error}");
+            return;
+        }
+    };
     let (session_tx, session_rx) = oneshot::channel();
 
     {
@@ -675,13 +685,20 @@ async fn handle_operator_session(
         pending.insert(
             session_id.clone(),
             PendingSession {
-                agent_name,
+                agent_token_hash: agent_token.hash(),
                 sender: session_tx,
             },
         );
     }
 
-    if control.send(kind.offer(session_id.clone())).await.is_err() {
+    if control
+        .send(kind.offer(
+            session_id.clone(),
+            agent_token.expose().to_owned(),
+        ))
+        .await
+        .is_err()
+    {
         state.pending.lock().await.remove(&session_id);
         return;
     }
@@ -709,6 +726,10 @@ async fn attach_agent_session(socket: WebSocket, state: RelayState, session_id: 
     if let Some(pending) = pending {
         let _ = pending.sender.send(socket);
     }
+}
+
+async fn attach_reserved_agent_session(socket: WebSocket, pending: PendingSession) {
+    let _ = pending.sender.send(socket);
 }
 
 async fn bridge_websockets(left: WebSocket, right: WebSocket) {
@@ -992,12 +1013,30 @@ mod tests {
                     let control: ControlMessage =
                         serde_json::from_str(&text).expect("decode probe offer");
 
-                    if let ControlMessage::ProbeOffer { session_id, .. } = control {
+                    if let ControlMessage::ProbeOffer {
+                        session_id,
+                        tunnel_token,
+                        ..
+                    } = control
+                    {
                         let path = format!("/v1/session/{session_id}");
-                        let mut session =
+                        let rejected =
                             connect_websocket(&agent_http, &agent_relay, &path, &control_token)
+                                .await;
+                        assert!(
+                            rejected.is_err(),
+                            "long-lived control credential must not open a data tunnel"
+                        );
+
+                        let mut session =
+                            connect_websocket(&agent_http, &agent_relay, &path, &tunnel_token)
                                 .await
                                 .expect("connect authenticated agent session");
+
+                        let replay =
+                            connect_websocket(&agent_http, &agent_relay, &path, &tunnel_token)
+                                .await;
+                        assert!(replay.is_err(), "agent tunnel credential must be single-use");
 
                         let result = ProbeResult {
                             name: "signed-demo".to_owned(),
@@ -1157,7 +1196,6 @@ mod tests {
         let (_agent_sender, mut agent_receiver) = agent.split();
         let agent_http = http.clone();
         let agent_relay = relay.clone();
-        let control_token = credential.control_token.expose().to_owned();
 
         let agent_task = tokio::spawn(async move {
             while let Some(message) = agent_receiver.next().await {
@@ -1165,10 +1203,15 @@ mod tests {
                     let control: ControlMessage =
                         serde_json::from_str(&text).expect("decode SSH session offer");
 
-                    if let ControlMessage::ProbeOffer { session_id, .. } = control {
+                    if let ControlMessage::ProbeOffer {
+                        session_id,
+                        tunnel_token,
+                        ..
+                    } = control
+                    {
                         let path = format!("/v1/session/{session_id}");
                         let websocket =
-                            connect_websocket(&agent_http, &agent_relay, &path, &control_token)
+                            connect_websocket(&agent_http, &agent_relay, &path, &tunnel_token)
                                 .await
                                 .expect("connect authenticated agent SSH session");
                         let (server_stream, bridge_task) = websocket_byte_stream(websocket);
