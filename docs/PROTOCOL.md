@@ -1,33 +1,34 @@
 # revtty Control Protocol
 
-Status: **draft / pre-implementation**
+Status: **draft / implemented pre-v1 subset**
 
-The control protocol coordinates agent presence and session rendezvous. It does not carry terminal bytes. The terminal session uses SSH over an ephemeral data tunnel.
+The control protocol coordinates authenticated agent presence and session rendezvous. It does not carry terminal bytes. Interactive terminal data is SSH carried over an ephemeral WebSocket data tunnel.
+
+The wire contract may still change before the first stable release.
 
 ## Envelope
 
-The current scaffold uses tagged JSON messages and an explicit numeric protocol version.
+Control messages are tagged JSON with an explicit numeric protocol version.
 
-Example:
+Current heartbeat example:
 
 ```json
 {
   "type": "heartbeat",
-  "version": 1,
-  "active_sessions": 0
+  "version": 1
 }
 ```
 
-## v1 messages
+## Implemented control messages
 
 ### hello
 
-Sent by the agent after authenticating its control connection.
+Sent by the agent immediately after authenticating its persistent control connection.
 
 Fields:
 
 - `version`
-- `agent_id`
+- `name`
 - `agent_version`
 
 ### heartbeat
@@ -37,60 +38,90 @@ Periodic liveness update.
 Fields:
 
 - `version`
-- `active_sessions`
 
-### session_offer
+### probe_offer
 
-Relay asks an agent to prepare an outbound data tunnel.
+Relay asks the agent to open the data side of a probe rendezvous.
 
 Fields:
 
 - `version`
 - `session_id`
-- `expires_at_unix`
 - `tunnel_token`
 
-The tunnel token is secret, short lived, role specific, and single use. It must never be logged.
+### shell_offer
 
-### session_accept
-
-Agent accepted the offered session.
+Relay asks the agent to open the data side of an SSH shell rendezvous.
 
 Fields:
 
 - `version`
 - `session_id`
+- `tunnel_token`
 
-### session_reject
+The `tunnel_token` is generated independently for each rendezvous, delivered only over the authenticated agent control channel, stored by the relay only as a hash while pending and consumed at most once. A pending rendezvous is also bounded by the relay's session wait timeout.
 
-Agent rejected the offered session.
+The long-lived agent control credential is not accepted by the persistent `/v1/session/{session_id}` data endpoint.
 
-Fields:
+## Operator authentication and rendezvous credentials
 
-- `version`
-- `session_id`
-- `reason`
+Operator control authentication currently uses HTTP JSON endpoints around an OpenSSH SSHSIG challenge rather than a control-channel message.
 
-The reason must be safe for logs and must not contain secrets.
+The flow is:
 
-### session_cancel
+1. request a target-specific challenge;
+2. sign the canonical `revtty-control-v1` message with the operator Ed25519 key;
+3. submit the SSHSIG;
+4. receive a short-lived opaque operator session credential plus the enrolled agent host key;
+5. consume that credential once when opening `/v1/probe/{name}` or `/v1/connect/{name}`;
+6. the relay generates a separate one-time agent `tunnel_token` and sends the corresponding offer over the agent control channel.
 
-The pending session should be abandoned.
+The operator and agent rendezvous credentials are therefore distinct.
 
-Fields:
+## Data plane
 
-- `version`
-- `session_id`
+After the operator and agent WebSockets are paired, the relay forwards frames without interpreting the SSH payload.
 
-## Invariants
+For an interactive shell:
 
-- Unknown incompatible protocol versions fail explicitly.
-- Terminal data never appears in control messages.
-- Session credentials are never placed in URL query strings.
-- Session credentials expire and are consumed at most once.
-- A tunnel side is paired at most once.
-- Operator and agent tunnel credentials are distinct.
-- The relay may route data without understanding the SSH payload.
-- Secrets must be redacted from diagnostic formatting and logs.
+```text
+operator Russh client
+        |
+        | SSH
+        v
+operator WSS ===== opaque relay ===== agent WSS
+                                      |
+                                      | SSH
+                                      v
+                               agent Russh server
+                                      |
+                                      v
+                                     PTY
+```
 
-This document will become normative as implementation lands. Message changes before the first stable release may still be breaking.
+SSH performs agent host authentication and operator public-key authentication independently of the relay control authorization.
+
+## Implemented invariants
+
+- Terminal bytes never appear in control messages.
+- Session credentials are sent in authorization headers, not URL query strings.
+- Operator session credentials are target-scoped, short lived and single use.
+- Agent data-tunnel credentials are per-rendezvous and single use.
+- A persistent agent control credential cannot open a `/v1/session` data tunnel.
+- A pending agent side is paired at most once.
+- Operator and agent rendezvous credentials are distinct.
+- The relay can route terminal data without understanding the SSH payload.
+- Secret-bearing control types do not derive debug formatting.
+
+## Required before the stable v1 protocol
+
+The approved v1 scope still requires explicit lifecycle semantics that are not implemented in the current subset:
+
+- `session_accept`;
+- `session_reject`;
+- `session_cancel`;
+- explicit incompatible-version failure instead of silently ignoring an unmatched offer version;
+- active-session reporting/concurrency enforcement;
+- a documented compatibility policy for stable releases.
+
+These should extend the existing contract rather than create a second terminal protocol.
