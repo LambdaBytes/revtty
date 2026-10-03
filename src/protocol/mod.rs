@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
+pub const OPERATOR_AUTH_NAMESPACE: &str = "revtty-control-v1";
+
+pub fn operator_auth_message(agent_name: &str, challenge: &str) -> String {
+    format!("revtty-control-v1\nagent={agent_name}\nchallenge={challenge}\n")
+}
+
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -42,9 +48,30 @@ pub struct EnrollResponse {
     pub operator_key: String,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorChallengeResponse {
+    pub challenge: String,
+    pub expires_in_secs: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorAuthRequest {
+    pub challenge: String,
+    pub signature: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorAuthResponse {
+    pub session_token: String,
+    pub expires_in_secs: u64,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ControlMessage, EnrollRequest, EnrollResponse, ProbeResult};
+    use super::{
+        ControlMessage, EnrollRequest, EnrollResponse, OperatorAuthRequest, OperatorAuthResponse,
+        OperatorChallengeResponse, ProbeResult, operator_auth_message,
+    };
 
     #[test]
     fn control_message_round_trips() {
@@ -79,6 +106,41 @@ mod tests {
         let decoded: EnrollResponse =
             serde_json::from_str(&encoded).expect("deserialize enrollment response");
         assert!(decoded == response);
+    }
+
+    #[test]
+    fn operator_auth_messages_round_trip() {
+        let challenge = OperatorChallengeResponse {
+            challenge: "rvc_random".to_owned(),
+            expires_in_secs: 30,
+        };
+        let encoded = serde_json::to_string(&challenge).expect("serialize challenge");
+        let decoded: OperatorChallengeResponse =
+            serde_json::from_str(&encoded).expect("deserialize challenge");
+        assert!(decoded == challenge);
+
+        let request = OperatorAuthRequest {
+            challenge: challenge.challenge.clone(),
+            signature: "-----BEGIN SSH SIGNATURE-----".to_owned(),
+        };
+        let encoded = serde_json::to_string(&request).expect("serialize auth request");
+        let decoded: OperatorAuthRequest =
+            serde_json::from_str(&encoded).expect("deserialize auth request");
+        assert!(decoded == request);
+
+        let response = OperatorAuthResponse {
+            session_token: "rvo_secret".to_owned(),
+            expires_in_secs: 30,
+        };
+        let encoded = serde_json::to_string(&response).expect("serialize auth response");
+        let decoded: OperatorAuthResponse =
+            serde_json::from_str(&encoded).expect("deserialize auth response");
+        assert!(decoded == response);
+
+        assert_eq!(
+            operator_auth_message("store-042", "rvc_random"),
+            "revtty-control-v1\nagent=store-042\nchallenge=rvc_random\n"
+        );
     }
 
     #[test]
