@@ -5,7 +5,7 @@ pub async fn run(args: Args) -> Result<(), RevttyError> {
     match args.command {
         Command::Init => crate::client::init(),
         Command::List => crate::client::list(),
-        Command::Status { target } => crate::client::status(&target),
+        Command::Status { target, relay } => crate::client::status(&target, &relay).await,
         Command::Probe { target, relay } => crate::client::probe(&target, &relay).await,
         Command::Connect { target, relay } => crate::client::connect(&target, &relay).await,
         Command::Doctor => crate::client::doctor(),

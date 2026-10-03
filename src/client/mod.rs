@@ -9,8 +9,8 @@ use ssh_key::{HashAlg, LineEnding, PrivateKey};
 use crate::config::Paths;
 use crate::error::RevttyError;
 use crate::protocol::{
-    OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest, OperatorAuthResponse, OperatorChallengeResponse,
-    ProbeResult, operator_auth_message,
+    AgentStatusResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest, OperatorAuthResponse,
+    OperatorChallengeResponse, ProbeResult, operator_auth_message,
 };
 use crate::transport::{connect_websocket, http_url, valid_name};
 
@@ -36,8 +36,47 @@ pub fn list() -> Result<(), RevttyError> {
     Err(RevttyError::NotImplemented("agent listing"))
 }
 
-pub fn status(_target: &str) -> Result<(), RevttyError> {
-    Err(RevttyError::NotImplemented("agent status"))
+pub async fn status(target: &str, relay: &str) -> Result<(), RevttyError> {
+    let operator = authenticate_operator(target, relay).await?;
+    let url = http_url(relay, &format!("/v1/status/{target}"))?;
+    let response = operator
+        .client
+        .get(url)
+        .bearer_auth(&operator.auth.session_token)
+        .send()
+        .await
+        .map_err(|error| RevttyError::runtime("request agent status", error))?;
+
+    let response_status = response.status();
+    if !response_status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(RevttyError::message(format!(
+            "agent status rejected ({response_status}){}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        )));
+    }
+
+    let status: AgentStatusResponse = response
+        .json()
+        .await
+        .map_err(|error| RevttyError::runtime("decode agent status", error))?;
+
+    println!("target    {}", status.name);
+    println!("status    {}", if status.online { "online" } else { "offline" });
+    println!("id        {}", status.id);
+    println!("created   {}", status.created_at);
+    println!(
+        "last_seen {}",
+        status
+            .last_seen
+            .map_or_else(|| "-".to_owned(), |value| value.to_string())
+    );
+    println!("revtty    {}", status.version.as_deref().unwrap_or("-"));
+    Ok(())
 }
 
 struct AuthenticatedOperator {

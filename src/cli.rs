@@ -21,6 +21,10 @@ pub enum Command {
     Status {
         /// Machine name or stable identifier.
         target: String,
+
+        /// Relay base URL.
+        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
+        relay: String,
     },
 
     /// Validate reverse connectivity to an online agent.
@@ -146,6 +150,12 @@ mod tests {
     #[test]
     fn parses_probe_target() {
         let args = Args::try_parse_from(["revtty", "probe", "store-042"]);
+        assert!(args.is_ok());
+    }
+
+    #[test]
+    fn parses_status_target() {
+        let args = Args::try_parse_from(["revtty", "status", "store-042"]);
         assert!(args.is_ok());
     }
 

@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::error::RevttyError;
 use crate::protocol::{
-    CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse,
+    AgentStatusResponse, CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse,
     OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest, OperatorAuthResponse, OperatorChallengeResponse,
     operator_auth_message,
 };
@@ -206,6 +206,7 @@ fn router(state: RelayState) -> Router {
         .route("/v1/operator/challenge/{name}", post(operator_challenge))
         .route("/v1/operator/auth/{name}", post(operator_auth))
         .route("/v1/agent/{name}", get(persistent_agent_upgrade))
+        .route("/v1/status/{name}", get(operator_status))
         .route("/v1/probe/{name}", get(persistent_probe_upgrade))
         .route("/v1/connect/{name}", get(persistent_connect_upgrade))
         .route("/v1/session/{session_id}", get(persistent_session_upgrade))
@@ -380,6 +381,44 @@ async fn operator_auth(
         }),
     )
         .into_response()
+}
+
+async fn operator_status(
+    State(state): State<RelayState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !valid_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
+    }
+
+    if !consume_operator_session(&state, &name, &headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let agent = match state.store.get_agent(&name).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            eprintln!("operator status lookup failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let online = {
+        let agents = state.agents.lock().await;
+        agents.contains_key(&name)
+    };
+
+    Json(AgentStatusResponse {
+        id: agent.id,
+        name: agent.name,
+        online,
+        created_at: agent.created_at,
+        last_seen: agent.last_seen,
+        version: agent.version,
+    })
+    .into_response()
 }
 
 async fn persistent_probe_upgrade(
@@ -800,9 +839,9 @@ mod tests {
 
     use super::{RelayState, authorized, router};
     use crate::protocol::{
-        ControlMessage, EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE,
-        OperatorAuthRequest, OperatorAuthResponse, OperatorChallengeResponse, ProbeResult,
-        operator_auth_message,
+        AgentStatusResponse, ControlMessage, EnrollRequest, EnrollResponse,
+        OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest, OperatorAuthResponse,
+        OperatorChallengeResponse, ProbeResult, operator_auth_message,
     };
     use crate::storage::Store;
     use crate::transport::{connect_websocket, websocket_byte_stream};
@@ -1131,6 +1170,75 @@ mod tests {
         let reused_session =
             connect_websocket(&http, &relay, "/v1/probe/signed-demo", &auth.session_token).await;
         assert!(reused_session.is_err());
+
+        let status_challenge_response = http
+            .post(format!(
+                "http://{address}/v1/operator/challenge/signed-demo"
+            ))
+            .send()
+            .await
+            .expect("request status operator challenge");
+        assert_eq!(
+            status_challenge_response.status(),
+            reqwest::StatusCode::OK
+        );
+
+        let status_challenge: OperatorChallengeResponse = status_challenge_response
+            .json()
+            .await
+            .expect("decode status operator challenge");
+        let status_message = operator_auth_message("signed-demo", &status_challenge.challenge);
+        let status_signature = operator_private
+            .sign(
+                OPERATOR_AUTH_NAMESPACE,
+                RusshHashAlg::Sha256,
+                status_message.as_bytes(),
+            )
+            .expect("sign status operator challenge")
+            .to_pem(ssh_key::LineEnding::LF)
+            .expect("encode status operator signature");
+
+        let status_auth_response = http
+            .post(format!("http://{address}/v1/operator/auth/signed-demo"))
+            .json(&OperatorAuthRequest {
+                challenge: status_challenge.challenge,
+                signature: status_signature,
+            })
+            .send()
+            .await
+            .expect("authenticate status operator");
+        assert_eq!(
+            status_auth_response.status(),
+            reqwest::StatusCode::CREATED
+        );
+
+        let status_auth: OperatorAuthResponse = status_auth_response
+            .json()
+            .await
+            .expect("decode status operator auth");
+
+        let status_response = http
+            .get(format!("http://{address}/v1/status/signed-demo"))
+            .bearer_auth(&status_auth.session_token)
+            .send()
+            .await
+            .expect("request authenticated status");
+        assert_eq!(status_response.status(), reqwest::StatusCode::OK);
+
+        let status: AgentStatusResponse =
+            status_response.json().await.expect("decode agent status");
+        assert_eq!(status.id, credential.id);
+        assert_eq!(status.name, "signed-demo");
+        assert!(status.online);
+        assert_eq!(status.version.as_deref(), Some("0.1.0"));
+
+        let reused_status = http
+            .get(format!("http://{address}/v1/status/signed-demo"))
+            .bearer_auth(&status_auth.session_token)
+            .send()
+            .await
+            .expect("retry authenticated status");
+        assert_eq!(reused_status.status(), reqwest::StatusCode::UNAUTHORIZED);
 
         agent_task.await.expect("agent test task");
         server.abort();
