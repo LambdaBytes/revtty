@@ -1,97 +1,127 @@
-# First Reverse Transport Proof
+# Reverse Transport and First Shell Proof
 
-Status: **development proof only — not production security**
+Status: **M1 development implementation — pre-v1.0**
 
-This slice validates the highest-risk networking assumption before the project adds SSH, enrollment, SQLite, PTYs, browser access, or file transfer:
+The project started by validating the highest-risk networking assumption:
 
 > Can a target behind NAT keep only an outbound control connection, receive an on-demand request, open a second outbound connection, rendezvous through the relay, and return data to an operator?
 
-The current proof answers only that question.
+That transport proof is now implemented together with the first authenticated SSH/PTTY path. The remaining high-value validation is the same flow across a real NAT/CGNAT boundary and under failure/recovery conditions.
 
 ## What is implemented
 
-- one Rust binary;
-- relay WebSocket endpoints;
+- one Rust binary with operator, agent and relay roles;
+- SQLite relay state and migrations;
+- persistent Ed25519 operator identity;
+- persistent Ed25519 agent host identity;
+- single-use enrollment tokens;
 - persistent outbound agent control WebSocket;
-- heartbeat traffic;
+- heartbeat/presence persistence;
 - automatic reconnect after control-channel loss;
-- named agent registration in relay memory;
+- SSHSIG operator challenge/response authentication;
+- short-lived, single-use operator session credentials;
+- agent host-key pinning;
 - operator `probe <name>`;
-- relay rendezvous;
-- temporary second outbound agent WebSocket;
+- operator `connect <name>`;
+- on-demand outbound agent data tunnel;
+- separate one-time credential for each agent data tunnel;
 - opaque WebSocket forwarding through the relay;
-- bounded relay control queues;
+- Ed25519 SSH public-key authentication end to end;
+- real PTY-backed interactive shell;
+- local raw-terminal guard and restoration;
+- terminal resize propagation;
+- remote EOF/exit handling;
+- bounded relay/control and PTY I/O queues;
 - WebSocket frame/message limits;
-- Linux and macOS CI;
-- automated end-to-end reverse-rendezvous test;
-- local `portable-pty` smoke test on both Linux and macOS;
-- Russh handshake and Ed25519 authentication over an arbitrary Tokio duplex stream;
-- Russh handshake, pinned host key and Ed25519 operator authentication through the actual WebSocket rendezvous relay.
+- Linux and macOS CI.
 
-The probe result contains only:
+The relay does not interpret interactive terminal bytes.
 
-- agent name;
-- OS;
-- CPU architecture;
-- revtty version.
+## Current security boundary
 
-It does not execute a command supplied by the operator.
+The persistent `/v1` path no longer authenticates shells with the shared development token.
 
-## Deliberately not implemented yet
+The current flow is:
 
-- remote shell;
-- **remote** PTY transport;
-- persistent on-disk SSH identities and enrollment;
-- production Ed25519 identity lifecycle;
-- enrollment;
-- host-key pinning;
-- SQLite;
-- session-specific credentials;
-- systemd/launchd installation;
-- list/status API;
-- browser;
-- SFTP/exec/forwarding.
+1. an operator owns a persistent Ed25519 key;
+2. the relay creates a single-use enrollment token tied to an agent name and operator public key;
+3. the agent enrolls its persistent Ed25519 host key and receives a separate long-lived control credential;
+4. the operator authenticates to the target using an OpenSSH SSHSIG challenge;
+5. the relay returns a short-lived operator session credential and the enrolled host key;
+6. the client pins/verifies that host key;
+7. each rendezvous creates a new one-time agent tunnel credential;
+8. SSH authenticates the operator public key again at the agent and encrypts the terminal payload end to end.
 
-The temporary shared development token authenticates the proof endpoints.
+The long-lived agent control credential is explicitly rejected on the `/v1/session` data path, and the per-session agent credential is consumed at most once.
 
-**Do not treat this token model as production security.**
+This is still pre-v1 security. Rotation, multi-operator revocation, service hardening, rate limiting and the complete fault/threat-model validation remain release work.
+
+The legacy `/v0` transport-proof endpoints still use `REVTTY_DEV_TOKEN`; `relay serve` currently requires that value while those endpoints remain compiled in.
 
 ## Local validation
 
-Terminal 1:
+### 1. Operator identity
 
 ```bash
-export REVTTY_DEV_TOKEN='replace-with-a-long-random-value'
-cargo run -- relay serve
+cargo run -- init
 ```
 
-Terminal 2:
+Keep the printed public-key path for enrollment.
+
+### 2. Relay
 
 ```bash
-export REVTTY_DEV_TOKEN='replace-with-a-long-random-value'
-cargo run -- agent run --name demo
+cargo run -- relay init --db revtty.db
+
+cargo run -- relay enroll store-042 \
+  --operator-key <operator-public-key> \
+  --db revtty.db
+
+export REVTTY_DEV_TOKEN='replace-with-a-long-random-development-token'
+cargo run -- relay serve --db revtty.db
 ```
 
-Terminal 3:
+The enrollment command prints the single-use token that the target consumes.
+
+### 3. Target
 
 ```bash
-export REVTTY_DEV_TOKEN='replace-with-a-long-random-value'
-cargo run -- probe demo
+cargo run -- agent enroll \
+  --relay http://127.0.0.1:8787 \
+  --token <single-use-enrollment-token>
+
+cargo run -- agent run
+```
+
+The agent now loads its persisted configuration and identity; `agent run` does not take a machine name on every launch.
+
+### 4. Operator probe
+
+```bash
+cargo run -- probe store-042 --relay http://127.0.0.1:8787
 ```
 
 Expected shape:
 
 ```text
-target   demo
+target   store-042
 status   reachable
 os       linux
 arch     x86_64
 revtty   0.1.0
 ```
 
-## Local PTY validation
+### 5. Interactive shell
 
-The PTY backend is validated independently from the network path:
+```bash
+cargo run -- connect store-042 --relay http://127.0.0.1:8787
+```
+
+The client authenticates with its operator key, verifies the enrolled host key, requests a real PTY and forwards terminal input/output through SSH. Local terminal resizes are propagated to the remote PTY.
+
+## Independent PTY validation
+
+The PTY backend can still be tested without the network path:
 
 ```bash
 cargo run -- agent pty-test
@@ -105,9 +135,9 @@ os       linux
 arch     x86_64
 ```
 
-The smoke test uses a fixed local `/bin/echo` command; it does not accept or execute remote input. The same test runs in Ubuntu and macOS CI.
+CI additionally opens an authenticated SSH shell on the real PTY backend and verifies a live resize.
 
-## Real NAT validation
+## Real NAT/CGNAT validation
 
 Run the relay on a public Linux host behind HTTPS/WSS termination.
 
@@ -119,64 +149,75 @@ revtty.example.com {
 }
 ```
 
-Relay:
+Initialize the relay, create an enrollment for the target and start it:
 
 ```bash
+cargo run -- relay init --db revtty.db
+
+cargo run -- relay enroll store-042 \
+  --operator-key <operator-public-key> \
+  --db revtty.db
+
 export REVTTY_DEV_TOKEN='a-long-random-development-token'
-revtty relay serve
+cargo run -- relay serve --bind 127.0.0.1:8787 --db revtty.db
 ```
 
-Agent on a machine behind NAT/CGNAT:
+On the target behind NAT/CGNAT:
 
 ```bash
-export REVTTY_DEV_TOKEN='same-development-token'
-revtty agent run \
+cargo run -- agent enroll \
   --relay https://revtty.example.com \
-  --name store-042
+  --token <single-use-enrollment-token>
+
+cargo run -- agent run
 ```
 
-Operator:
+On the operator machine:
 
 ```bash
-export REVTTY_DEV_TOKEN='same-development-token'
-revtty probe store-042 \
-  --relay https://revtty.example.com
+cargo run -- probe store-042 --relay https://revtty.example.com
+cargo run -- connect store-042 --relay https://revtty.example.com
 ```
 
-A successful result proves:
+A successful interactive `connect` proves the complete first-shell network path across the real boundary:
 
-1. outbound persistent agent connectivity;
-2. server-side presence/rendezvous;
-3. operator-triggered control signaling;
-4. a second on-demand outbound connection from the target;
-5. bidirectional relay pairing across NAT.
+1. persistent outbound target connectivity;
+2. enrolled agent and operator identities;
+3. signed operator authorization;
+4. operator-triggered control signaling;
+5. a second outbound connection from the target;
+6. one-time session credential consumption;
+7. relay pairing across NAT;
+8. host-key verification and SSH public-key authentication;
+9. interactive PTY traffic and resize over the tunnel.
 
-## Validation status
+## CI validation status
 
-The core architecture is now independently proven in CI on Linux and macOS:
+The repository currently validates these pieces on Linux and macOS:
 
-1. outbound agent control connection: validated;
-2. operator-triggered second outbound connection: validated;
-3. relay rendezvous and bidirectional forwarding: validated;
-4. portable PTY backend: validated;
-5. SSH over arbitrary non-TCP stream: validated;
-6. SSH through the WebSocket relay itself: validated;
-7. pinned SSH host key: validated;
-8. Ed25519 public-key operator authentication: validated.
+- reverse rendezvous and bidirectional WebSocket forwarding;
+- persistent enrollment and agent authentication;
+- enrollment replay rejection;
+- SSHSIG operator authentication and challenge replay rejection;
+- single-use operator session credentials;
+- host-key pinning and mismatch rejection;
+- rejection of the long-lived control credential on the agent data path;
+- single-use agent data-tunnel credentials;
+- SSH over an arbitrary byte stream and through the relay;
+- Ed25519 SSH operator authentication;
+- real PTY-backed interactive shell behavior;
+- PTY resize behavior;
+- format, Clippy and release compilation.
 
-The relay test does not open a shell or execute remote commands; it stops after successful SSH authentication.
+## Next validation gates
 
-## Next validation gate
+The next gates for M1 are:
 
-The next meaningful validation is **real NAT/CGNAT**, using the documented `probe` command against a public HTTPS/WSS relay.
+1. run the authenticated `connect` path across a real NAT/CGNAT boundary;
+2. validate relay restart and network-loss recovery;
+3. replace fixed reconnect delay with bounded exponential backoff and jitter;
+4. implement operator `list` / `status`;
+5. add systemd service lifecycle and stronger doctor checks;
+6. complete explicit pending-session lifecycle/concurrency behavior.
 
-After that succeeds, implementation should move from proof credentials to the intended product security/lifecycle:
-
-1. persistent Ed25519 agent host identity;
-2. persistent Ed25519 operator identity;
-3. enrollment and revocation;
-4. session-specific one-time credentials;
-5. SQLite durable state;
-6. then connect the already validated PTY to authenticated SSH session channels.
-
-This ordering keeps networking, identity, SSH, and PTY failures independently observable.
+This keeps transport, identity, SSH, PTY and lifecycle failures independently observable.

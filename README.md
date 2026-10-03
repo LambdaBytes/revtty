@@ -4,7 +4,7 @@
 
 No inbound ports. No VPN. No exposed SSH daemon — just secure, on-demand shell access from anywhere.
 
-> Status: early design / scaffold.
+> Status: early implementation — M1 “First Shell” is in progress.
 
 ## Goal
 
@@ -26,55 +26,94 @@ The first milestone is intentionally narrow: **reliable shell access to Linux an
 - Stable, versioned protocol contracts before feature growth.
 - No speculative abstraction: extract interfaces only when a second implementation exists.
 
-## Planned shape
-
-```text
-revtty
-├── client
-├── agent
-├── relay
-└── web
-```
-
-The intended operator experience is:
-
-```bash
-revtty list
-revtty connect store-042
-```
-
 See [docs/BRIEF.md](docs/BRIEF.md) for the architecture, [docs/V1_SCOPE.md](docs/V1_SCOPE.md) for the approved v1 scope, [docs/STACK.md](docs/STACK.md) for the vetted build-vs-reuse technology choices, and [docs/ROADMAP.md](docs/ROADMAP.md) for delivery order and v2.
 
-## Current proof
+## Current implementation
 
-The first implemented slice validates outbound reverse connectivity without exposing a remote shell yet:
+The repository has moved beyond the scaffold. The authenticated M1 path now includes:
+
+- persistent Ed25519 operator identity via `revtty init`;
+- persistent Ed25519 agent host identity;
+- SQLite relay state and single-use enrollment tokens;
+- an authenticated persistent outbound agent control WebSocket with heartbeat and reconnect;
+- SSHSIG operator challenge/response authentication;
+- short-lived, single-use operator session credentials;
+- OpenSSH-style agent host-key pinning;
+- a separate one-time credential for each agent data tunnel;
+- SSH carried end-to-end through an opaque WebSocket relay;
+- a real interactive PTY shell;
+- terminal input/output, EOF/exit handling and remote exit status capture;
+- live terminal resize propagation;
+- Linux and macOS CI for format, Clippy, tests and release builds.
+
+The relay still carries the legacy `/v0` transport-proof endpoints. `REVTTY_DEV_TOKEN` is currently required by `relay serve` for those endpoints; the persistent `/v1` path uses enrollment, agent, operator and per-session credentials instead.
+
+## Authenticated local flow
+
+Initialize the operator identity:
 
 ```bash
-export REVTTY_DEV_TOKEN='replace-with-a-long-random-value'
-
-# public/local relay
-revtty relay serve
-
-# target machine
-revtty agent run --name demo
-
-# operator
-revtty probe demo
+cargo run -- init
 ```
 
-CI now validates the reverse rendezvous, portable PTY support on Linux/macOS, and an Ed25519-authenticated SSH handshake carried through the WebSocket relay. The public `probe` command remains the deliberately harmless way to validate the same outbound architecture across a real NAT boundary.
+Initialize relay storage and create a single-use enrollment token. Use the public-key path printed by `revtty init`:
 
-See [docs/PROTOTYPE.md](docs/PROTOTYPE.md) for the exact local and real-NAT validation procedure. The development token is temporary and is **not** the v1 security model.
+```bash
+cargo run -- relay init --db revtty.db
+cargo run -- relay enroll store-042 \
+  --operator-key <operator-public-key> \
+  --db revtty.db
+```
+
+Start the relay:
+
+```bash
+export REVTTY_DEV_TOKEN='replace-with-a-long-random-development-token'
+cargo run -- relay serve --db revtty.db
+```
+
+On the target machine, consume the enrollment token and start the persistent agent:
+
+```bash
+cargo run -- agent enroll \
+  --relay http://127.0.0.1:8787 \
+  --token <single-use-enrollment-token>
+
+cargo run -- agent run
+```
+
+From the operator machine:
+
+```bash
+cargo run -- probe store-042 --relay http://127.0.0.1:8787
+cargo run -- connect store-042 --relay http://127.0.0.1:8787
+```
+
+`connect` authenticates the operator, verifies the pinned agent host key, opens a one-time rendezvous and starts an interactive SSH PTY.
+
+See [docs/PROTOTYPE.md](docs/PROTOTYPE.md) for validation details and the remaining real-NAT gate.
+
+## M1 still in progress
+
+The first shell works, but M1 is not complete. Notable remaining work includes:
+
+- operator `list` and `status`;
+- systemd service integration;
+- bounded exponential reconnect backoff with jitter;
+- stronger operator/agent/relay doctor checks;
+- explicit session accept/reject/cancel lifecycle and concurrency limits;
+- real NAT/CGNAT validation of the full authenticated `connect` path;
+- recovery/fault tests around relay restart and network loss.
+
+Later v1 milestones add macOS service parity, multi-operator management, `exec`, SFTP/copy, local forwarding and the optional web console.
 
 ## Development
-
-The repository currently contains a compileable scaffold only.
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo run -- --help
+cargo test --all-targets --all-features
+cargo build --release
 ```
 
 ## License
