@@ -703,16 +703,16 @@ async fn handle_operator_session(
         return;
     }
 
-    eprintln!("{} requested: {session_id}", kind.label());
+    eprintln!("{} requested for {agent_name}: {session_id}", kind.label());
 
     match tokio::time::timeout(SESSION_WAIT, session_rx).await {
         Ok(Ok(agent_socket)) => {
-            eprintln!("{} paired: {session_id}", kind.label());
+            eprintln!("{} paired for {agent_name}: {session_id}", kind.label());
             bridge_websockets(operator_socket, agent_socket).await;
         }
         _ => {
             state.pending.lock().await.remove(&session_id);
-            eprintln!("{} timed out: {session_id}", kind.label());
+            eprintln!("{} timed out for {agent_name}: {session_id}", kind.label());
         }
     }
 }
