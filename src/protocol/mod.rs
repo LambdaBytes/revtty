@@ -63,6 +63,7 @@ pub struct OperatorAuthRequest {
 pub struct OperatorAuthResponse {
     pub session_token: String,
     pub expires_in_secs: u64,
+    pub host_key: String,
 }
 
 #[cfg(test)]
@@ -130,6 +131,7 @@ mod tests {
         let response = OperatorAuthResponse {
             session_token: "rvo_secret".to_owned(),
             expires_in_secs: 30,
+            host_key: "ssh-ed25519 AAAA host".to_owned(),
         };
         let encoded = serde_json::to_string(&response).expect("serialize auth response");
         let decoded: OperatorAuthResponse =
