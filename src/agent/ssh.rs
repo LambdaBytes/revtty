@@ -563,11 +563,13 @@ mod tests {
             .await
             .expect("request shell");
 
+        let command = [
+            br"printf '\162\145\166\164\164\171\055\163\150\145\154\154\055\157\153\012'; exit".as_slice(),
+            b"\n".as_slice(),
+        ]
+        .concat();
         channel
-            .data(
-                b"printf '\162\145\166\164\164\171\055\163\150\145\154\154\055\157\153\012'; exit\n"
-                    .as_slice(),
-            )
+            .data(command)
             .await
             .expect("send shell command");
 
