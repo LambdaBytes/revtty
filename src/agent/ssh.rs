@@ -2,9 +2,7 @@ use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
-use portable_pty::{
-    ChildKiller, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system,
-};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 use reqwest::Client;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{self, Msg, Session};
@@ -558,20 +556,15 @@ mod tests {
             .request_pty(true, "xterm-256color", 80, 24, 0, 0, &[])
             .await
             .expect("request PTY");
-        channel
-            .request_shell(true)
-            .await
-            .expect("request shell");
+        channel.request_shell(true).await.expect("request shell");
 
         let command = [
-            br"printf '\162\145\166\164\164\171\055\163\150\145\154\154\055\157\153\012'; exit".as_slice(),
+            br"printf '\162\145\166\164\164\171\055\163\150\145\154\154\055\157\153\012'; exit"
+                .as_slice(),
             b"\n".as_slice(),
         ]
         .concat();
-        channel
-            .data_bytes(command)
-            .await
-            .expect("send shell command");
+        channel.data_bytes(command).await.expect("send shell command");
 
         let output = tokio::time::timeout(Duration::from_secs(8), async {
             let mut output = Vec::new();
