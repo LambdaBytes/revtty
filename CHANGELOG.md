@@ -23,6 +23,9 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - Interactive SSH-backed PTY shell with bounded I/O queues and cleanup.
 - Live terminal resize propagation to the remote PTY.
 - Separate one-time agent data-tunnel credentials; the long-lived agent control credential is rejected on the data path.
+- Stronger operator, agent and relay doctor checks for relay reachability, persisted agent configuration and relay SQLite state.
+- Linux systemd agent template with an explicit OS account, restart-on-failure, graceful SIGINT shutdown, journald logging and restrictive runtime umask.
+- Absolute `REVTTY_CONFIG_DIR` and `REVTTY_STATE_DIR` overrides for service/container deployments.
 - Product, security, stack, scope, protocol and roadmap documentation.
 
 ### Changed

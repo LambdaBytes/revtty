@@ -33,6 +33,8 @@ That transport proof is now implemented together with the first authenticated SS
 - local raw-terminal guard and restoration;
 - terminal resize propagation;
 - remote EOF/exit handling;
+- operator/agent relay-reachability diagnostics and relay SQLite diagnostics;
+- systemd template service with an explicit OS account, restart-on-failure and journald logging;
 - bounded relay/control and PTY I/O queues;
 - WebSocket frame/message limits;
 - Linux and macOS CI.
@@ -229,7 +231,7 @@ The next gates for M1 are:
 
 1. run the authenticated `connect` path across a real NAT/CGNAT boundary;
 2. validate relay restart and network-loss recovery;
-3. add systemd service lifecycle and stronger doctor checks;
+3. deepen doctor checks for TLS/authentication/filesystem-permission failures;
 4. complete explicit pending-session lifecycle/concurrency behavior.
 
 This keeps transport, identity, SSH, PTY and lifecycle failures independently observable.

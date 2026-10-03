@@ -26,7 +26,7 @@ The first milestone is intentionally narrow: **reliable shell access to Linux an
 - Stable, versioned protocol contracts before feature growth.
 - No speculative abstraction: extract interfaces only when a second implementation exists.
 
-See [docs/BRIEF.md](docs/BRIEF.md) for the architecture, [docs/V1_SCOPE.md](docs/V1_SCOPE.md) for the approved v1 scope, [docs/STACK.md](docs/STACK.md) for the vetted build-vs-reuse technology choices, and [docs/ROADMAP.md](docs/ROADMAP.md) for delivery order and v2.
+See [docs/BRIEF.md](docs/BRIEF.md) for the architecture, [docs/V1_SCOPE.md](docs/V1_SCOPE.md) for the approved v1 scope, [docs/STACK.md](docs/STACK.md) for the vetted build-vs-reuse technology choices, [docs/ROADMAP.md](docs/ROADMAP.md) for delivery order and v2, and [docs/SYSTEMD.md](docs/SYSTEMD.md) for Linux agent service setup.
 
 ## Current implementation
 
@@ -46,6 +46,8 @@ The repository has moved beyond the scaffold. The authenticated M1 path now incl
 - a real interactive PTY shell;
 - terminal input/output, EOF/exit handling and remote exit status capture;
 - live terminal resize propagation;
+- operator, agent and relay doctor checks for identity/configuration, relay reachability and relay storage;
+- a systemd template that runs the agent as an explicit OS account with restart-on-failure and journald logging;
 - Linux and macOS CI for format, Clippy, tests and release builds.
 
 The relay still carries the legacy `/v0` transport-proof endpoints. `REVTTY_DEV_TOKEN` is currently required by `relay serve` for those endpoints; the persistent `/v1` path uses enrollment, agent, operator and per-session credentials instead.
@@ -101,8 +103,7 @@ See [docs/PROTOTYPE.md](docs/PROTOTYPE.md) for validation details and the remain
 
 The first shell works, but M1 is not complete. Notable remaining work includes:
 
-- systemd service integration;
-- stronger operator/agent/relay doctor checks;
+- deeper doctor coverage for TLS/authentication/filesystem-permission failures;
 - explicit session accept/reject/cancel lifecycle and concurrency limits;
 - real NAT/CGNAT validation of the full authenticated `connect` path;
 - recovery/fault tests around relay restart and network loss.
