@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path as FsPath;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -11,18 +11,26 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
-use ssh_key::{Algorithm, HashAlg, PublicKey};
+use ssh_key::{Algorithm, HashAlg, PublicKey, SshSig};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::error::RevttyError;
-use crate::protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse};
+use crate::protocol::{
+    CONTROL_PROTOCOL_VERSION, OPERATOR_AUTH_NAMESPACE, ControlMessage, EnrollRequest,
+    EnrollResponse, OperatorAuthRequest, OperatorAuthResponse, OperatorChallengeResponse,
+    operator_auth_message,
+};
 use crate::storage::Store;
+use crate::token::{SecretToken, hash_token};
 use crate::transport::valid_name;
 
 const CONTROL_QUEUE_DEPTH: usize = 16;
 const SESSION_WAIT: Duration = Duration::from_secs(10);
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const OPERATOR_CHALLENGE_TTL: Duration = Duration::from_secs(30);
+const OPERATOR_SESSION_TTL: Duration = Duration::from_secs(30);
+const MAX_PENDING_OPERATOR_AUTH: usize = 4096;
 
 #[derive(Clone)]
 struct RelayState {
@@ -30,6 +38,8 @@ struct RelayState {
     store: Store,
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
     pending: Arc<Mutex<HashMap<String, PendingSession>>>,
+    operator_challenges: Arc<Mutex<HashMap<String, OperatorChallenge>>>,
+    operator_sessions: Arc<Mutex<HashMap<[u8; 32], OperatorSession>>>,
 }
 
 impl RelayState {
@@ -39,6 +49,8 @@ impl RelayState {
             store,
             agents: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            operator_challenges: Arc::new(Mutex::new(HashMap::new())),
+            operator_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -52,6 +64,16 @@ struct AgentHandle {
 struct PendingSession {
     agent_name: String,
     sender: oneshot::Sender<WebSocket>,
+}
+
+struct OperatorChallenge {
+    agent_name: String,
+    expires_at: Instant,
+}
+
+struct OperatorSession {
+    agent_name: String,
+    expires_at: Instant,
 }
 
 pub async fn init(db: &FsPath) -> Result<(), RevttyError> {
@@ -151,7 +173,10 @@ fn router(state: RelayState) -> Router {
         .route("/v0/probe/{name}", get(probe_upgrade))
         .route("/v0/session/{session_id}", get(session_upgrade))
         .route("/v1/enroll", post(enroll_agent))
+        .route("/v1/operator/challenge/{name}", post(operator_challenge))
+        .route("/v1/operator/auth/{name}", post(operator_auth))
         .route("/v1/agent/{name}", get(persistent_agent_upgrade))
+        .route("/v1/probe/{name}", get(persistent_probe_upgrade))
         .route("/v1/session/{session_id}", get(persistent_session_upgrade))
         .with_state(state)
 }
@@ -197,6 +222,177 @@ async fn enroll_agent(
             StatusCode::UNAUTHORIZED.into_response()
         }
     }
+}
+
+async fn operator_challenge(
+    State(state): State<RelayState>,
+    Path(name): Path<String>,
+) -> Response {
+    if !valid_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
+    }
+
+    match state.store.get_agent(&name).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            eprintln!("operator challenge lookup failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    let challenge = match SecretToken::generate("rvc") {
+        Ok(challenge) => challenge.expose().to_owned(),
+        Err(error) => {
+            eprintln!("operator challenge generation failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let now = Instant::now();
+    let mut challenges = state.operator_challenges.lock().await;
+    challenges.retain(|_, value| value.expires_at > now);
+
+    if challenges.len() >= MAX_PENDING_OPERATOR_AUTH {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+
+    challenges.insert(
+        challenge.clone(),
+        OperatorChallenge {
+            agent_name: name,
+            expires_at: now + OPERATOR_CHALLENGE_TTL,
+        },
+    );
+
+    Json(OperatorChallengeResponse {
+        challenge,
+        expires_in_secs: OPERATOR_CHALLENGE_TTL.as_secs(),
+    })
+    .into_response()
+}
+
+async fn operator_auth(
+    State(state): State<RelayState>,
+    Path(name): Path<String>,
+    Json(request): Json<OperatorAuthRequest>,
+) -> Response {
+    if !valid_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
+    }
+
+    let challenge = {
+        let mut challenges = state.operator_challenges.lock().await;
+        challenges.remove(&request.challenge)
+    };
+
+    let Some(challenge) = challenge else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    if challenge.agent_name != name || challenge.expires_at <= Instant::now() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let agent = match state.store.get_agent(&name).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            eprintln!("operator auth lookup failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let operator_key = match PublicKey::from_openssh(&agent.operator_key) {
+        Ok(key) if key.algorithm() == Algorithm::Ed25519 => key,
+        _ => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let signature = match SshSig::from_pem(request.signature.as_bytes()) {
+        Ok(signature) => signature,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let message = operator_auth_message(&name, &request.challenge);
+
+    if operator_key
+        .verify(OPERATOR_AUTH_NAMESPACE, message.as_bytes(), &signature)
+        .is_err()
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let session_token = match SecretToken::generate("rvo") {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("operator session token generation failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let now = Instant::now();
+    let mut sessions = state.operator_sessions.lock().await;
+    sessions.retain(|_, value| value.expires_at > now);
+    if sessions.len() >= MAX_PENDING_OPERATOR_AUTH {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+
+    sessions.insert(
+        session_token.hash(),
+        OperatorSession {
+            agent_name: name,
+            expires_at: now + OPERATOR_SESSION_TTL,
+        },
+    );
+
+    (
+        StatusCode::CREATED,
+        Json(OperatorAuthResponse {
+            session_token: session_token.expose().to_owned(),
+            expires_in_secs: OPERATOR_SESSION_TTL.as_secs(),
+        }),
+    )
+        .into_response()
+}
+
+async fn persistent_probe_upgrade(
+    State(state): State<RelayState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !valid_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
+    }
+
+    let Some(token) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    let session = {
+        let mut sessions = state.operator_sessions.lock().await;
+        sessions.remove(&hash_token(token))
+    };
+
+    let Some(session) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    if session.agent_name != name || session.expires_at <= Instant::now() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let control = {
+        let agents = state.agents.lock().await;
+        agents.get(&name).map(|agent| agent.control.clone())
+    };
+
+    let Some(control) = control else {
+        return (StatusCode::NOT_FOUND, "agent is offline").into_response();
+    };
+
+    ws.max_message_size(MAX_MESSAGE_SIZE)
+        .max_frame_size(MAX_MESSAGE_SIZE)
+        .on_upgrade(move |socket| handle_probe(socket, state, name, control))
+        .into_response()
 }
 
 async fn persistent_agent_upgrade(
