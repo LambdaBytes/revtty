@@ -78,6 +78,10 @@ The flow is:
 
 The operator and agent rendezvous credentials are therefore distinct.
 
+`revtty status <name>` reuses this target-scoped authentication flow and consumes the resulting operator session credential once on `GET /v1/status/{name}`. It returns persisted identity/presence metadata plus the relay's current online/offline view without opening a data tunnel.
+
+`revtty list` uses a separate one-time SSHSIG inventory challenge. The client signs the canonical `scope=list` message and sends its Ed25519 public key with the signature. The relay verifies possession of that key and returns only enrolled agents whose authorized operator key has the same SHA-256 SSH fingerprint. The inventory challenge is removed when used, including failed/replayed attempts.
+
 ## Data plane
 
 After the operator and agent WebSockets are paired, the relay forwards frames without interpreting the SSH payload.
@@ -106,6 +110,7 @@ SSH performs agent host authentication and operator public-key authentication in
 - Terminal bytes never appear in control messages.
 - Session credentials are sent in authorization headers, not URL query strings.
 - Operator session credentials are target-scoped, short lived and single use.
+- Operator inventory challenges are short lived, single use and return only agents authorized for the proven key.
 - Agent data-tunnel credentials are per-rendezvous and single use.
 - A persistent agent control credential cannot open a `/v1/session` data tunnel.
 - A pending agent side is paired at most once.

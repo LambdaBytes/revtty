@@ -14,8 +14,10 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - Platform-native state/config paths.
 - Persistent Ed25519 operator and agent identities.
 - SQLite relay persistence, migrations and single-use enrollment.
-- Persistent authenticated agent control sessions with heartbeat/presence updates.
+- Persistent authenticated agent control sessions with heartbeat/presence updates and bounded exponential reconnect backoff with jitter.
 - SSHSIG operator challenge/response authentication and short-lived operator sessions.
+- Authenticated operator `list` filtered by the proven SSH-key fingerprint, with single-use inventory challenges.
+- Authenticated operator `status` with online/offline, last-seen and version metadata.
 - OpenSSH-compatible host-key pinning with hard failure on unexpected key changes.
 - Authenticated SSH transport through the WebSocket rendezvous relay.
 - Interactive SSH-backed PTY shell with bounded I/O queues and cleanup.
