@@ -16,8 +16,8 @@ impl Paths {
             .ok_or_else(|| RevttyError::message("unable to determine revtty user directories"))?;
 
         Ok(Self {
-            config_dir: dirs.config_dir().to_path_buf(),
-            state_dir: dirs.data_local_dir().to_path_buf(),
+            config_dir: path_override("REVTTY_CONFIG_DIR", dirs.config_dir().to_path_buf())?,
+            state_dir: path_override("REVTTY_STATE_DIR", dirs.data_local_dir().to_path_buf())?,
         })
     }
 
@@ -28,4 +28,19 @@ impl Paths {
             state_dir: state_dir.into(),
         }
     }
+}
+
+fn path_override(name: &str, fallback: PathBuf) -> Result<PathBuf, RevttyError> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(fallback);
+    };
+
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(RevttyError::message(format!(
+            "{name} must be an absolute path"
+        )));
+    }
+
+    Ok(path)
 }
