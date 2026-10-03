@@ -66,6 +66,34 @@ struct PendingSession {
     sender: oneshot::Sender<WebSocket>,
 }
 
+#[derive(Clone, Copy)]
+enum SessionKind {
+    Probe,
+    Shell,
+}
+
+impl SessionKind {
+    fn offer(self, session_id: String) -> ControlMessage {
+        match self {
+            Self::Probe => ControlMessage::ProbeOffer {
+                version: CONTROL_PROTOCOL_VERSION,
+                session_id,
+            },
+            Self::Shell => ControlMessage::ShellOffer {
+                version: CONTROL_PROTOCOL_VERSION,
+                session_id,
+            },
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Probe => "probe",
+            Self::Shell => "shell",
+        }
+    }
+}
+
 struct OperatorChallenge {
     agent_name: String,
     expires_at: Instant,
@@ -177,6 +205,7 @@ fn router(state: RelayState) -> Router {
         .route("/v1/operator/auth/{name}", post(operator_auth))
         .route("/v1/agent/{name}", get(persistent_agent_upgrade))
         .route("/v1/probe/{name}", get(persistent_probe_upgrade))
+        .route("/v1/connect/{name}", get(persistent_connect_upgrade))
         .route("/v1/session/{session_id}", get(persistent_session_upgrade))
         .with_state(state)
 }
@@ -357,24 +386,30 @@ async fn persistent_probe_upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    persistent_operator_upgrade(state, name, headers, ws, SessionKind::Probe).await
+}
+
+async fn persistent_connect_upgrade(
+    State(state): State<RelayState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    persistent_operator_upgrade(state, name, headers, ws, SessionKind::Shell).await
+}
+
+async fn persistent_operator_upgrade(
+    state: RelayState,
+    name: String,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    kind: SessionKind,
+) -> Response {
     if !valid_name(&name) {
         return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
     }
 
-    let Some(token) = bearer_token(&headers) else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-
-    let session = {
-        let mut sessions = state.operator_sessions.lock().await;
-        sessions.remove(&hash_token(token))
-    };
-
-    let Some(session) = session else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-
-    if session.agent_name != name || session.expires_at <= Instant::now() {
+    if !consume_operator_session(&state, &name, &headers).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -389,8 +424,27 @@ async fn persistent_probe_upgrade(
 
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_probe(socket, state, name, control))
+        .on_upgrade(move |socket| handle_operator_session(socket, state, name, control, kind))
         .into_response()
+}
+
+async fn consume_operator_session(
+    state: &RelayState,
+    agent_name: &str,
+    headers: &HeaderMap,
+) -> bool {
+    let Some(token) = bearer_token(headers) else {
+        return false;
+    };
+
+    let session = {
+        let mut sessions = state.operator_sessions.lock().await;
+        sessions.remove(&hash_token(token))
+    };
+
+    session.is_some_and(|session| {
+        session.agent_name == agent_name && session.expires_at > Instant::now()
+    })
 }
 
 async fn persistent_agent_upgrade(
@@ -506,7 +560,9 @@ async fn probe_upgrade(
 
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_probe(socket, state, name, control))
+        .on_upgrade(move |socket| {
+            handle_operator_session(socket, state, name, control, SessionKind::Probe)
+        })
         .into_response()
 }
 
@@ -604,11 +660,12 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
     }
 }
 
-async fn handle_probe(
+async fn handle_operator_session(
     operator_socket: WebSocket,
     state: RelayState,
     agent_name: String,
     control: mpsc::Sender<ControlMessage>,
+    kind: SessionKind,
 ) {
     let session_id = Uuid::new_v4().simple().to_string();
     let (session_tx, session_rx) = oneshot::channel();
@@ -624,26 +681,21 @@ async fn handle_probe(
         );
     }
 
-    let offer = ControlMessage::ProbeOffer {
-        version: CONTROL_PROTOCOL_VERSION,
-        session_id: session_id.clone(),
-    };
-
-    if control.send(offer).await.is_err() {
+    if control.send(kind.offer(session_id.clone())).await.is_err() {
         state.pending.lock().await.remove(&session_id);
         return;
     }
 
-    eprintln!("probe requested: {session_id}");
+    eprintln!("{} requested: {session_id}", kind.label());
 
     match tokio::time::timeout(SESSION_WAIT, session_rx).await {
         Ok(Ok(agent_socket)) => {
-            eprintln!("probe paired: {session_id}");
+            eprintln!("{} paired: {session_id}", kind.label());
             bridge_websockets(operator_socket, agent_socket).await;
         }
         _ => {
             state.pending.lock().await.remove(&session_id);
-            eprintln!("probe timed out: {session_id}");
+            eprintln!("{} timed out: {session_id}", kind.label());
         }
     }
 }
