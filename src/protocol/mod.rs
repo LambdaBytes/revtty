@@ -31,6 +31,16 @@ pub enum ControlMessage {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatusResponse {
+    pub id: String,
+    pub name: String,
+    pub online: bool,
+    pub created_at: i64,
+    pub last_seen: Option<i64>,
+    pub version: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeResult {
     pub name: String,
     pub os: String,
@@ -75,8 +85,8 @@ pub struct OperatorAuthResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlMessage, EnrollRequest, EnrollResponse, OperatorAuthRequest, OperatorAuthResponse,
-        OperatorChallengeResponse, ProbeResult, operator_auth_message,
+        AgentStatusResponse, ControlMessage, EnrollRequest, EnrollResponse, OperatorAuthRequest,
+        OperatorAuthResponse, OperatorChallengeResponse, ProbeResult, operator_auth_message,
     };
 
     #[test]
@@ -161,6 +171,22 @@ mod tests {
             operator_auth_message("store-042", "rvc_random"),
             "revtty-control-v1\nagent=store-042\nchallenge=rvc_random\n"
         );
+    }
+
+    #[test]
+    fn agent_status_round_trips() {
+        let status = AgentStatusResponse {
+            id: "agent-id".to_owned(),
+            name: "store-042".to_owned(),
+            online: true,
+            created_at: 1_700_000_000,
+            last_seen: Some(1_700_000_030),
+            version: Some("0.1.0".to_owned()),
+        };
+        let json = serde_json::to_string(&status).expect("serialize agent status");
+        let decoded: AgentStatusResponse =
+            serde_json::from_str(&json).expect("deserialize agent status");
+        assert!(decoded == status);
     }
 
     #[test]
