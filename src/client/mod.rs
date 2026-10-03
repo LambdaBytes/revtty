@@ -66,7 +66,10 @@ pub async fn status(target: &str, relay: &str) -> Result<(), RevttyError> {
         .map_err(|error| RevttyError::runtime("decode agent status", error))?;
 
     println!("target    {}", status.name);
-    println!("status    {}", if status.online { "online" } else { "offline" });
+    println!(
+        "status    {}",
+        if status.online { "online" } else { "offline" }
+    );
     println!("id        {}", status.id);
     println!("created   {}", status.created_at);
     println!(
