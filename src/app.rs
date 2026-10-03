@@ -29,9 +29,7 @@ pub async fn run(args: Args) -> Result<(), RevttyError> {
                 db,
             } => crate::relay::create_enrollment(&db, &name, &operator_key, ttl).await,
             RelayCommand::Agents { db } => crate::relay::list_agents(&db).await,
-            RelayCommand::Serve { bind, token, db } => {
-                crate::relay::serve(&bind, token, &db).await
-            }
+            RelayCommand::Serve { bind, token, db } => crate::relay::serve(&bind, token, &db).await,
             RelayCommand::Doctor => crate::relay::doctor(),
         },
     }
