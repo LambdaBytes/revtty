@@ -1,12 +1,15 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::str::FromStr;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+use sha2::{Digest, Sha256};
+use ssh_key::known_hosts::{Entry as KnownHostEntry, HostPatterns};
 use ssh_key::rand_core::OsRng;
-use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey};
+use ssh_key::{Algorithm, HashAlg, KnownHosts, LineEnding, PrivateKey, PublicKey};
 
 use crate::config::Paths;
 use crate::error::RevttyError;
@@ -15,6 +18,7 @@ const OPERATOR_KEY_FILE: &str = "id_ed25519";
 const OPERATOR_PUBLIC_KEY_FILE: &str = "id_ed25519.pub";
 const AGENT_KEY_FILE: &str = "agent_ed25519";
 const AGENT_PUBLIC_KEY_FILE: &str = "agent_ed25519.pub";
+const KNOWN_HOSTS_FILE: &str = "known_hosts";
 
 pub struct AgentIdentity {
     pub public_key: String,
@@ -25,6 +29,11 @@ pub struct AgentIdentity {
 pub struct OperatorIdentity {
     pub private_key_path: PathBuf,
     pub public_key_path: PathBuf,
+    pub fingerprint: String,
+    pub created: bool,
+}
+
+pub struct HostKeyPin {
     pub fingerprint: String,
     pub created: bool,
 }
@@ -100,6 +109,112 @@ pub fn ensure_operator(paths: &Paths) -> Result<OperatorIdentity, RevttyError> {
         fingerprint: public_key.fingerprint(HashAlg::Sha256).to_string(),
         created,
     })
+}
+
+pub fn pin_agent_host_key(
+    paths: &Paths,
+    relay: &str,
+    agent_name: &str,
+    encoded_key: &str,
+) -> Result<HostKeyPin, RevttyError> {
+    let public_key = PublicKey::from_openssh(encoded_key)
+        .map_err(|error| RevttyError::runtime("parse enrolled agent host key", error))?;
+
+    if public_key.algorithm() != Algorithm::Ed25519 {
+        return Err(RevttyError::message("v1 requires an Ed25519 agent host key"));
+    }
+
+    fs::create_dir_all(&paths.config_dir)
+        .map_err(|error| RevttyError::runtime("create operator config directory", error))?;
+
+    let path = paths.config_dir.join(KNOWN_HOSTS_FILE);
+    let alias = known_host_alias(relay, agent_name);
+    let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+
+    if path.exists() {
+        let entries = KnownHosts::read_file(&path)
+            .map_err(|error| RevttyError::runtime("read revtty known_hosts", error))?;
+
+        for entry in entries {
+            if !entry_matches_alias(&entry, &alias) {
+                continue;
+            }
+
+            if entry.marker().is_some() {
+                return Err(RevttyError::message(format!(
+                    "host key for {agent_name} is marked revoked"
+                )));
+            }
+
+            if entry.public_key() == &public_key {
+                return Ok(HostKeyPin {
+                    fingerprint,
+                    created: false,
+                });
+            }
+
+            return Err(RevttyError::message(format!(
+                "HOST KEY MISMATCH for {agent_name}: pinned {}, received {}",
+                entry.public_key().fingerprint(HashAlg::Sha256),
+                fingerprint
+            )));
+        }
+    }
+
+    let public_text = public_key
+        .to_openssh()
+        .map_err(|error| RevttyError::runtime("encode enrolled agent host key", error))?;
+    let line = format!("{alias} {public_text}");
+    let entry = KnownHostEntry::from_str(&line)
+        .map_err(|error| RevttyError::runtime("validate known_hosts entry", error))?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| RevttyError::runtime("open revtty known_hosts", error))?;
+
+    writeln!(file, "{entry}")
+        .map_err(|error| RevttyError::runtime("write revtty known_hosts", error))?;
+    file.sync_all()
+        .map_err(|error| RevttyError::runtime("sync revtty known_hosts", error))?;
+
+    Ok(HostKeyPin {
+        fingerprint,
+        created: true,
+    })
+}
+
+fn known_host_alias(relay: &str, agent_name: &str) -> String {
+    let relay = canonical_relay_identity(relay);
+    let digest = Sha256::digest(relay.as_bytes());
+    let mut relay_id = String::with_capacity(16);
+
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(relay_id, "{byte:02x}");
+    }
+
+    format!("revtty-{relay_id}-{agent_name}")
+}
+
+fn canonical_relay_identity(relay: &str) -> String {
+    let relay = relay.trim().trim_end_matches('/').to_ascii_lowercase();
+
+    if let Some(rest) = relay.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = relay.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        relay
+    }
+}
+
+fn entry_matches_alias(entry: &KnownHostEntry, alias: &str) -> bool {
+    match entry.host_patterns() {
+        HostPatterns::Patterns(patterns) => patterns.iter().any(|pattern| pattern == alias),
+        HostPatterns::HashedName { .. } => false,
+    }
 }
 
 fn write_private_key(path: &Path, key: &PrivateKey) -> Result<(), RevttyError> {
