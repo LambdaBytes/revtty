@@ -1199,9 +1199,7 @@ mod tests {
         });
 
         let challenge_response = http
-            .post(format!(
-                "http://{address}/v1/operator/challenge/signed-ssh"
-            ))
+            .post(format!("http://{address}/v1/operator/challenge/signed-ssh"))
             .send()
             .await
             .expect("request operator challenge");
