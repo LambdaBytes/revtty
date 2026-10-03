@@ -9,8 +9,9 @@ use ssh_key::{HashAlg, LineEnding, PrivateKey};
 use crate::config::Paths;
 use crate::error::RevttyError;
 use crate::protocol::{
-    AgentStatusResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest, OperatorAuthResponse,
-    OperatorChallengeResponse, ProbeResult, operator_auth_message,
+    AgentListResponse, AgentStatusResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
+    OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, ProbeResult,
+    operator_auth_message, operator_list_auth_message,
 };
 use crate::transport::{connect_websocket, http_url, valid_name};
 
@@ -32,8 +33,85 @@ pub fn init() -> Result<(), RevttyError> {
     Ok(())
 }
 
-pub fn list() -> Result<(), RevttyError> {
-    Err(RevttyError::NotImplemented("agent listing"))
+pub async fn list(relay: &str) -> Result<(), RevttyError> {
+    let paths = Paths::discover()?;
+    let identity = crate::identity::ensure_operator(&paths)?;
+    let private_key = PrivateKey::read_openssh_file(&identity.private_key_path)
+        .map_err(|error| RevttyError::runtime("read operator private key", error))?;
+    let operator_key = private_key
+        .public_key()
+        .to_openssh()
+        .map_err(|error| RevttyError::runtime("encode operator public key", error))?;
+
+    let client = reqwest::Client::new();
+    let challenge_url = http_url(relay, "/v1/operator/list/challenge")?;
+    let challenge_response = client
+        .post(challenge_url)
+        .send()
+        .await
+        .map_err(|error| RevttyError::runtime("request operator list challenge", error))?;
+
+    let challenge_status = challenge_response.status();
+    if !challenge_status.is_success() {
+        return Err(RevttyError::message(format!(
+            "operator list challenge rejected ({challenge_status})"
+        )));
+    }
+
+    let challenge: OperatorChallengeResponse = challenge_response
+        .json()
+        .await
+        .map_err(|error| RevttyError::runtime("decode operator list challenge", error))?;
+
+    let message = operator_list_auth_message(&challenge.challenge);
+    let signature = private_key
+        .sign(OPERATOR_AUTH_NAMESPACE, HashAlg::Sha256, message.as_bytes())
+        .map_err(|error| RevttyError::runtime("sign operator list challenge", error))?
+        .to_pem(LineEnding::LF)
+        .map_err(|error| RevttyError::runtime("encode operator list SSH signature", error))?;
+
+    let list_url = http_url(relay, "/v1/operator/list")?;
+    let response = client
+        .post(list_url)
+        .json(&OperatorListRequest {
+            operator_key,
+            challenge: challenge.challenge,
+            signature,
+        })
+        .send()
+        .await
+        .map_err(|error| RevttyError::runtime("request agent list", error))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(RevttyError::message(format!(
+            "operator list rejected ({status})"
+        )));
+    }
+
+    let response: AgentListResponse = response
+        .json()
+        .await
+        .map_err(|error| RevttyError::runtime("decode agent list", error))?;
+
+    if response.agents.is_empty() {
+        println!("No enrolled agents.");
+        return Ok(());
+    }
+
+    for agent in response.agents {
+        println!(
+            "{}\t{}\tlast_seen={}\tversion={}",
+            agent.name,
+            if agent.online { "online" } else { "offline" },
+            agent
+                .last_seen
+                .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+            agent.version.as_deref().unwrap_or("-")
+        );
+    }
+
+    Ok(())
 }
 
 pub async fn status(target: &str, relay: &str) -> Result<(), RevttyError> {

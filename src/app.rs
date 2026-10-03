@@ -4,7 +4,7 @@ use crate::error::RevttyError;
 pub async fn run(args: Args) -> Result<(), RevttyError> {
     match args.command {
         Command::Init => crate::client::init(),
-        Command::List => crate::client::list(),
+        Command::List { relay } => crate::client::list(&relay).await,
         Command::Status { target, relay } => crate::client::status(&target, &relay).await,
         Command::Probe { target, relay } => crate::client::probe(&target, &relay).await,
         Command::Connect { target, relay } => crate::client::connect(&target, &relay).await,
