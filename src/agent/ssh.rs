@@ -74,15 +74,14 @@ impl AgentSshHandler {
             .active_shell
             .as_ref()
             .is_some_and(|active| active.channel == channel)
+            && let Some(mut active) = self.active_shell.take()
         {
-            if let Some(mut active) = self.active_shell.take() {
-                let _ = active.killer.kill();
-                if let Ok(mut input) = active.input.lock() {
-                    input.take();
-                }
-                if let Ok(mut master) = active.master.lock() {
-                    master.take();
-                }
+            let _ = active.killer.kill();
+            if let Ok(mut input) = active.input.lock() {
+                input.take();
+            }
+            if let Ok(mut master) = active.master.lock() {
+                master.take();
             }
         }
 
