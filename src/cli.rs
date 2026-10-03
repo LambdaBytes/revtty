@@ -31,10 +31,6 @@ pub enum Command {
         /// Relay base URL. http(s) is converted to ws(s).
         #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
         relay: String,
-
-        /// Development-only shared token for the transport proof.
-        #[arg(long, env = "REVTTY_DEV_TOKEN")]
-        token: String,
     },
 
     /// Open an interactive remote terminal.
@@ -145,13 +141,7 @@ mod tests {
 
     #[test]
     fn parses_probe_target() {
-        let args = Args::try_parse_from([
-            "revtty",
-            "probe",
-            "store-042",
-            "--token",
-            "development-token",
-        ]);
+        let args = Args::try_parse_from(["revtty", "probe", "store-042"]);
         assert!(args.is_ok());
     }
 
