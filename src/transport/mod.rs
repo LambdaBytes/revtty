@@ -1,9 +1,75 @@
+use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
-use reqwest_websocket::{Upgrade, WebSocket};
+use reqwest_websocket::{Message, Upgrade, WebSocket};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::task::JoinHandle;
 
 use crate::error::RevttyError;
 
 pub const DEFAULT_TRANSPORT: &str = "wss";
+
+const STREAM_BUFFER_SIZE: usize = 256 * 1024;
+const STREAM_CHUNK_SIZE: usize = 16 * 1024;
+
+pub fn websocket_byte_stream(
+    websocket: WebSocket,
+) -> (DuplexStream, JoinHandle<Result<(), RevttyError>>) {
+    let (application, bridge) = tokio::io::duplex(STREAM_BUFFER_SIZE);
+
+    let task = tokio::spawn(async move {
+        let (mut websocket_sender, mut websocket_receiver) = websocket.split();
+        let (mut stream_reader, mut stream_writer) = tokio::io::split(bridge);
+        let mut buffer = [0_u8; STREAM_CHUNK_SIZE];
+
+        loop {
+            tokio::select! {
+                message = websocket_receiver.next() => {
+                    match message {
+                        Some(Ok(Message::Binary(data))) => {
+                            stream_writer
+                                .write_all(&data)
+                                .await
+                                .map_err(|error| RevttyError::runtime("write websocket data to stream", error))?;
+                        }
+                        Some(Ok(Message::Ping(data))) => {
+                            websocket_sender
+                                .send(Message::Pong(data))
+                                .await
+                                .map_err(|error| RevttyError::runtime("send websocket pong", error))?;
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Close { .. })) | None => break,
+                        Some(Ok(Message::Text(_))) => {
+                            return Err(RevttyError::message(
+                                "unexpected text frame on binary session transport",
+                            ));
+                        }
+                        Some(Err(error)) => {
+                            return Err(RevttyError::runtime("receive websocket session data", error));
+                        }
+                    }
+                }
+                read = stream_reader.read(&mut buffer) => {
+                    let read = read
+                        .map_err(|error| RevttyError::runtime("read session stream", error))?;
+
+                    if read == 0 {
+                        break;
+                    }
+
+                    websocket_sender
+                        .send(Message::Binary(buffer[..read].to_vec().into()))
+                        .await
+                        .map_err(|error| RevttyError::runtime("send websocket session data", error))?;
+                }
+            }
+        }
+
+        Ok(())
+    });
+
+    (application, task)
+}
 
 pub async fn connect_websocket(
     client: &Client,
