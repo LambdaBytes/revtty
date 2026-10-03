@@ -1,7 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::str::FromStr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -121,7 +121,9 @@ pub fn pin_agent_host_key(
         .map_err(|error| RevttyError::runtime("parse enrolled agent host key", error))?;
 
     if public_key.algorithm() != Algorithm::Ed25519 {
-        return Err(RevttyError::message("v1 requires an Ed25519 agent host key"));
+        return Err(RevttyError::message(
+            "v1 requires an Ed25519 agent host key",
+        ));
     }
 
     fs::create_dir_all(&paths.config_dir)
@@ -292,18 +294,17 @@ mod tests {
         .expect("pin first host key");
         assert!(first.created);
 
-        let same = pin_agent_host_key(
-            &paths,
-            "wss://relay.example.com",
-            "store-042",
-            &first_key,
-        )
-        .expect("reuse same host key");
+        let same = pin_agent_host_key(&paths, "wss://relay.example.com", "store-042", &first_key)
+            .expect("reuse same host key");
         assert!(!same.created);
         assert_eq!(same.fingerprint, first.fingerprint);
 
-        let mismatch =
-            pin_agent_host_key(&paths, "https://relay.example.com", "store-042", &second_key);
+        let mismatch = pin_agent_host_key(
+            &paths,
+            "https://relay.example.com",
+            "store-042",
+            &second_key,
+        );
         assert!(mismatch.is_err());
 
         let other_relay = pin_agent_host_key(
@@ -315,8 +316,8 @@ mod tests {
         .expect("pin same name on another relay");
         assert!(other_relay.created);
 
-        let known_hosts = fs::read_to_string(paths.config_dir.join("known_hosts"))
-            .expect("read known_hosts");
+        let known_hosts =
+            fs::read_to_string(paths.config_dir.join("known_hosts")).expect("read known_hosts");
         assert_eq!(known_hosts.lines().count(), 2);
 
         fs::remove_dir_all(root).expect("clean known_hosts test directory");
