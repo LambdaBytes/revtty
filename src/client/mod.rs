@@ -70,11 +70,7 @@ pub async fn probe(target: &str, relay: &str) -> Result<(), RevttyError> {
 
     let message = operator_auth_message(target, &challenge.challenge);
     let signature = private_key
-        .sign(
-            OPERATOR_AUTH_NAMESPACE,
-            HashAlg::Sha256,
-            message.as_bytes(),
-        )
+        .sign(OPERATOR_AUTH_NAMESPACE, HashAlg::Sha256, message.as_bytes())
         .map_err(|error| RevttyError::runtime("sign operator challenge", error))?
         .to_pem(LineEnding::LF)
         .map_err(|error| RevttyError::runtime("encode operator SSH signature", error))?;
@@ -103,8 +99,7 @@ pub async fn probe(target: &str, relay: &str) -> Result<(), RevttyError> {
         .map_err(|error| RevttyError::runtime("decode operator authentication", error))?;
 
     let path = format!("/v1/probe/{target}");
-    let mut websocket =
-        connect_websocket(&client, relay, &path, &auth.session_token).await?;
+    let mut websocket = connect_websocket(&client, relay, &path, &auth.session_token).await?;
 
     while let Some(message) = websocket.next().await {
         match message {
