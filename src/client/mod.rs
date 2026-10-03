@@ -1,6 +1,9 @@
+mod ssh;
+
 use futures_util::StreamExt;
 use reqwest_websocket::Message;
-use ssh_key::{HashAlg, LineEnding, PrivateKey};
+use russh::keys::PrivateKey;
+use ssh_key::{HashAlg, LineEnding};
 
 use crate::config::Paths;
 use crate::error::RevttyError;
@@ -36,7 +39,16 @@ pub fn status(_target: &str) -> Result<(), RevttyError> {
     Err(RevttyError::NotImplemented("agent status"))
 }
 
-pub async fn probe(target: &str, relay: &str) -> Result<(), RevttyError> {
+struct AuthenticatedOperator {
+    client: reqwest::Client,
+    private_key: PrivateKey,
+    auth: OperatorAuthResponse,
+}
+
+async fn authenticate_operator(
+    target: &str,
+    relay: &str,
+) -> Result<AuthenticatedOperator, RevttyError> {
     if !valid_name(target) {
         return Err(RevttyError::message(
             "target names may contain only letters, digits, '.', '_' and '-'",
@@ -103,8 +115,23 @@ pub async fn probe(target: &str, relay: &str) -> Result<(), RevttyError> {
         eprintln!("pinned host key {}", host_pin.fingerprint);
     }
 
+    Ok(AuthenticatedOperator {
+        client,
+        private_key,
+        auth,
+    })
+}
+
+pub async fn probe(target: &str, relay: &str) -> Result<(), RevttyError> {
+    let operator = authenticate_operator(target, relay).await?;
     let path = format!("/v1/probe/{target}");
-    let mut websocket = connect_websocket(&client, relay, &path, &auth.session_token).await?;
+    let mut websocket = connect_websocket(
+        &operator.client,
+        relay,
+        &path,
+        &operator.auth.session_token,
+    )
+    .await?;
 
     while let Some(message) = websocket.next().await {
         match message {
@@ -130,8 +157,22 @@ pub async fn probe(target: &str, relay: &str) -> Result<(), RevttyError> {
     ))
 }
 
-pub async fn connect(_target: &str) -> Result<(), RevttyError> {
-    Err(RevttyError::NotImplemented("remote terminal connection"))
+pub async fn connect(target: &str, relay: &str) -> Result<(), RevttyError> {
+    let operator = authenticate_operator(target, relay).await?;
+    let path = format!("/v1/connect/{target}");
+    let websocket = connect_websocket(
+        &operator.client,
+        relay,
+        &path,
+        &operator.auth.session_token,
+    )
+    .await?;
+
+    ssh::authenticate(websocket, operator.private_key, &operator.auth.host_key).await?;
+
+    println!("target   {target}");
+    println!("status   secure SSH transport established");
+    Ok(())
 }
 
 pub fn doctor() -> Result<(), RevttyError> {

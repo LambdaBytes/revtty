@@ -1,4 +1,5 @@
 mod config;
+mod ssh;
 
 use std::io::Read;
 use std::time::Duration;
@@ -102,7 +103,13 @@ pub async fn run() -> Result<(), RevttyError> {
     let client = reqwest::Client::new();
 
     loop {
-        let control = run_control_once(&client, &config.relay, &config.name, &config.control_token);
+        let control = run_control_once(
+            &client,
+            &config.relay,
+            &config.name,
+            &config.control_token,
+            &config.operator_key,
+        );
 
         tokio::select! {
             result = control => {
@@ -131,6 +138,7 @@ async fn run_control_once(
     relay: &str,
     name: &str,
     token: &str,
+    operator_key: &str,
 ) -> Result<(), RevttyError> {
     let path = format!("/v1/agent/{name}");
     let websocket = connect_websocket(client, relay, &path, token).await?;
@@ -168,29 +176,49 @@ async fn run_control_once(
                         let control: ControlMessage = serde_json::from_str(&text)
                             .map_err(|error| RevttyError::runtime("decode control message", error))?;
 
-                        if let ControlMessage::ProbeOffer {
-                            version,
-                            session_id,
-                        } = control
-                        {
-                            if version != CONTROL_PROTOCOL_VERSION {
-                                continue;
+                        match control {
+                            ControlMessage::ProbeOffer {
+                                version,
+                                session_id,
+                            } if version == CONTROL_PROTOCOL_VERSION => {
+                                let client = client.clone();
+                                let relay = relay.to_owned();
+                                let token = token.to_owned();
+                                let name = name.to_owned();
+
+                                tokio::spawn(async move {
+                                    if let Err(error) =
+                                        send_probe(&client, &relay, &token, &session_id, &name).await
+                                    {
+                                        eprintln!("probe {session_id} failed: {error}");
+                                    }
+                                });
                             }
+                            ControlMessage::ShellOffer {
+                                version,
+                                session_id,
+                            } if version == CONTROL_PROTOCOL_VERSION => {
+                                let client = client.clone();
+                                let relay = relay.to_owned();
+                                let token = token.to_owned();
+                                let operator_key = operator_key.to_owned();
 
-                            let client = client.clone();
-                            let relay = relay.to_owned();
-                            let token = token.to_owned();
-                            let name = name.to_owned();
-
-                            tokio::spawn(async move {
-                                if let Err(error) =
-                                    send_probe(&client, &relay, &token, &session_id, &name).await
-                                {
-                                    eprintln!("probe {session_id} failed: {error}");
-                                }
-                            });
+                                tokio::spawn(async move {
+                                    if let Err(error) = ssh::serve(
+                                        &client,
+                                        &relay,
+                                        &token,
+                                        &session_id,
+                                        &operator_key,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!("shell {session_id} failed: {error}");
+                                    }
+                                });
+                            }
+                            _ => {}
                         }
-                    }
                     Some(Ok(Message::Ping(data))) => {
                         sender
                             .send(Message::Pong(data))
