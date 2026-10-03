@@ -1,9 +1,10 @@
 mod ssh;
 
+use std::path::PathBuf;
+
 use futures_util::StreamExt;
 use reqwest_websocket::Message;
-use russh::keys::PrivateKey;
-use ssh_key::{HashAlg, LineEnding};
+use ssh_key::{HashAlg, LineEnding, PrivateKey};
 
 use crate::config::Paths;
 use crate::error::RevttyError;
@@ -41,7 +42,7 @@ pub fn status(_target: &str) -> Result<(), RevttyError> {
 
 struct AuthenticatedOperator {
     client: reqwest::Client,
-    private_key: PrivateKey,
+    private_key_path: PathBuf,
     auth: OperatorAuthResponse,
 }
 
@@ -117,7 +118,7 @@ async fn authenticate_operator(
 
     Ok(AuthenticatedOperator {
         client,
-        private_key,
+        private_key_path: identity.private_key_path,
         auth,
     })
 }
@@ -158,7 +159,12 @@ pub async fn connect(target: &str, relay: &str) -> Result<(), RevttyError> {
     let websocket =
         connect_websocket(&operator.client, relay, &path, &operator.auth.session_token).await?;
 
-    ssh::authenticate(websocket, operator.private_key, &operator.auth.host_key).await?;
+    ssh::authenticate(
+        websocket,
+        &operator.private_key_path,
+        &operator.auth.host_key,
+    )
+    .await?;
 
     println!("target   {target}");
     println!("status   secure SSH transport established");

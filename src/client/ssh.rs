@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::path::Path;
 use std::sync::Arc;
 
 use reqwest_websocket::WebSocket;
@@ -37,9 +38,11 @@ fn ed25519_only() -> Preferred {
 
 pub async fn authenticate(
     websocket: WebSocket,
-    operator_key: PrivateKey,
+    operator_key_path: &Path,
     encoded_host_key: &str,
 ) -> Result<(), RevttyError> {
+    let operator_key = PrivateKey::read_openssh_file(operator_key_path)
+        .map_err(|error| RevttyError::runtime("read operator SSH private key", error))?;
     let expected_server_key = PublicKey::from_openssh(encoded_host_key)
         .map_err(|error| RevttyError::runtime("parse pinned agent host key", error))?;
 
