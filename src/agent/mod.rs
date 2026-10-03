@@ -219,6 +219,7 @@ async fn run_control_once(
                             }
                             _ => {}
                         }
+                    }
                     Some(Ok(Message::Ping(data))) => {
                         sender
                             .send(Message::Pong(data))
