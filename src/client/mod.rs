@@ -125,13 +125,8 @@ async fn authenticate_operator(
 pub async fn probe(target: &str, relay: &str) -> Result<(), RevttyError> {
     let operator = authenticate_operator(target, relay).await?;
     let path = format!("/v1/probe/{target}");
-    let mut websocket = connect_websocket(
-        &operator.client,
-        relay,
-        &path,
-        &operator.auth.session_token,
-    )
-    .await?;
+    let mut websocket =
+        connect_websocket(&operator.client, relay, &path, &operator.auth.session_token).await?;
 
     while let Some(message) = websocket.next().await {
         match message {
@@ -160,13 +155,8 @@ pub async fn probe(target: &str, relay: &str) -> Result<(), RevttyError> {
 pub async fn connect(target: &str, relay: &str) -> Result<(), RevttyError> {
     let operator = authenticate_operator(target, relay).await?;
     let path = format!("/v1/connect/{target}");
-    let websocket = connect_websocket(
-        &operator.client,
-        relay,
-        &path,
-        &operator.auth.session_token,
-    )
-    .await?;
+    let websocket =
+        connect_websocket(&operator.client, relay, &path, &operator.auth.session_token).await?;
 
     ssh::authenticate(websocket, operator.private_key, &operator.auth.host_key).await?;
 
