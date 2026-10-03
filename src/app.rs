@@ -8,13 +8,13 @@ pub async fn run(args: Args) -> Result<(), RevttyError> {
         Command::Status { target, relay } => crate::client::status(&target, &relay).await,
         Command::Probe { target, relay } => crate::client::probe(&target, &relay).await,
         Command::Connect { target, relay } => crate::client::connect(&target, &relay).await,
-        Command::Doctor => crate::client::doctor(),
+        Command::Doctor { relay } => crate::client::doctor(&relay).await,
         Command::Agent { command } => match command {
             AgentCommand::Enroll { relay, token } => crate::agent::enroll(&relay, &token).await,
             AgentCommand::Run => crate::agent::run().await,
             AgentCommand::PtyTest => crate::agent::pty_test(),
             AgentCommand::Status => crate::agent::status(),
-            AgentCommand::Doctor => crate::agent::doctor(),
+            AgentCommand::Doctor => crate::agent::doctor().await,
         },
         Command::Relay { command } => match command {
             RelayCommand::Init { db } => crate::relay::init(&db).await,
@@ -26,7 +26,7 @@ pub async fn run(args: Args) -> Result<(), RevttyError> {
             } => crate::relay::create_enrollment(&db, &name, &operator_key, ttl).await,
             RelayCommand::Agents { db } => crate::relay::list_agents(&db).await,
             RelayCommand::Serve { bind, token, db } => crate::relay::serve(&bind, token, &db).await,
-            RelayCommand::Doctor => crate::relay::doctor(),
+            RelayCommand::Doctor { db } => crate::relay::doctor(&db).await,
         },
     }
 }

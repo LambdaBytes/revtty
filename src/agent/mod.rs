@@ -18,7 +18,7 @@ use crate::error::RevttyError;
 use crate::protocol::{
     CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse, ProbeResult,
 };
-use crate::transport::{connect_websocket, http_url, valid_name};
+use crate::transport::{check_relay_health, connect_websocket, http_url, valid_name};
 
 const RECONNECT_BASE_MILLIS: u64 = 1_000;
 const RECONNECT_CAP_MILLIS: u64 = 30_000;
@@ -424,15 +424,38 @@ pub fn status() -> Result<(), RevttyError> {
     Ok(())
 }
 
-pub fn doctor() -> Result<(), RevttyError> {
+pub async fn doctor() -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
     let config = AgentConfig::load(&paths)?;
     let identity = ensure_agent(&paths)?;
+
+    if !valid_name(&config.name) {
+        return Err(RevttyError::message("persisted agent name is invalid"));
+    }
+    if config.agent_id.trim().is_empty() || config.control_token.trim().is_empty() {
+        return Err(RevttyError::message(
+            "persisted agent configuration is incomplete",
+        ));
+    }
+
+    match PublicKey::from_openssh(&config.operator_key) {
+        Ok(key) if key.algorithm() == Algorithm::Ed25519 => {}
+        _ => {
+            return Err(RevttyError::message(
+                "persisted operator key is not a valid Ed25519 SSH key",
+            ));
+        }
+    }
+
+    let client = reqwest::Client::new();
+    check_relay_health(&client, &config.relay).await?;
 
     println!("agent      configured");
     println!("name       {}", config.name);
     println!("host key   {}", identity.fingerprint);
     println!("protocol   v{}", crate::protocol::CONTROL_PROTOCOL_VERSION);
+    println!("relay      {} reachable", config.relay);
+    println!("config     {}", AgentConfig::path(&paths).display());
     Ok(())
 }
 

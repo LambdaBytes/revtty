@@ -71,6 +71,24 @@ pub fn websocket_byte_stream(
     (application, task)
 }
 
+pub async fn check_relay_health(client: &Client, relay: &str) -> Result<(), RevttyError> {
+    let url = http_url(relay, "/health")?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| RevttyError::runtime("relay health check", error))?;
+    let status = response.status();
+
+    if !status.is_success() {
+        return Err(RevttyError::message(format!(
+            "relay health check failed ({status})"
+        )));
+    }
+
+    Ok(())
+}
+
 pub async fn connect_websocket(
     client: &Client,
     relay: &str,
