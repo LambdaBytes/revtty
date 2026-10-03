@@ -35,8 +35,10 @@ The repository has moved beyond the scaffold. The authenticated M1 path now incl
 - persistent Ed25519 operator identity via `revtty init`;
 - persistent Ed25519 agent host identity;
 - SQLite relay state and single-use enrollment tokens;
-- an authenticated persistent outbound agent control WebSocket with heartbeat and reconnect;
+- an authenticated persistent outbound agent control WebSocket with heartbeat and bounded exponential reconnect backoff with jitter;
 - SSHSIG operator challenge/response authentication;
+- signed operator `list` scoped to machines authorized for that operator key;
+- authenticated operator `status` with online/offline, last-seen and version metadata;
 - short-lived, single-use operator session credentials;
 - OpenSSH-style agent host-key pinning;
 - a separate one-time credential for each agent data tunnel;
@@ -85,11 +87,13 @@ cargo run -- agent run
 From the operator machine:
 
 ```bash
+cargo run -- list --relay http://127.0.0.1:8787
+cargo run -- status store-042 --relay http://127.0.0.1:8787
 cargo run -- probe store-042 --relay http://127.0.0.1:8787
 cargo run -- connect store-042 --relay http://127.0.0.1:8787
 ```
 
-`connect` authenticates the operator, verifies the pinned agent host key, opens a one-time rendezvous and starts an interactive SSH PTY.
+`list` proves possession of the operator key and returns only machines enrolled for that key. `status` uses target-scoped SSHSIG authentication. `connect` authenticates the operator, verifies the pinned agent host key, opens a one-time rendezvous and starts an interactive SSH PTY.
 
 See [docs/PROTOTYPE.md](docs/PROTOTYPE.md) for validation details and the remaining real-NAT gate.
 
@@ -97,9 +101,7 @@ See [docs/PROTOTYPE.md](docs/PROTOTYPE.md) for validation details and the remain
 
 The first shell works, but M1 is not complete. Notable remaining work includes:
 
-- operator `list` and `status`;
 - systemd service integration;
-- bounded exponential reconnect backoff with jitter;
 - stronger operator/agent/relay doctor checks;
 - explicit session accept/reject/cancel lifecycle and concurrency limits;
 - real NAT/CGNAT validation of the full authenticated `connect` path;

@@ -17,10 +17,12 @@ That transport proof is now implemented together with the first authenticated SS
 - single-use enrollment tokens;
 - persistent outbound agent control WebSocket;
 - heartbeat/presence persistence;
-- automatic reconnect after control-channel loss;
+- automatic reconnect after control-channel loss with bounded exponential backoff, jitter and a 30-second cap;
 - SSHSIG operator challenge/response authentication;
 - short-lived, single-use operator session credentials;
 - agent host-key pinning;
+- operator `list` scoped to the authenticated operator key;
+- operator `status <name>` with persisted presence metadata;
 - operator `probe <name>`;
 - operator `connect <name>`;
 - on-demand outbound agent data tunnel;
@@ -51,6 +53,8 @@ The current flow is:
 6. the client pins/verifies that host key;
 7. each rendezvous creates a new one-time agent tunnel credential;
 8. SSH authenticates the operator public key again at the agent and encrypts the terminal payload end to end.
+
+Machine discovery uses a separate one-time SSHSIG challenge. The operator supplies the public key whose possession it proves, and the relay returns only agents whose enrolled operator key has the same SHA-256 SSH fingerprint. The challenge is consumed once, so the signed list request cannot be replayed.
 
 The long-lived agent control credential is explicitly rejected on the `/v1/session` data path, and the per-session agent credential is consumed at most once.
 
@@ -95,7 +99,16 @@ cargo run -- agent run
 
 The agent now loads its persisted configuration and identity; `agent run` does not take a machine name on every launch.
 
-### 4. Operator probe
+### 4. Operator discovery and status
+
+```bash
+cargo run -- list --relay http://127.0.0.1:8787
+cargo run -- status store-042 --relay http://127.0.0.1:8787
+```
+
+`list` returns only machines authorized for the current operator key. `status` reports the persisted identity, online/offline state, last-seen timestamp and agent version.
+
+### 5. Operator probe
 
 ```bash
 cargo run -- probe store-042 --relay http://127.0.0.1:8787
@@ -111,7 +124,7 @@ arch     x86_64
 revtty   0.1.0
 ```
 
-### 5. Interactive shell
+### 6. Interactive shell
 
 ```bash
 cargo run -- connect store-042 --relay http://127.0.0.1:8787
@@ -199,7 +212,8 @@ The repository currently validates these pieces on Linux and macOS:
 - persistent enrollment and agent authentication;
 - enrollment replay rejection;
 - SSHSIG operator authentication and challenge replay rejection;
-- single-use operator session credentials;
+- signed operator listing filtered by authorized SSH-key fingerprint with challenge replay rejection;
+- authenticated target status and single-use operator session credentials;
 - host-key pinning and mismatch rejection;
 - rejection of the long-lived control credential on the agent data path;
 - single-use agent data-tunnel credentials;
@@ -215,9 +229,7 @@ The next gates for M1 are:
 
 1. run the authenticated `connect` path across a real NAT/CGNAT boundary;
 2. validate relay restart and network-loss recovery;
-3. replace fixed reconnect delay with bounded exponential backoff and jitter;
-4. implement operator `list` / `status`;
-5. add systemd service lifecycle and stronger doctor checks;
-6. complete explicit pending-session lifecycle/concurrency behavior.
+3. add systemd service lifecycle and stronger doctor checks;
+4. complete explicit pending-session lifecycle/concurrency behavior.
 
 This keeps transport, identity, SSH, PTY and lifecycle failures independently observable.
