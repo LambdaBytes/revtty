@@ -345,6 +345,7 @@ async fn operator_auth(
         Json(OperatorAuthResponse {
             session_token: session_token.expose().to_owned(),
             expires_in_secs: OPERATOR_SESSION_TTL.as_secs(),
+            host_key: agent.host_key,
         }),
     )
         .into_response()
