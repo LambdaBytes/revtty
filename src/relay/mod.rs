@@ -722,13 +722,15 @@ mod tests {
     use russh::Preferred;
     use russh::client;
     use russh::keys::key::{PrivateKeyWithHashAlg, safe_rng};
-    use russh::keys::{Algorithm, HashAlg as RusshHashAlg, PrivateKey, PublicKey, PublicKeyOrCertificate};
+    use russh::keys::{
+        Algorithm, HashAlg as RusshHashAlg, PrivateKey, PublicKey, PublicKeyOrCertificate,
+    };
     use russh::server;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::{RelayState, authorized, router};
     use crate::protocol::{
-        OPERATOR_AUTH_NAMESPACE, ControlMessage, EnrollRequest, EnrollResponse,
+        ControlMessage, EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE,
         OperatorAuthRequest, OperatorAuthResponse, OperatorChallengeResponse, ProbeResult,
         operator_auth_message,
     };
@@ -1067,14 +1069,10 @@ mod tests {
             .expect("replay operator challenge");
         assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-        let mut operator = connect_websocket(
-            &http,
-            &relay,
-            "/v1/probe/signed-demo",
-            &auth.session_token,
-        )
-        .await
-        .expect("connect signed operator probe");
+        let mut operator =
+            connect_websocket(&http, &relay, "/v1/probe/signed-demo", &auth.session_token)
+                .await
+                .expect("connect signed operator probe");
 
         let response = tokio::time::timeout(Duration::from_secs(2), operator.next())
             .await
@@ -1085,17 +1083,11 @@ mod tests {
         let ClientMessage::Text(text) = response else {
             panic!("expected signed probe text result");
         };
-        let result: ProbeResult =
-            serde_json::from_str(&text).expect("decode signed probe result");
+        let result: ProbeResult = serde_json::from_str(&text).expect("decode signed probe result");
         assert_eq!(result.name, "signed-demo");
 
-        let reused_session = connect_websocket(
-            &http,
-            &relay,
-            "/v1/probe/signed-demo",
-            &auth.session_token,
-        )
-        .await;
+        let reused_session =
+            connect_websocket(&http, &relay, "/v1/probe/signed-demo", &auth.session_token).await;
         assert!(reused_session.is_err());
 
         agent_task.await.expect("agent test task");
