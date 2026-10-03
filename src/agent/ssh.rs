@@ -416,12 +416,12 @@ fn ed25519_only() -> Preferred {
 pub async fn serve(
     client: &Client,
     relay: &str,
-    token: &str,
+    tunnel_token: &str,
     session_id: &str,
     encoded_operator_key: &str,
 ) -> Result<(), RevttyError> {
     let path = format!("/v1/session/{session_id}");
-    let websocket = connect_websocket(client, relay, &path, token).await?;
+    let websocket = connect_websocket(client, relay, &path, tunnel_token).await?;
     let (stream, bridge_task) = websocket_byte_stream(websocket);
 
     let result = async {
