@@ -167,7 +167,7 @@ pub fn pin_agent_host_key(
         .to_openssh()
         .map_err(|error| RevttyError::runtime("encode enrolled agent host key", error))?;
     let line = format!("{alias} {public_text}");
-    let entry = KnownHostEntry::from_str(&line)
+    let _: KnownHostEntry = KnownHostEntry::from_str(&line)
         .map_err(|error| RevttyError::runtime("validate known_hosts entry", error))?;
 
     let mut file = OpenOptions::new()
@@ -176,7 +176,7 @@ pub fn pin_agent_host_key(
         .open(&path)
         .map_err(|error| RevttyError::runtime("open revtty known_hosts", error))?;
 
-    writeln!(file, "{entry}")
+    writeln!(file, "{line}")
         .map_err(|error| RevttyError::runtime("write revtty known_hosts", error))?;
     file.sync_all()
         .map_err(|error| RevttyError::runtime("sync revtty known_hosts", error))?;
