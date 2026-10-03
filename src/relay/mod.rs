@@ -1178,10 +1178,7 @@ mod tests {
             .send()
             .await
             .expect("request status operator challenge");
-        assert_eq!(
-            status_challenge_response.status(),
-            reqwest::StatusCode::OK
-        );
+        assert_eq!(status_challenge_response.status(), reqwest::StatusCode::OK);
 
         let status_challenge: OperatorChallengeResponse = status_challenge_response
             .json()
@@ -1207,10 +1204,7 @@ mod tests {
             .send()
             .await
             .expect("authenticate status operator");
-        assert_eq!(
-            status_auth_response.status(),
-            reqwest::StatusCode::CREATED
-        );
+        assert_eq!(status_auth_response.status(), reqwest::StatusCode::CREATED);
 
         let status_auth: OperatorAuthResponse = status_auth_response
             .json()
