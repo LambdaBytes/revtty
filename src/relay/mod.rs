@@ -912,12 +912,14 @@ fn public_key_fingerprint(encoded: &str) -> Result<String, RevttyError> {
     Ok(key.fingerprint(HashAlg::Sha256).to_string())
 }
 
-pub fn doctor() -> Result<(), RevttyError> {
-    println!("relay transport proof: available");
-    println!(
-        "control protocol v{}",
-        crate::protocol::CONTROL_PROTOCOL_VERSION
-    );
+pub async fn doctor(db: &FsPath) -> Result<(), RevttyError> {
+    let store = Store::open(db).await?;
+    let agents = store.list_agents().await?;
+
+    println!("relay      ready");
+    println!("protocol   v{}", crate::protocol::CONTROL_PROTOCOL_VERSION);
+    println!("database   {}", db.display());
+    println!("agents     {}", agents.len());
     Ok(())
 }
 

@@ -13,7 +13,7 @@ use crate::protocol::{
     OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, ProbeResult,
     operator_auth_message, operator_list_auth_message,
 };
-use crate::transport::{connect_websocket, http_url, valid_name};
+use crate::transport::{check_relay_health, connect_websocket, http_url, valid_name};
 
 pub fn init() -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
@@ -290,15 +290,19 @@ pub async fn connect(target: &str, relay: &str) -> Result<(), RevttyError> {
     Ok(())
 }
 
-pub fn doctor() -> Result<(), RevttyError> {
+pub async fn doctor(relay: &str) -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
-    println!("revtty {}", env!("CARGO_PKG_VERSION"));
-    println!(
-        "control protocol v{}",
-        crate::protocol::CONTROL_PROTOCOL_VERSION
-    );
-    println!("default transport: {}", crate::transport::DEFAULT_TRANSPORT);
-    println!("config: {}", paths.config_dir.display());
-    println!("state: {}", paths.state_dir.display());
+    let identity = crate::identity::ensure_operator(&paths)?;
+    let client = reqwest::Client::new();
+
+    check_relay_health(&client, relay).await?;
+
+    println!("revtty     {}", env!("CARGO_PKG_VERSION"));
+    println!("protocol   v{}", crate::protocol::CONTROL_PROTOCOL_VERSION);
+    println!("transport  {}", crate::transport::DEFAULT_TRANSPORT);
+    println!("identity   {}", identity.fingerprint);
+    println!("relay      {relay} reachable");
+    println!("config     {}", paths.config_dir.display());
+    println!("state      {}", paths.state_dir.display());
     Ok(())
 }
