@@ -117,6 +117,10 @@ pub async fn connect_terminal(
             .await
             .map_err(|error| RevttyError::runtime("request remote shell", error))?;
 
+        let mut resize =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                .map_err(|error| RevttyError::runtime("listen for terminal resize", error))?;
+
         let _raw_mode = RawModeGuard::enter()?;
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
@@ -142,6 +146,14 @@ pub async fn connect_terminal(
                             return Err(RevttyError::runtime("read local terminal input", error));
                         }
                     }
+                }
+                Some(()) = resize.recv() => {
+                    let (cols, rows) = size()
+                        .map_err(|error| RevttyError::runtime("read local terminal size", error))?;
+                    channel
+                        .window_change(u32::from(cols), u32::from(rows), 0, 0)
+                        .await
+                        .map_err(|error| RevttyError::runtime("resize remote PTY", error))?;
                 }
                 message = channel.wait() => {
                     match message {

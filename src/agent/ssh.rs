@@ -498,7 +498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interactive_shell_runs_inside_real_pty() {
+    async fn interactive_shell_runs_and_resizes_real_pty() {
         let server_key = ed25519_key();
         let expected_server_key = server_key.public_key().clone();
         let client_key = ed25519_key();
@@ -556,9 +556,13 @@ mod tests {
             .await
             .expect("request PTY");
         channel.request_shell(true).await.expect("request shell");
+        channel
+            .window_change(111, 37, 0, 0)
+            .await
+            .expect("resize remote PTY");
 
         let command = [
-            br"printf '\162\145\166\164\164\171\055\163\150\145\154\154\055\157\153\012'; exit"
+            br"stty size; printf '\162\145\166\164\164\171\055\163\150\145\154\154\055\157\153\012'; exit"
                 .as_slice(),
             b"\n".as_slice(),
         ]
@@ -584,10 +588,14 @@ mod tests {
         .await
         .expect("PTY shell timed out");
 
+        let output = String::from_utf8_lossy(&output);
         assert!(
-            String::from_utf8_lossy(&output).contains("revtty-shell-ok"),
-            "shell output did not contain validation marker: {}",
-            String::from_utf8_lossy(&output)
+            output.contains("37 111"),
+            "shell output did not reflect the resized PTY: {output}"
+        );
+        assert!(
+            output.contains("revtty-shell-ok"),
+            "shell output did not contain validation marker: {output}"
         );
 
         drop(session);
