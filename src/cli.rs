@@ -14,8 +14,12 @@ pub enum Command {
     /// Initialize local operator state.
     Init,
 
-    /// List enrolled machines.
-    List,
+    /// List enrolled machines authorized for this operator.
+    List {
+        /// Relay base URL.
+        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
+        relay: String,
+    },
 
     /// Show one machine's status.
     Status {
@@ -146,6 +150,12 @@ pub enum RelayCommand {
 mod tests {
     use super::Args;
     use clap::Parser;
+
+    #[test]
+    fn parses_list() {
+        let args = Args::try_parse_from(["revtty", "list"]);
+        assert!(args.is_ok());
+    }
 
     #[test]
     fn parses_probe_target() {

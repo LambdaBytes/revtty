@@ -7,6 +7,10 @@ pub fn operator_auth_message(agent_name: &str, challenge: &str) -> String {
     format!("revtty-control-v1\nagent={agent_name}\nchallenge={challenge}\n")
 }
 
+pub fn operator_list_auth_message(challenge: &str) -> String {
+    format!("revtty-control-v1\nscope=list\nchallenge={challenge}\n")
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
@@ -70,6 +74,18 @@ pub struct OperatorChallengeResponse {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorListRequest {
+    pub operator_key: String,
+    pub challenge: String,
+    pub signature: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentListResponse {
+    pub agents: Vec<AgentStatusResponse>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorAuthRequest {
     pub challenge: String,
     pub signature: String,
@@ -85,8 +101,9 @@ pub struct OperatorAuthResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentStatusResponse, ControlMessage, EnrollRequest, EnrollResponse, OperatorAuthRequest,
-        OperatorAuthResponse, OperatorChallengeResponse, ProbeResult, operator_auth_message,
+        AgentListResponse, AgentStatusResponse, ControlMessage, EnrollRequest, EnrollResponse,
+        OperatorAuthRequest, OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest,
+        ProbeResult, operator_auth_message, operator_list_auth_message,
     };
 
     #[test]
@@ -170,6 +187,39 @@ mod tests {
         assert_eq!(
             operator_auth_message("store-042", "rvc_random"),
             "revtty-control-v1\nagent=store-042\nchallenge=rvc_random\n"
+        );
+    }
+
+    #[test]
+    fn operator_list_messages_round_trip() {
+        let request = OperatorListRequest {
+            operator_key: "ssh-ed25519 AAAA operator".to_owned(),
+            challenge: "rvc_list".to_owned(),
+            signature: "-----BEGIN SSH SIGNATURE-----".to_owned(),
+        };
+        let json = serde_json::to_string(&request).expect("serialize operator list request");
+        let decoded: OperatorListRequest =
+            serde_json::from_str(&json).expect("deserialize operator list request");
+        assert!(decoded == request);
+
+        let response = AgentListResponse {
+            agents: vec![AgentStatusResponse {
+                id: "agent-id".to_owned(),
+                name: "store-042".to_owned(),
+                online: false,
+                created_at: 1_700_000_000,
+                last_seen: Some(1_700_000_030),
+                version: Some("0.1.0".to_owned()),
+            }],
+        };
+        let json = serde_json::to_string(&response).expect("serialize agent list");
+        let decoded: AgentListResponse =
+            serde_json::from_str(&json).expect("deserialize agent list");
+        assert!(decoded == response);
+
+        assert_eq!(
+            operator_list_auth_message("rvc_list"),
+            "revtty-control-v1\nscope=list\nchallenge=rvc_list\n"
         );
     }
 

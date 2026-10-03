@@ -17,9 +17,10 @@ use uuid::Uuid;
 
 use crate::error::RevttyError;
 use crate::protocol::{
-    AgentStatusResponse, CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse,
-    OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest, OperatorAuthResponse, OperatorChallengeResponse,
-    operator_auth_message,
+    AgentListResponse, AgentStatusResponse, CONTROL_PROTOCOL_VERSION, ControlMessage,
+    EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
+    OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, operator_auth_message,
+    operator_list_auth_message,
 };
 use crate::storage::Store;
 use crate::token::{SecretToken, hash_token};
@@ -96,8 +97,13 @@ impl SessionKind {
     }
 }
 
+enum OperatorChallengeScope {
+    Agent(String),
+    List,
+}
+
 struct OperatorChallenge {
-    agent_name: String,
+    scope: OperatorChallengeScope,
     expires_at: Instant,
 }
 
@@ -203,6 +209,11 @@ fn router(state: RelayState) -> Router {
         .route("/v0/probe/{name}", get(probe_upgrade))
         .route("/v0/session/{session_id}", get(session_upgrade))
         .route("/v1/enroll", post(enroll_agent))
+        .route(
+            "/v1/operator/list/challenge",
+            post(operator_list_challenge),
+        )
+        .route("/v1/operator/list", post(operator_list))
         .route("/v1/operator/challenge/{name}", post(operator_challenge))
         .route("/v1/operator/auth/{name}", post(operator_auth))
         .route("/v1/agent/{name}", get(persistent_agent_upgrade))
@@ -270,6 +281,17 @@ async fn operator_challenge(State(state): State<RelayState>, Path(name): Path<St
         }
     }
 
+    issue_operator_challenge(&state, OperatorChallengeScope::Agent(name)).await
+}
+
+async fn operator_list_challenge(State(state): State<RelayState>) -> Response {
+    issue_operator_challenge(&state, OperatorChallengeScope::List).await
+}
+
+async fn issue_operator_challenge(
+    state: &RelayState,
+    scope: OperatorChallengeScope,
+) -> Response {
     let challenge = match SecretToken::generate("rvc") {
         Ok(challenge) => challenge.expose().to_owned(),
         Err(error) => {
@@ -289,7 +311,7 @@ async fn operator_challenge(State(state): State<RelayState>, Path(name): Path<St
     challenges.insert(
         challenge.clone(),
         OperatorChallenge {
-            agent_name: name,
+            scope,
             expires_at: now + OPERATOR_CHALLENGE_TTL,
         },
     );
@@ -319,7 +341,12 @@ async fn operator_auth(
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    if challenge.agent_name != name || challenge.expires_at <= Instant::now() {
+    if challenge.expires_at <= Instant::now()
+        || !matches!(
+            challenge.scope,
+            OperatorChallengeScope::Agent(ref agent_name) if agent_name == &name
+        )
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -381,6 +408,83 @@ async fn operator_auth(
         }),
     )
         .into_response()
+}
+
+async fn operator_list(
+    State(state): State<RelayState>,
+    Json(request): Json<OperatorListRequest>,
+) -> Response {
+    let challenge = {
+        let mut challenges = state.operator_challenges.lock().await;
+        challenges.remove(&request.challenge)
+    };
+
+    let Some(challenge) = challenge else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    if challenge.expires_at <= Instant::now()
+        || !matches!(challenge.scope, OperatorChallengeScope::List)
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let operator_key = match PublicKey::from_openssh(&request.operator_key) {
+        Ok(key) if key.algorithm() == Algorithm::Ed25519 => key,
+        _ => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let signature = match SshSig::from_pem(request.signature.as_bytes()) {
+        Ok(signature) => signature,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let message = operator_list_auth_message(&request.challenge);
+
+    if operator_key
+        .verify(OPERATOR_AUTH_NAMESPACE, message.as_bytes(), &signature)
+        .is_err()
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let operator_fingerprint = operator_key.fingerprint(HashAlg::Sha256).to_string();
+    let agents = match state.store.list_agents().await {
+        Ok(agents) => agents,
+        Err(error) => {
+            eprintln!("operator list lookup failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let online = {
+        let connected = state.agents.lock().await;
+        connected.keys().cloned().collect::<std::collections::HashSet<_>>()
+    };
+
+    let mut visible = Vec::new();
+    for agent in agents {
+        let enrolled_key = match PublicKey::from_openssh(&agent.operator_key) {
+            Ok(key) => key,
+            Err(error) => {
+                eprintln!("stored operator key for {} is invalid: {error}", agent.name);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+
+        if enrolled_key.fingerprint(HashAlg::Sha256).to_string() != operator_fingerprint {
+            continue;
+        }
+
+        visible.push(AgentStatusResponse {
+            id: agent.id,
+            name: agent.name.clone(),
+            online: online.contains(&agent.name),
+            created_at: agent.created_at,
+            last_seen: agent.last_seen,
+            version: agent.version,
+        });
+    }
+
+    Json(AgentListResponse { agents: visible }).into_response()
 }
 
 async fn operator_status(
@@ -839,9 +943,10 @@ mod tests {
 
     use super::{RelayState, authorized, router};
     use crate::protocol::{
-        AgentStatusResponse, ControlMessage, EnrollRequest, EnrollResponse,
+        AgentListResponse, AgentStatusResponse, ControlMessage, EnrollRequest, EnrollResponse,
         OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest, OperatorAuthResponse,
-        OperatorChallengeResponse, ProbeResult, operator_auth_message,
+        OperatorChallengeResponse, OperatorListRequest, ProbeResult, operator_auth_message,
+        operator_list_auth_message,
     };
     use crate::storage::Store;
     use crate::transport::{connect_websocket, websocket_byte_stream};
@@ -978,6 +1083,104 @@ mod tests {
             .expect("send reused enrollment");
 
         assert_eq!(reuse.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn signed_operator_list_is_scoped_and_single_use() {
+        let store = Store::open_in_memory()
+            .await
+            .expect("open in-memory relay store");
+        let state = RelayState::new("secret".to_owned(), store.clone());
+        let app = router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test relay");
+        let address = listener.local_addr().expect("test relay address");
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test relay");
+        });
+
+        let operator_private = ed25519_key();
+        let operator_key = operator_private
+            .public_key()
+            .to_openssh()
+            .expect("operator key");
+        let other_operator_key = ed25519_key()
+            .public_key()
+            .to_openssh()
+            .expect("other operator key");
+
+        for (name, key) in [
+            ("visible-agent", operator_key.as_str()),
+            ("hidden-agent", other_operator_key.as_str()),
+        ] {
+            let enrollment = store
+                .create_enrollment(name, key, Duration::from_secs(60))
+                .await
+                .expect("create enrollment");
+            let host_key = ed25519_key().public_key().to_openssh().expect("host key");
+            store
+                .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+                .await
+                .expect("consume enrollment");
+        }
+
+        let http = reqwest::Client::new();
+        let challenge_response = http
+            .post(format!(
+                "http://{address}/v1/operator/list/challenge"
+            ))
+            .send()
+            .await
+            .expect("request operator list challenge");
+        assert_eq!(challenge_response.status(), reqwest::StatusCode::OK);
+
+        let challenge: OperatorChallengeResponse = challenge_response
+            .json()
+            .await
+            .expect("decode operator list challenge");
+        let message = operator_list_auth_message(&challenge.challenge);
+        let signature = operator_private
+            .sign(
+                OPERATOR_AUTH_NAMESPACE,
+                RusshHashAlg::Sha256,
+                message.as_bytes(),
+            )
+            .expect("sign operator list challenge")
+            .to_pem(ssh_key::LineEnding::LF)
+            .expect("encode operator list signature");
+
+        let request = OperatorListRequest {
+            operator_key,
+            challenge: challenge.challenge,
+            signature,
+        };
+
+        let list_response = http
+            .post(format!("http://{address}/v1/operator/list"))
+            .json(&request)
+            .send()
+            .await
+            .expect("request authenticated agent list");
+        assert_eq!(list_response.status(), reqwest::StatusCode::OK);
+
+        let list: AgentListResponse = list_response.json().await.expect("decode agent list");
+        assert_eq!(list.agents.len(), 1);
+        assert_eq!(list.agents[0].name, "visible-agent");
+        assert!(!list.agents[0].online);
+
+        let replay = http
+            .post(format!("http://{address}/v1/operator/list"))
+            .json(&request)
+            .send()
+            .await
+            .expect("replay operator list request");
+        assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED);
 
         server.abort();
         let _ = server.await;
