@@ -464,12 +464,7 @@ async fn operator_list(
         let connected = state.agents.lock().await;
         connected
             .iter()
-            .map(|(name, agent)| {
-                (
-                    name.clone(),
-                    (agent.active_sessions, agent.max_sessions),
-                )
-            })
+            .map(|(name, agent)| (name.clone(), (agent.active_sessions, agent.max_sessions)))
             .collect::<HashMap<_, _>>()
     };
 
@@ -1047,7 +1042,10 @@ async fn handle_legacy_operator_session(
 
     match tokio::time::timeout(SESSION_WAIT, session_rx).await {
         Ok(Ok(agent_socket)) => {
-            eprintln!("legacy {} paired for {agent_name}: {session_id}", kind.label());
+            eprintln!(
+                "legacy {} paired for {agent_name}: {session_id}",
+                kind.label()
+            );
             bridge_websockets(operator_socket, agent_socket).await;
         }
         _ => {
@@ -1083,10 +1081,7 @@ async fn attach_agent_session(socket: WebSocket, state: RelayState, session_id: 
     }
 }
 
-async fn attach_reserved_agent_session(
-    socket: WebSocket,
-    sender: oneshot::Sender<WebSocket>,
-) {
+async fn attach_reserved_agent_session(socket: WebSocket, sender: oneshot::Sender<WebSocket>) {
     let _ = sender.send(socket);
 }
 
@@ -1152,7 +1147,6 @@ mod tests {
 
     use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
     use futures_util::{SinkExt, StreamExt};
-    use tokio::sync::oneshot;
     use reqwest_websocket::Message as ClientMessage;
     use russh::Preferred;
     use russh::client;
@@ -1161,6 +1155,7 @@ mod tests {
         Algorithm, HashAlg as RusshHashAlg, PrivateKey, PublicKey, PublicKeyOrCertificate,
     };
     use russh::server;
+    use tokio::sync::oneshot;
 
     use super::{
         AgentDecision, PendingSession, RelayState, authorized, record_agent_decision, router,
