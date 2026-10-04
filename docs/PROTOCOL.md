@@ -114,6 +114,20 @@ The operator and agent rendezvous credentials are therefore distinct.
 
 `revtty list` uses a separate one-time SSHSIG inventory challenge. The client signs the canonical `scope=list` message and sends its Ed25519 public key with the signature. The relay verifies possession of that key and returns only enrolled agents whose authorized operator key has the same SHA-256 SSH fingerprint. The inventory challenge is removed when used, including failed/replayed attempts.
 
+## Operator-visible rendezvous failures
+
+Before SSH starts, the relay may send one control text frame on the operator data WebSocket using the reserved `revtty-error:` prefix. The byte-stream adapter converts that frame into a local error instead of feeding it into SSH.
+
+Current errors cover:
+
+- agent concurrency limit reached;
+- incompatible offer version;
+- agent-side startup failure;
+- agent acceptance timeout;
+- accepted session whose data tunnel never arrives.
+
+Once SSH traffic begins, session payload remains binary and opaque to the relay.
+
 ## Data plane
 
 After the operator and agent WebSockets are paired, the relay forwards frames without interpreting the SSH payload.
@@ -157,7 +171,6 @@ SSH performs agent host authentication and operator public-key authentication in
 
 The approved v1 scope still requires the following protocol hardening:
 
-- stronger operator-visible rejection/error propagation;
 - persistence/audit metadata for completed sessions;
 - a documented compatibility policy for stable releases.
 
