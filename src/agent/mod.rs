@@ -179,6 +179,7 @@ pub async fn run() -> Result<(), RevttyError> {
             &config.name,
             &config.control_token,
             &config.operator_key,
+            config.max_sessions,
             &mut backoff,
             &session_slots,
             &session_tasks,
@@ -215,6 +216,7 @@ async fn run_control_once(
     name: &str,
     token: &str,
     operator_key: &str,
+    max_sessions: usize,
     backoff: &mut ReconnectBackoff,
     session_slots: &Arc<Semaphore>,
     session_tasks: &SessionTasks,
@@ -229,6 +231,8 @@ async fn run_control_once(
             version: CONTROL_PROTOCOL_VERSION,
             name: name.to_owned(),
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+            active_sessions: max_sessions.saturating_sub(session_slots.available_permits()),
+            max_sessions,
         },
     )
     .await?;
@@ -251,6 +255,8 @@ async fn run_control_once(
                     &mut sender,
                     ControlMessage::Heartbeat {
                         version: CONTROL_PROTOCOL_VERSION,
+                        active_sessions: max_sessions
+                            .saturating_sub(session_slots.available_permits()),
                     },
                 )
                 .await?;
