@@ -300,6 +300,23 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_accepts_legacy_payload_without_capacity() {
+        let json = r#"{
+            "id":"agent-id",
+            "name":"store-042",
+            "online":true,
+            "created_at":1700000000,
+            "last_seen":1700000030,
+            "version":"0.1.0"
+        }"#;
+
+        let status: AgentStatusResponse =
+            serde_json::from_str(json).expect("deserialize legacy agent status");
+        assert_eq!(status.active_sessions, 0);
+        assert_eq!(status.max_sessions, None);
+    }
+
+    #[test]
     fn probe_result_round_trips() {
         let result = ProbeResult {
             name: "store-042".to_owned(),
