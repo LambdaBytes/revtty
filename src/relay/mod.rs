@@ -61,6 +61,8 @@ impl RelayState {
 struct AgentHandle {
     connection_id: Uuid,
     control: mpsc::Sender<ControlMessage>,
+    active_sessions: usize,
+    max_sessions: usize,
 }
 
 struct PendingSession {
@@ -458,12 +460,17 @@ async fn operator_list(
         }
     };
 
-    let online = {
+    let runtime = {
         let connected = state.agents.lock().await;
         connected
-            .keys()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>()
+            .iter()
+            .map(|(name, agent)| {
+                (
+                    name.clone(),
+                    (agent.active_sessions, agent.max_sessions),
+                )
+            })
+            .collect::<HashMap<_, _>>()
     };
 
     let mut visible = Vec::new();
@@ -480,10 +487,14 @@ async fn operator_list(
             continue;
         }
 
+        let live = runtime.get(&agent.name).copied();
+
         visible.push(AgentStatusResponse {
             id: agent.id,
             name: agent.name.clone(),
-            online: online.contains(&agent.name),
+            online: live.is_some(),
+            active_sessions: live.map_or(0, |value| value.0),
+            max_sessions: live.and_then(|value| (value.1 > 0).then_some(value.1)),
             created_at: agent.created_at,
             last_seen: agent.last_seen,
             version: agent.version,
@@ -515,15 +526,19 @@ async fn operator_status(
         }
     };
 
-    let online = {
+    let runtime = {
         let agents = state.agents.lock().await;
-        agents.contains_key(&name)
+        agents
+            .get(&name)
+            .map(|agent| (agent.active_sessions, agent.max_sessions))
     };
 
     Json(AgentStatusResponse {
         id: agent.id,
         name: agent.name,
-        online,
+        online: runtime.is_some(),
+        active_sessions: runtime.map_or(0, |value| value.0),
+        max_sessions: runtime.and_then(|value| (value.1 > 0).then_some(value.1)),
         created_at: agent.created_at,
         last_seen: agent.last_seen,
         version: agent.version,
@@ -742,6 +757,8 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
             AgentHandle {
                 connection_id,
                 control: control_tx,
+                active_sessions: 0,
+                max_sessions: 0,
             },
         );
     }
@@ -774,16 +791,40 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
                                     version,
                                     name: hello_name,
                                     agent_version,
+                                    active_sessions,
+                                    max_sessions,
                                 } if version == CONTROL_PROTOCOL_VERSION && hello_name == name => {
+                                    {
+                                        let mut agents = state.agents.lock().await;
+                                        if let Some(agent) = agents
+                                            .get_mut(&name)
+                                            .filter(|agent| agent.connection_id == connection_id)
+                                        {
+                                            agent.active_sessions = active_sessions;
+                                            agent.max_sessions = max_sessions;
+                                        }
+                                    }
+
                                     if let Err(error) =
                                         state.store.mark_seen(&name, Some(&agent_version)).await
                                     {
                                         eprintln!("failed to persist agent hello: {error}");
                                     }
                                 }
-                                ControlMessage::Heartbeat { version }
-                                    if version == CONTROL_PROTOCOL_VERSION =>
-                                {
+                                ControlMessage::Heartbeat {
+                                    version,
+                                    active_sessions,
+                                } if version == CONTROL_PROTOCOL_VERSION => {
+                                    {
+                                        let mut agents = state.agents.lock().await;
+                                        if let Some(agent) = agents
+                                            .get_mut(&name)
+                                            .filter(|agent| agent.connection_id == connection_id)
+                                        {
+                                            agent.active_sessions = active_sessions;
+                                        }
+                                    }
+
                                     if let Err(error) = state.store.mark_seen(&name, None).await {
                                         eprintln!("failed to persist agent heartbeat: {error}");
                                     }
