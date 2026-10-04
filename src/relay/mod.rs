@@ -878,9 +878,9 @@ async fn record_agent_decision(
 ) {
     let sender = {
         let mut pending = state.pending.lock().await;
-        if !pending
+        if pending
             .get(session_id)
-            .is_some_and(|session| session.agent_name.as_str() == agent_name)
+            .is_none_or(|session| session.agent_name.as_str() != agent_name)
         {
             return;
         }
@@ -1074,10 +1074,10 @@ async fn attach_agent_session(socket: WebSocket, state: RelayState, session_id: 
         pending.remove(&session_id)
     };
 
-    if let Some(mut pending) = pending {
-        if let Some(sender) = pending.sender.take() {
-            let _ = sender.send(socket);
-        }
+    if let Some(mut pending) = pending
+        && let Some(sender) = pending.sender.take()
+    {
+        let _ = sender.send(socket);
     }
 }
 
@@ -1161,10 +1161,10 @@ mod tests {
         AgentDecision, PendingSession, RelayState, authorized, record_agent_decision, router,
     };
     use crate::protocol::{
-        AgentListResponse, AgentStatusResponse, ControlMessage, EnrollRequest, EnrollResponse,
-        OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest, OperatorAuthResponse,
-        OperatorChallengeResponse, OperatorListRequest, ProbeResult, SessionRejectReason,
-        operator_auth_message, operator_list_auth_message,
+        AgentListResponse, AgentStatusResponse, CONTROL_PROTOCOL_VERSION, ControlMessage,
+        EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
+        OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, ProbeResult,
+        SessionRejectReason, operator_auth_message, operator_list_auth_message,
     };
     use crate::storage::Store;
     use crate::transport::{connect_websocket, websocket_byte_stream};
