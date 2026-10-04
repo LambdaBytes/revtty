@@ -23,6 +23,10 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - Interactive SSH-backed PTY shell with bounded I/O queues and cleanup.
 - Live terminal resize propagation to the remote PTY.
 - Separate one-time agent data-tunnel credentials; the long-lived agent control credential is rejected on the data path.
+- Explicit session accept/reject/cancel lifecycle with separate acceptance and data-tunnel deadlines.
+- Configurable per-agent concurrent session limit (default 4, maximum 64), including backward-compatible agent config loading.
+- Explicit rejection of incompatible session-offer protocol versions instead of silently ignoring them.
+- Live active-session/capacity reporting in operator `list` and `status`.
 - Stronger operator, agent and relay doctor checks for relay reachability, persisted agent configuration and relay SQLite state.
 - Linux systemd agent template with an explicit OS account, restart-on-failure, graceful SIGINT shutdown, journald logging and restrictive runtime umask.
 - Absolute `REVTTY_CONFIG_DIR` and `REVTTY_STATE_DIR` overrides for service/container deployments.
