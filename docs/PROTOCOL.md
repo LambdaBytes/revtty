@@ -63,6 +63,38 @@ The `tunnel_token` is generated independently for each rendezvous, delivered onl
 
 The long-lived agent control credential is not accepted by the persistent `/v1/session/{session_id}` data endpoint.
 
+### session_accept
+
+The agent confirms that it has reserved local capacity for the offered session. The relay waits for this explicit acceptance before considering the v1 rendezvous accepted.
+
+Fields:
+
+- `version`
+- `session_id`
+
+### session_reject
+
+The agent rejects an offer before opening the data tunnel.
+
+Fields:
+
+- `version`
+- `session_id`
+- `reason`: `busy`, `incompatible_version`, or `internal_error`
+
+A full per-agent session pool produces `busy`. An unsupported offer version produces `incompatible_version` rather than being silently ignored.
+
+### session_cancel
+
+The relay tells the agent to abort an accepted session when the acceptance/data-tunnel deadline expires.
+
+Fields:
+
+- `version`
+- `session_id`
+
+The agent tracks spawned session tasks by ID and aborts the matching task on cancellation.
+
 ## Operator authentication and rendezvous credentials
 
 Operator control authentication currently uses HTTP JSON endpoints around an OpenSSH SSHSIG challenge rather than a control-channel message.
@@ -112,6 +144,9 @@ SSH performs agent host authentication and operator public-key authentication in
 - Operator session credentials are target-scoped, short lived and single use.
 - Operator inventory challenges are short lived, single use and return only agents authorized for the proven key.
 - Agent data-tunnel credentials are per-rendezvous and single use.
+- A v1 rendezvous requires explicit agent acceptance before pairing.
+- Concurrent probe/shell sessions are bounded by persisted per-agent configuration.
+- Agent acceptance and data-tunnel waits have separate deadlines; timeout triggers `session_cancel`.
 - A persistent agent control credential cannot open a `/v1/session` data tunnel.
 - A pending agent side is paired at most once.
 - Operator and agent rendezvous credentials are distinct.
@@ -120,13 +155,10 @@ SSH performs agent host authentication and operator public-key authentication in
 
 ## Required before the stable v1 protocol
 
-The approved v1 scope still requires explicit lifecycle semantics that are not implemented in the current subset:
+The approved v1 scope still requires the following protocol hardening:
 
-- `session_accept`;
-- `session_reject`;
-- `session_cancel`;
-- explicit incompatible-version failure instead of silently ignoring an unmatched offer version;
-- active-session reporting/concurrency enforcement;
+- stronger operator-visible rejection/error propagation;
+- persistence/audit metadata for completed sessions;
 - a documented compatibility policy for stable releases.
 
 These should extend the existing contract rather than create a second terminal protocol.
