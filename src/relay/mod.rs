@@ -19,14 +19,15 @@ use crate::error::RevttyError;
 use crate::protocol::{
     AgentListResponse, AgentStatusResponse, CONTROL_PROTOCOL_VERSION, ControlMessage,
     EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
-    OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, operator_auth_message,
-    operator_list_auth_message,
+    OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, SessionRejectReason,
+    operator_auth_message, operator_list_auth_message,
 };
 use crate::storage::Store;
 use crate::token::{SecretToken, hash_token};
 use crate::transport::valid_name;
 
 const CONTROL_QUEUE_DEPTH: usize = 16;
+const AGENT_ACCEPT_WAIT: Duration = Duration::from_secs(5);
 const SESSION_WAIT: Duration = Duration::from_secs(10);
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const OPERATOR_CHALLENGE_TTL: Duration = Duration::from_secs(30);
@@ -63,8 +64,16 @@ struct AgentHandle {
 }
 
 struct PendingSession {
+    agent_name: String,
     agent_token_hash: [u8; 32],
-    sender: oneshot::Sender<WebSocket>,
+    sender: Option<oneshot::Sender<WebSocket>>,
+    decision_sender: Option<oneshot::Sender<AgentDecision>>,
+}
+
+#[derive(Clone, Copy)]
+enum AgentDecision {
+    Accepted,
+    Rejected(SessionRejectReason),
 }
 
 #[derive(Clone, Copy)]
@@ -634,29 +643,26 @@ async fn persistent_session_upgrade(
     };
     let token_hash = hash_token(token);
 
-    let pending = {
+    let sender = {
         let mut pending = state.pending.lock().await;
-        let Some(expected_token_hash) = pending
-            .get(&session_id)
-            .map(|session| session.agent_token_hash)
-        else {
+        let Some(session) = pending.get_mut(&session_id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
 
-        if expected_token_hash != token_hash {
+        if session.agent_token_hash != token_hash {
             return StatusCode::UNAUTHORIZED.into_response();
         }
 
-        pending.remove(&session_id)
-    };
+        let Some(sender) = session.sender.take() else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
 
-    let Some(pending) = pending else {
-        return StatusCode::NOT_FOUND.into_response();
+        sender
     };
 
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| attach_reserved_agent_session(socket, pending))
+        .on_upgrade(move |socket| attach_reserved_agent_session(socket, sender))
         .into_response()
 }
 
@@ -704,7 +710,7 @@ async fn probe_upgrade(
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| {
-            handle_operator_session(socket, state, name, control, SessionKind::Probe)
+            handle_legacy_operator_session(socket, state, name, control, SessionKind::Probe)
         })
         .into_response()
 }
@@ -782,6 +788,31 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
                                         eprintln!("failed to persist agent heartbeat: {error}");
                                     }
                                 }
+                                ControlMessage::SessionAccept {
+                                    version,
+                                    session_id,
+                                } if version == CONTROL_PROTOCOL_VERSION => {
+                                    record_agent_decision(
+                                        &state,
+                                        &name,
+                                        &session_id,
+                                        AgentDecision::Accepted,
+                                    )
+                                    .await;
+                                }
+                                ControlMessage::SessionReject {
+                                    version,
+                                    session_id,
+                                    reason,
+                                } if version == CONTROL_PROTOCOL_VERSION => {
+                                    record_agent_decision(
+                                        &state,
+                                        &name,
+                                        &session_id,
+                                        AgentDecision::Rejected(reason),
+                                    )
+                                    .await;
+                                }
                                 _ => {}
                             }
                         }
@@ -803,7 +834,120 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
     }
 }
 
+async fn record_agent_decision(
+    state: &RelayState,
+    agent_name: &str,
+    session_id: &str,
+    decision: AgentDecision,
+) {
+    let sender = {
+        let mut pending = state.pending.lock().await;
+        if !pending
+            .get(session_id)
+            .is_some_and(|session| session.agent_name.as_str() == agent_name)
+        {
+            return;
+        }
+
+        if matches!(decision, AgentDecision::Rejected(_)) {
+            pending
+                .remove(session_id)
+                .and_then(|mut session| session.decision_sender.take())
+        } else {
+            pending
+                .get_mut(session_id)
+                .and_then(|session| session.decision_sender.take())
+        }
+    };
+
+    if let Some(sender) = sender {
+        let _ = sender.send(decision);
+    }
+}
+
 async fn handle_operator_session(
+    operator_socket: WebSocket,
+    state: RelayState,
+    agent_name: String,
+    control: mpsc::Sender<ControlMessage>,
+    kind: SessionKind,
+) {
+    let session_id = Uuid::new_v4().simple().to_string();
+    let agent_token = match SecretToken::generate("rvs") {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("session token generation failed: {error}");
+            return;
+        }
+    };
+    let (session_tx, session_rx) = oneshot::channel();
+    let (decision_tx, decision_rx) = oneshot::channel();
+
+    {
+        let mut pending = state.pending.lock().await;
+        pending.insert(
+            session_id.clone(),
+            PendingSession {
+                agent_name: agent_name.clone(),
+                agent_token_hash: agent_token.hash(),
+                sender: Some(session_tx),
+                decision_sender: Some(decision_tx),
+            },
+        );
+    }
+
+    if control
+        .send(kind.offer(session_id.clone(), agent_token.expose().to_owned()))
+        .await
+        .is_err()
+    {
+        state.pending.lock().await.remove(&session_id);
+        return;
+    }
+
+    eprintln!("{} requested for {agent_name}: {session_id}", kind.label());
+
+    match tokio::time::timeout(AGENT_ACCEPT_WAIT, decision_rx).await {
+        Ok(Ok(AgentDecision::Accepted)) => {
+            eprintln!("{} accepted by {agent_name}: {session_id}", kind.label());
+        }
+        Ok(Ok(AgentDecision::Rejected(reason))) => {
+            state.pending.lock().await.remove(&session_id);
+            eprintln!(
+                "{} rejected by {agent_name}: {session_id} ({reason:?})",
+                kind.label()
+            );
+            return;
+        }
+        _ => {
+            state.pending.lock().await.remove(&session_id);
+            send_session_cancel(&control, &session_id).await;
+            eprintln!(
+                "{} acceptance timed out for {agent_name}: {session_id}",
+                kind.label()
+            );
+            return;
+        }
+    }
+
+    match tokio::time::timeout(SESSION_WAIT, session_rx).await {
+        Ok(Ok(agent_socket)) => {
+            state.pending.lock().await.remove(&session_id);
+            eprintln!("{} paired for {agent_name}: {session_id}", kind.label());
+            bridge_websockets(operator_socket, agent_socket).await;
+        }
+        _ => {
+            state.pending.lock().await.remove(&session_id);
+            send_session_cancel(&control, &session_id).await;
+            eprintln!(
+                "{} data tunnel timed out for {agent_name}: {session_id}",
+                kind.label()
+            );
+        }
+    }
+}
+
+async fn handle_legacy_operator_session(
     operator_socket: WebSocket,
     state: RelayState,
     agent_name: String,
@@ -825,8 +969,10 @@ async fn handle_operator_session(
         pending.insert(
             session_id.clone(),
             PendingSession {
+                agent_name: agent_name.clone(),
                 agent_token_hash: agent_token.hash(),
-                sender: session_tx,
+                sender: Some(session_tx),
+                decision_sender: None,
             },
         );
     }
@@ -840,18 +986,24 @@ async fn handle_operator_session(
         return;
     }
 
-    eprintln!("{} requested for {agent_name}: {session_id}", kind.label());
-
     match tokio::time::timeout(SESSION_WAIT, session_rx).await {
         Ok(Ok(agent_socket)) => {
-            eprintln!("{} paired for {agent_name}: {session_id}", kind.label());
+            eprintln!("legacy {} paired for {agent_name}: {session_id}", kind.label());
             bridge_websockets(operator_socket, agent_socket).await;
         }
         _ => {
             state.pending.lock().await.remove(&session_id);
-            eprintln!("{} timed out for {agent_name}: {session_id}", kind.label());
         }
     }
+}
+
+async fn send_session_cancel(control: &mpsc::Sender<ControlMessage>, session_id: &str) {
+    let _ = control
+        .send(ControlMessage::SessionCancel {
+            version: CONTROL_PROTOCOL_VERSION,
+            session_id: session_id.to_owned(),
+        })
+        .await;
 }
 
 async fn attach_agent_session(socket: WebSocket, state: RelayState, session_id: String) {
@@ -860,13 +1012,18 @@ async fn attach_agent_session(socket: WebSocket, state: RelayState, session_id: 
         pending.remove(&session_id)
     };
 
-    if let Some(pending) = pending {
-        let _ = pending.sender.send(socket);
+    if let Some(mut pending) = pending {
+        if let Some(sender) = pending.sender.take() {
+            let _ = sender.send(socket);
+        }
     }
 }
 
-async fn attach_reserved_agent_session(socket: WebSocket, pending: PendingSession) {
-    let _ = pending.sender.send(socket);
+async fn attach_reserved_agent_session(
+    socket: WebSocket,
+    sender: oneshot::Sender<WebSocket>,
+) {
+    let _ = sender.send(socket);
 }
 
 async fn bridge_websockets(left: WebSocket, right: WebSocket) {
@@ -931,6 +1088,7 @@ mod tests {
 
     use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
     use futures_util::{SinkExt, StreamExt};
+    use tokio::sync::oneshot;
     use reqwest_websocket::Message as ClientMessage;
     use russh::Preferred;
     use russh::client;
@@ -940,12 +1098,14 @@ mod tests {
     };
     use russh::server;
 
-    use super::{RelayState, authorized, router};
+    use super::{
+        AgentDecision, PendingSession, RelayState, authorized, record_agent_decision, router,
+    };
     use crate::protocol::{
         AgentListResponse, AgentStatusResponse, ControlMessage, EnrollRequest, EnrollResponse,
         OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest, OperatorAuthResponse,
-        OperatorChallengeResponse, OperatorListRequest, ProbeResult, operator_auth_message,
-        operator_list_auth_message,
+        OperatorChallengeResponse, OperatorListRequest, ProbeResult, SessionRejectReason,
+        operator_auth_message, operator_list_auth_message,
     };
     use crate::storage::Store;
     use crate::transport::{connect_websocket, websocket_byte_stream};
@@ -999,6 +1159,41 @@ mod tests {
             key: Cow::Owned(vec![Algorithm::Ed25519]),
             ..Preferred::default()
         }
+    }
+
+    #[tokio::test]
+    async fn agent_decisions_are_scoped_and_rejection_cleans_pending() {
+        let store = Store::open_in_memory().await.expect("open store");
+        let state = RelayState::new("secret".to_owned(), store);
+        let (socket_tx, _socket_rx) = oneshot::channel();
+        let (decision_tx, mut decision_rx) = oneshot::channel();
+
+        state.pending.lock().await.insert(
+            "session".to_owned(),
+            PendingSession {
+                agent_name: "demo".to_owned(),
+                agent_token_hash: [7; 32],
+                sender: Some(socket_tx),
+                decision_sender: Some(decision_tx),
+            },
+        );
+
+        record_agent_decision(&state, "other-agent", "session", AgentDecision::Accepted).await;
+        assert!(decision_rx.try_recv().is_err());
+
+        record_agent_decision(
+            &state,
+            "demo",
+            "session",
+            AgentDecision::Rejected(SessionRejectReason::Busy),
+        )
+        .await;
+
+        assert!(matches!(
+            decision_rx.await.expect("receive decision"),
+            AgentDecision::Rejected(SessionRejectReason::Busy)
+        ));
+        assert!(!state.pending.lock().await.contains_key("session"));
     }
 
     #[test]
@@ -1238,7 +1433,7 @@ mod tests {
         .await
         .expect("agent becomes visible");
 
-        let (_agent_sender, mut agent_receiver) = agent.split();
+        let (mut agent_sender, mut agent_receiver) = agent.split();
         let agent_http = http.clone();
         let agent_relay = relay.clone();
         let control_token = credential.control_token.expose().to_owned();
@@ -1255,6 +1450,17 @@ mod tests {
                         ..
                     } = control
                     {
+                        agent_sender
+                            .send(ClientMessage::Text(
+                                serde_json::to_string(&ControlMessage::SessionAccept {
+                                    version: CONTROL_PROTOCOL_VERSION,
+                                    session_id: session_id.clone(),
+                                })
+                                .expect("encode session accept"),
+                            ))
+                            .await
+                            .expect("send session accept");
+
                         let path = format!("/v1/session/{session_id}");
                         let rejected =
                             connect_websocket(&agent_http, &agent_relay, &path, &control_token)
@@ -1495,7 +1701,7 @@ mod tests {
         .await
         .expect("agent becomes visible");
 
-        let (_agent_sender, mut agent_receiver) = agent.split();
+        let (mut agent_sender, mut agent_receiver) = agent.split();
         let agent_http = http.clone();
         let agent_relay = relay.clone();
 
@@ -1511,6 +1717,17 @@ mod tests {
                         ..
                     } = control
                     {
+                        agent_sender
+                            .send(ClientMessage::Text(
+                                serde_json::to_string(&ControlMessage::SessionAccept {
+                                    version: CONTROL_PROTOCOL_VERSION,
+                                    session_id: session_id.clone(),
+                                })
+                                .expect("encode session accept"),
+                            ))
+                            .await
+                            .expect("send session accept");
+
                         let path = format!("/v1/session/{session_id}");
                         let websocket =
                             connect_websocket(&agent_http, &agent_relay, &path, &tunnel_token)
