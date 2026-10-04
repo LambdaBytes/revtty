@@ -82,6 +82,10 @@ pub enum AgentCommand {
         /// Single-use enrollment token.
         #[arg(long)]
         token: String,
+
+        /// Maximum concurrent probe/shell sessions accepted by this agent.
+        #[arg(long, default_value_t = 4)]
+        max_sessions: usize,
     },
 
     /// Run the enrolled long-lived agent using its persisted configuration.
