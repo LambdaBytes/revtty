@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::task::JoinHandle;
 
 use crate::error::RevttyError;
+use crate::protocol::SESSION_ERROR_PREFIX;
 
 pub const DEFAULT_TRANSPORT: &str = "wss";
 
@@ -39,7 +40,11 @@ pub fn websocket_byte_stream(
                         }
                         Some(Ok(Message::Pong(_))) => {}
                         Some(Ok(Message::Close { .. })) | None => break,
-                        Some(Ok(Message::Text(_))) => {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Some(detail) = session_error_detail(&text) {
+                                return Err(RevttyError::message(detail.to_owned()));
+                            }
+
                             return Err(RevttyError::message(
                                 "unexpected text frame on binary session transport",
                             ));
@@ -69,6 +74,11 @@ pub fn websocket_byte_stream(
     });
 
     (application, task)
+}
+
+fn session_error_detail(text: &str) -> Option<&str> {
+    text.strip_prefix(SESSION_ERROR_PREFIX)
+        .filter(|detail| !detail.is_empty())
 }
 
 pub async fn check_relay_health(client: &Client, relay: &str) -> Result<(), RevttyError> {
@@ -163,7 +173,17 @@ pub fn valid_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{http_url, valid_name, websocket_url};
+    use super::{http_url, session_error_detail, valid_name, websocket_url};
+
+    #[test]
+    fn parses_session_error_marker() {
+        assert_eq!(
+            session_error_detail("revtty-error:agent is busy"),
+            Some("agent is busy")
+        );
+        assert_eq!(session_error_detail("plain text"), None);
+        assert_eq!(session_error_detail("revtty-error:"), None);
+    }
 
     #[test]
     fn converts_wss_to_https() {
