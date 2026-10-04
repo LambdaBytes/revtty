@@ -1,7 +1,9 @@
 mod config;
 mod ssh;
 
+use std::collections::HashMap;
 use std::io::Read;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -9,20 +11,25 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::Message;
 use ssh_key::{Algorithm, PublicKey};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 
-use self::config::AgentConfig;
+use self::config::{AgentConfig, validate_max_sessions};
 use crate::config::Paths;
 use crate::identity::ensure_agent;
 
 use crate::error::RevttyError;
 use crate::protocol::{
     CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse, ProbeResult,
+    SessionRejectReason,
 };
 use crate::transport::{check_relay_health, connect_websocket, http_url, valid_name};
 
 const RECONNECT_BASE_MILLIS: u64 = 1_000;
 const RECONNECT_CAP_MILLIS: u64 = 30_000;
 const RECONNECT_JITTER_PERCENT: u64 = 20;
+
+type SessionTasks = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
 
 #[derive(Debug, Default)]
 struct ReconnectBackoff {
@@ -73,7 +80,12 @@ fn jitter_sample(failures: u32) -> u64 {
     value
 }
 
-pub async fn enroll(relay: &str, token: &str) -> Result<(), RevttyError> {
+pub async fn enroll(
+    relay: &str,
+    token: &str,
+    max_sessions: usize,
+) -> Result<(), RevttyError> {
+    validate_max_sessions(max_sessions)?;
     let paths = Paths::discover()?;
     let identity = ensure_agent(&paths)?;
     let url = http_url(relay, "/v1/enroll")?;
@@ -126,6 +138,7 @@ pub async fn enroll(relay: &str, token: &str) -> Result<(), RevttyError> {
         name: enrolled.name.clone(),
         control_token: enrolled.control_token,
         operator_key: enrolled.operator_key,
+        max_sessions,
     }
     .save(&paths)?;
 
@@ -139,6 +152,7 @@ pub async fn enroll(relay: &str, token: &str) -> Result<(), RevttyError> {
             "existing"
         }
     );
+    println!("sessions   {max_sessions}");
     println!("config     {}", AgentConfig::path(&paths).display());
     Ok(())
 }
@@ -155,6 +169,8 @@ pub async fn run() -> Result<(), RevttyError> {
 
     let client = reqwest::Client::new();
     let mut backoff = ReconnectBackoff::default();
+    let session_slots = Arc::new(Semaphore::new(config.max_sessions));
+    let session_tasks: SessionTasks = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         let control = run_control_once(
@@ -164,6 +180,8 @@ pub async fn run() -> Result<(), RevttyError> {
             &config.control_token,
             &config.operator_key,
             &mut backoff,
+            &session_slots,
+            &session_tasks,
         );
 
         tokio::select! {
@@ -198,6 +216,8 @@ async fn run_control_once(
     token: &str,
     operator_key: &str,
     backoff: &mut ReconnectBackoff,
+    session_slots: &Arc<Semaphore>,
+    session_tasks: &SessionTasks,
 ) -> Result<(), RevttyError> {
     let path = format!("/v1/agent/{name}");
     let websocket = connect_websocket(client, relay, &path, token).await?;
@@ -222,6 +242,11 @@ async fn run_control_once(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
+                session_tasks
+                    .lock()
+                    .await
+                    .retain(|_, task| !task.is_finished());
+
                 send_control(
                     &mut sender,
                     ControlMessage::Heartbeat {
@@ -241,47 +266,86 @@ async fn run_control_once(
                                 version,
                                 session_id,
                                 tunnel_token,
-                            } if version == CONTROL_PROTOCOL_VERSION => {
+                            } => {
+                                if version != CONTROL_PROTOCOL_VERSION {
+                                    reject_incompatible_offer(&mut sender, session_id).await?;
+                                    continue;
+                                }
+
+                                let Some(permit) =
+                                    reserve_session(&mut sender, session_slots, &session_id).await?
+                                else {
+                                    continue;
+                                };
+
                                 let client = client.clone();
                                 let relay = relay.to_owned();
                                 let name = name.to_owned();
+                                let task_session_id = session_id.clone();
 
-                                tokio::spawn(async move {
+                                let task = tokio::spawn(async move {
+                                    let _permit = permit;
                                     if let Err(error) = send_probe(
                                         &client,
                                         &relay,
                                         &tunnel_token,
-                                        &session_id,
+                                        &task_session_id,
                                         &name,
                                     )
                                     .await
                                     {
-                                        eprintln!("probe {session_id} failed: {error}");
+                                        eprintln!("probe {task_session_id} failed: {error}");
                                     }
                                 });
+
+                                session_tasks.lock().await.insert(session_id, task);
                             }
                             ControlMessage::ShellOffer {
                                 version,
                                 session_id,
                                 tunnel_token,
-                            } if version == CONTROL_PROTOCOL_VERSION => {
+                            } => {
+                                if version != CONTROL_PROTOCOL_VERSION {
+                                    reject_incompatible_offer(&mut sender, session_id).await?;
+                                    continue;
+                                }
+
+                                let Some(permit) =
+                                    reserve_session(&mut sender, session_slots, &session_id).await?
+                                else {
+                                    continue;
+                                };
+
                                 let client = client.clone();
                                 let relay = relay.to_owned();
                                 let operator_key = operator_key.to_owned();
+                                let task_session_id = session_id.clone();
 
-                                tokio::spawn(async move {
+                                let task = tokio::spawn(async move {
+                                    let _permit = permit;
                                     if let Err(error) = ssh::serve(
                                         &client,
                                         &relay,
                                         &tunnel_token,
-                                        &session_id,
+                                        &task_session_id,
                                         &operator_key,
                                     )
                                     .await
                                     {
-                                        eprintln!("shell {session_id} failed: {error}");
+                                        eprintln!("shell {task_session_id} failed: {error}");
                                     }
                                 });
+
+                                session_tasks.lock().await.insert(session_id, task);
+                            }
+                            ControlMessage::SessionCancel {
+                                version,
+                                session_id,
+                            } if version == CONTROL_PROTOCOL_VERSION => {
+                                if let Some(task) = session_tasks.lock().await.remove(&session_id) {
+                                    task.abort();
+                                    eprintln!("session cancelled by relay: {session_id}");
+                                }
                             }
                             _ => {}
                         }
@@ -301,6 +365,59 @@ async fn run_control_once(
             }
         }
     }
+}
+
+async fn reserve_session(
+    sender: &mut futures_util::stream::SplitSink<
+        reqwest_websocket::WebSocket,
+        reqwest_websocket::Message,
+    >,
+    session_slots: &Arc<Semaphore>,
+    session_id: &str,
+) -> Result<Option<OwnedSemaphorePermit>, RevttyError> {
+    match session_slots.clone().try_acquire_owned() {
+        Ok(permit) => {
+            send_control(
+                sender,
+                ControlMessage::SessionAccept {
+                    version: CONTROL_PROTOCOL_VERSION,
+                    session_id: session_id.to_owned(),
+                },
+            )
+            .await?;
+            Ok(Some(permit))
+        }
+        Err(_) => {
+            send_control(
+                sender,
+                ControlMessage::SessionReject {
+                    version: CONTROL_PROTOCOL_VERSION,
+                    session_id: session_id.to_owned(),
+                    reason: SessionRejectReason::Busy,
+                },
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+async fn reject_incompatible_offer(
+    sender: &mut futures_util::stream::SplitSink<
+        reqwest_websocket::WebSocket,
+        reqwest_websocket::Message,
+    >,
+    session_id: String,
+) -> Result<(), RevttyError> {
+    send_control(
+        sender,
+        ControlMessage::SessionReject {
+            version: CONTROL_PROTOCOL_VERSION,
+            session_id,
+            reason: SessionRejectReason::IncompatibleVersion,
+        },
+    )
+    .await
 }
 
 async fn send_control(
@@ -420,6 +537,7 @@ pub fn status() -> Result<(), RevttyError> {
     println!("relay      {}", config.relay);
     println!("id         {}", config.agent_id);
     println!("host       {}", identity.fingerprint);
+    println!("sessions   {}", config.max_sessions);
     println!("config     {}", AgentConfig::path(&paths).display());
     Ok(())
 }
@@ -454,6 +572,7 @@ pub async fn doctor() -> Result<(), RevttyError> {
     println!("name       {}", config.name);
     println!("host key   {}", identity.fingerprint);
     println!("protocol   v{}", crate::protocol::CONTROL_PROTOCOL_VERSION);
+    println!("sessions   {}", config.max_sessions);
     println!("relay      {} reachable", config.relay);
     println!("config     {}", AgentConfig::path(&paths).display());
     Ok(())
