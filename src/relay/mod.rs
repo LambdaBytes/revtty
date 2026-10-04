@@ -1688,7 +1688,9 @@ mod tests {
             status_response.json().await.expect("decode agent status");
         assert_eq!(status.id, credential.id);
         assert_eq!(status.name, "signed-demo");
-        assert!(status.online);
+        assert!(!status.online);
+        assert_eq!(status.active_sessions, 0);
+        assert_eq!(status.max_sessions, None);
         assert_eq!(status.version.as_deref(), Some("0.1.0"));
 
         let reused_status = http
