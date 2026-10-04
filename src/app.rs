@@ -10,7 +10,11 @@ pub async fn run(args: Args) -> Result<(), RevttyError> {
         Command::Connect { target, relay } => crate::client::connect(&target, &relay).await,
         Command::Doctor { relay } => crate::client::doctor(&relay).await,
         Command::Agent { command } => match command {
-            AgentCommand::Enroll { relay, token } => crate::agent::enroll(&relay, &token).await,
+            AgentCommand::Enroll {
+                relay,
+                token,
+                max_sessions,
+            } => crate::agent::enroll(&relay, &token, max_sessions).await,
             AgentCommand::Run => crate::agent::run().await,
             AgentCommand::PtyTest => crate::agent::pty_test(),
             AgentCommand::Status => crate::agent::status(),
