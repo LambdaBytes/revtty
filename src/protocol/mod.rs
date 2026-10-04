@@ -67,7 +67,9 @@ pub struct AgentStatusResponse {
     pub id: String,
     pub name: String,
     pub online: bool,
+    #[serde(default)]
     pub active_sessions: usize,
+    #[serde(default)]
     pub max_sessions: Option<usize>,
     pub created_at: i64,
     pub last_seen: Option<i64>,
