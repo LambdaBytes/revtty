@@ -2,24 +2,57 @@ name: CI
 
 on:
   push:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-v2-${{ github.ref }}
+  group: ci-v3-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  rust:
+  linux:
     timeout-minutes: 10
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: ubuntu-latest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --all-features
+
+      - name: Release build
+        run: cargo build --release
+
+  macos:
+    if: github.event_name != 'push' || contains(github.event.head_commit.message, '[full ci]')
+    timeout-minutes: 10
+    name: macos-latest
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
