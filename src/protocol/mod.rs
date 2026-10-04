@@ -163,6 +163,24 @@ mod tests {
     }
 
     #[test]
+    fn session_reject_reason_wire_names_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&SessionRejectReason::Busy).expect("serialize busy"),
+            "\"busy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionRejectReason::IncompatibleVersion)
+                .expect("serialize incompatible version"),
+            "\"incompatible_version\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionRejectReason::InternalError)
+                .expect("serialize internal error"),
+            "\"internal_error\""
+        );
+    }
+
+    #[test]
     fn session_lifecycle_messages_round_trip() {
         for message in [
             ControlMessage::SessionAccept {
