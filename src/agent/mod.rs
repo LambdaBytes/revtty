@@ -171,11 +171,7 @@ pub async fn run() -> Result<(), RevttyError> {
     loop {
         let control = run_control_once(
             &client,
-            &config.relay,
-            &config.name,
-            &config.control_token,
-            &config.operator_key,
-            config.max_sessions,
+            &config,
             &mut backoff,
             &session_slots,
             &session_tasks,
@@ -208,15 +204,16 @@ pub async fn run() -> Result<(), RevttyError> {
 
 async fn run_control_once(
     client: &reqwest::Client,
-    relay: &str,
-    name: &str,
-    token: &str,
-    operator_key: &str,
-    max_sessions: usize,
+    config: &AgentConfig,
     backoff: &mut ReconnectBackoff,
     session_slots: &Arc<Semaphore>,
     session_tasks: &SessionTasks,
 ) -> Result<(), RevttyError> {
+    let relay = config.relay.as_str();
+    let name = config.name.as_str();
+    let token = config.control_token.as_str();
+    let operator_key = config.operator_key.as_str();
+    let max_sessions = config.max_sessions;
     let path = format!("/v1/agent/{name}");
     let websocket = connect_websocket(client, relay, &path, token).await?;
     let (mut sender, mut receiver) = websocket.split();
