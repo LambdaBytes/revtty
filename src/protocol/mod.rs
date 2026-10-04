@@ -26,9 +26,15 @@ pub enum ControlMessage {
         version: u16,
         name: String,
         agent_version: String,
+        #[serde(default)]
+        active_sessions: usize,
+        #[serde(default)]
+        max_sessions: usize,
     },
     Heartbeat {
         version: u16,
+        #[serde(default)]
+        active_sessions: usize,
     },
     ProbeOffer {
         version: u16,
@@ -60,6 +66,8 @@ pub struct AgentStatusResponse {
     pub id: String,
     pub name: String,
     pub online: bool,
+    pub active_sessions: usize,
+    pub max_sessions: Option<usize>,
     pub created_at: i64,
     pub last_seen: Option<i64>,
     pub version: Option<String>,
@@ -252,6 +260,8 @@ mod tests {
                 id: "agent-id".to_owned(),
                 name: "store-042".to_owned(),
                 online: false,
+                active_sessions: 0,
+                max_sessions: None,
                 created_at: 1_700_000_000,
                 last_seen: Some(1_700_000_030),
                 version: Some("0.1.0".to_owned()),
@@ -274,6 +284,8 @@ mod tests {
             id: "agent-id".to_owned(),
             name: "store-042".to_owned(),
             online: true,
+            active_sessions: 2,
+            max_sessions: Some(4),
             created_at: 1_700_000_000,
             last_seen: Some(1_700_000_030),
             version: Some("0.1.0".to_owned()),
