@@ -27,6 +27,7 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - Configurable per-agent concurrent session limit (default 4, maximum 64), including backward-compatible agent config loading.
 - Explicit rejection of incompatible session-offer protocol versions instead of silently ignoring them.
 - Live active-session/capacity reporting in operator `list` and `status`.
+- Operator-visible pre-SSH rejection/timeout errors without exposing terminal payload to the relay.
 - Stronger operator, agent and relay doctor checks for relay reachability, persisted agent configuration and relay SQLite state.
 - Linux systemd agent template with an explicit OS account, restart-on-failure, graceful SIGINT shutdown, journald logging and restrictive runtime umask.
 - Absolute `REVTTY_CONFIG_DIR` and `REVTTY_STATE_DIR` overrides for service/container deployments.
