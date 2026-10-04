@@ -49,6 +49,7 @@ The repository has moved beyond the scaffold. The authenticated M1 path now incl
 - explicit session accept/reject/cancel lifecycle with independent acceptance/data-tunnel timeouts;
 - configurable per-agent concurrent session limits with live capacity shown by `list` / `status`;
 - explicit rejection of incompatible session-offer protocol versions;
+- operator-visible pre-SSH errors for busy agents and rendezvous timeouts;
 - operator, agent and relay doctor checks for identity/configuration, relay reachability and relay storage;
 - a systemd template that runs the agent as an explicit OS account with restart-on-failure and journald logging;
 - Linux and macOS CI for format, Clippy, tests and release builds.
@@ -107,7 +108,7 @@ See [docs/PROTOTYPE.md](docs/PROTOTYPE.md) for validation details and the remain
 The first shell works, but M1 is not complete. Notable remaining work includes:
 
 - deeper doctor coverage for TLS/authentication/filesystem-permission failures;
-- stronger operator-visible session rejection/error propagation;
+- persistent session audit metadata;
 - real NAT/CGNAT validation of the full authenticated `connect` path;
 - recovery/fault tests around relay restart and network loss.
 
