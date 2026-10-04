@@ -11,6 +11,14 @@ pub fn operator_list_auth_message(challenge: &str) -> String {
     format!("revtty-control-v1\nscope=list\nchallenge={challenge}\n")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRejectReason {
+    Busy,
+    IncompatibleVersion,
+    InternalError,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
@@ -31,6 +39,19 @@ pub enum ControlMessage {
         version: u16,
         session_id: String,
         tunnel_token: String,
+    },
+    SessionAccept {
+        version: u16,
+        session_id: String,
+    },
+    SessionReject {
+        version: u16,
+        session_id: String,
+        reason: SessionRejectReason,
+    },
+    SessionCancel {
+        version: u16,
+        session_id: String,
     },
 }
 
@@ -103,7 +124,7 @@ mod tests {
     use super::{
         AgentListResponse, AgentStatusResponse, ControlMessage, EnrollRequest, EnrollResponse,
         OperatorAuthRequest, OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest,
-        ProbeResult, operator_auth_message, operator_list_auth_message,
+        ProbeResult, SessionRejectReason, operator_auth_message, operator_list_auth_message,
     };
 
     #[test]
@@ -128,6 +149,30 @@ mod tests {
         let json = serde_json::to_string(&message).expect("serialize shell offer");
         let decoded: ControlMessage = serde_json::from_str(&json).expect("deserialize shell offer");
         assert!(decoded == message);
+    }
+
+    #[test]
+    fn session_lifecycle_messages_round_trip() {
+        for message in [
+            ControlMessage::SessionAccept {
+                version: 1,
+                session_id: "session".to_owned(),
+            },
+            ControlMessage::SessionReject {
+                version: 1,
+                session_id: "session".to_owned(),
+                reason: SessionRejectReason::Busy,
+            },
+            ControlMessage::SessionCancel {
+                version: 1,
+                session_id: "session".to_owned(),
+            },
+        ] {
+            let json = serde_json::to_string(&message).expect("serialize lifecycle message");
+            let decoded: ControlMessage =
+                serde_json::from_str(&json).expect("deserialize lifecycle message");
+            assert!(decoded == message);
+        }
     }
 
     #[test]
