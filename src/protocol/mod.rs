@@ -151,6 +151,28 @@ mod tests {
     }
 
     #[test]
+    fn presence_messages_round_trip_with_capacity() {
+        for message in [
+            ControlMessage::Hello {
+                version: 1,
+                name: "store-042".to_owned(),
+                agent_version: "0.1.0".to_owned(),
+                active_sessions: 2,
+                max_sessions: 4,
+            },
+            ControlMessage::Heartbeat {
+                version: 1,
+                active_sessions: 3,
+            },
+        ] {
+            let json = serde_json::to_string(&message).expect("serialize presence message");
+            let decoded: ControlMessage =
+                serde_json::from_str(&json).expect("deserialize presence message");
+            assert!(decoded == message);
+        }
+    }
+
+    #[test]
     fn shell_offer_round_trips() {
         let message = ControlMessage::ShellOffer {
             version: 1,
