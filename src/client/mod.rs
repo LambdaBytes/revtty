@@ -163,9 +163,10 @@ pub async fn status(target: &str, relay: &str) -> Result<(), RevttyError> {
 }
 
 fn session_capacity(status: &AgentStatusResponse) -> String {
-    status
-        .max_sessions
-        .map_or_else(|| "-".to_owned(), |max| format!("{}/{}", status.active_sessions, max))
+    status.max_sessions.map_or_else(
+        || "-".to_owned(),
+        |max| format!("{}/{}", status.active_sessions, max),
+    )
 }
 
 struct AuthenticatedOperator {
