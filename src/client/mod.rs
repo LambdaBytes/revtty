@@ -101,9 +101,10 @@ pub async fn list(relay: &str) -> Result<(), RevttyError> {
 
     for agent in response.agents {
         println!(
-            "{}\t{}\tlast_seen={}\tversion={}",
+            "{}\t{}\tsessions={}\tlast_seen={}\tversion={}",
             agent.name,
             if agent.online { "online" } else { "offline" },
+            session_capacity(&agent),
             agent
                 .last_seen
                 .map_or_else(|| "-".to_owned(), |value| value.to_string()),
@@ -149,6 +150,7 @@ pub async fn status(target: &str, relay: &str) -> Result<(), RevttyError> {
         if status.online { "online" } else { "offline" }
     );
     println!("id        {}", status.id);
+    println!("sessions  {}", session_capacity(&status));
     println!("created   {}", status.created_at);
     println!(
         "last_seen {}",
@@ -158,6 +160,12 @@ pub async fn status(target: &str, relay: &str) -> Result<(), RevttyError> {
     );
     println!("revtty    {}", status.version.as_deref().unwrap_or("-"));
     Ok(())
+}
+
+fn session_capacity(status: &AgentStatusResponse) -> String {
+    status
+        .max_sessions
+        .map_or_else(|| "-".to_owned(), |max| format!("{}/{}", status.active_sessions, max))
 }
 
 struct AuthenticatedOperator {
