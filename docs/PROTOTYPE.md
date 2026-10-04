@@ -37,6 +37,7 @@ That transport proof is now implemented together with the first authenticated SS
 - persisted per-agent concurrency limit with `busy` rejection;
 - live active-session/capacity reporting in operator discovery/status;
 - explicit incompatible-offer-version rejection;
+- operator-visible pre-SSH errors for rejection and rendezvous timeout;
 - operator/agent relay-reachability diagnostics and relay SQLite diagnostics;
 - systemd template service with an explicit OS account, restart-on-failure and journald logging;
 - bounded relay/control and PTY I/O queues;
@@ -236,6 +237,6 @@ The next gates for M1 are:
 1. run the authenticated `connect` path across a real NAT/CGNAT boundary;
 2. validate relay restart and network-loss recovery;
 3. deepen doctor checks for TLS/authentication/filesystem-permission failures;
-4. improve operator-visible rejection/error propagation and session audit metadata.
+4. add persistent session audit metadata.
 
 This keeps transport, identity, SSH, PTY and lifecycle failures independently observable.
