@@ -11,6 +11,22 @@ use crate::config::Paths;
 use crate::error::RevttyError;
 
 const AGENT_CONFIG_FILE: &str = "agent.toml";
+pub const DEFAULT_MAX_SESSIONS: usize = 4;
+pub const MAX_SESSIONS_LIMIT: usize = 64;
+
+fn default_max_sessions() -> usize {
+    DEFAULT_MAX_SESSIONS
+}
+
+pub fn validate_max_sessions(value: usize) -> Result<(), RevttyError> {
+    if !(1..=MAX_SESSIONS_LIMIT).contains(&value) {
+        return Err(RevttyError::message(format!(
+            "max_sessions must be between 1 and {MAX_SESSIONS_LIMIT}"
+        )));
+    }
+
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -19,6 +35,8 @@ pub struct AgentConfig {
     pub name: String,
     pub control_token: String,
     pub operator_key: String,
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
 }
 
 impl AgentConfig {
@@ -30,11 +48,14 @@ impl AgentConfig {
         let path = Self::path(paths);
         let encoded = fs::read_to_string(&path)
             .map_err(|error| RevttyError::runtime("read agent configuration", error))?;
-        toml::from_str(&encoded)
-            .map_err(|error| RevttyError::runtime("parse agent configuration", error))
+        let config: Self = toml::from_str(&encoded)
+            .map_err(|error| RevttyError::runtime("parse agent configuration", error))?;
+        validate_max_sessions(config.max_sessions)?;
+        Ok(config)
     }
 
     pub fn save(&self, paths: &Paths) -> Result<(), RevttyError> {
+        validate_max_sessions(self.max_sessions)?;
         fs::create_dir_all(&paths.config_dir)
             .map_err(|error| RevttyError::runtime("create agent config directory", error))?;
 
@@ -84,6 +105,7 @@ mod tests {
             name: "store-042".to_owned(),
             control_token: "rva_secret".to_owned(),
             operator_key: "ssh-ed25519 AAAA".to_owned(),
+            max_sessions: 7,
         };
 
         config.save(&paths).expect("save agent config");
@@ -94,6 +116,7 @@ mod tests {
         assert_eq!(loaded.name, config.name);
         assert_eq!(loaded.control_token, config.control_token);
         assert_eq!(loaded.operator_key, config.operator_key);
+        assert_eq!(loaded.max_sessions, 7);
 
         #[cfg(unix)]
         {
@@ -106,5 +129,27 @@ mod tests {
         }
 
         fs::remove_dir_all(root).expect("clean agent config test directory");
+    }
+
+    #[test]
+    fn legacy_agent_config_defaults_session_limit() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+relay = "https://relay.example.com"
+agent_id = "agent-id"
+name = "store-042"
+control_token = "rva_secret"
+operator_key = "ssh-ed25519 AAAA"
+"#,
+        )
+        .expect("parse legacy agent config");
+
+        assert_eq!(config.max_sessions, super::DEFAULT_MAX_SESSIONS);
+    }
+
+    #[test]
+    fn rejects_invalid_session_limits() {
+        assert!(super::validate_max_sessions(0).is_err());
+        assert!(super::validate_max_sessions(super::MAX_SESSIONS_LIMIT + 1).is_err());
     }
 }
