@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
 pub const OPERATOR_AUTH_NAMESPACE: &str = "revtty-control-v1";
+pub const SESSION_ERROR_PREFIX: &str = "revtty-error:";
 
 pub fn operator_auth_message(agent_name: &str, challenge: &str) -> String {
     format!("revtty-control-v1\nagent={agent_name}\nchallenge={challenge}\n")
