@@ -19,8 +19,8 @@ use crate::error::RevttyError;
 use crate::protocol::{
     AgentListResponse, AgentStatusResponse, CONTROL_PROTOCOL_VERSION, ControlMessage,
     EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
-    OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, SessionRejectReason,
-    operator_auth_message, operator_list_auth_message,
+    OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, SESSION_ERROR_PREFIX,
+    SessionRejectReason, operator_auth_message, operator_list_auth_message,
 };
 use crate::storage::Store;
 use crate::token::{SecretToken, hash_token};
@@ -907,7 +907,7 @@ async fn record_agent_decision(
 }
 
 async fn handle_operator_session(
-    operator_socket: WebSocket,
+    mut operator_socket: WebSocket,
     state: RelayState,
     agent_name: String,
     control: mpsc::Sender<ControlMessage>,
@@ -954,6 +954,14 @@ async fn handle_operator_session(
         }
         Ok(Ok(AgentDecision::Rejected(reason))) => {
             state.pending.lock().await.remove(&session_id);
+            let detail = match reason {
+                SessionRejectReason::Busy => "agent is busy",
+                SessionRejectReason::IncompatibleVersion => {
+                    "agent rejected an incompatible protocol version"
+                }
+                SessionRejectReason::InternalError => "agent could not start the session",
+            };
+            send_operator_session_error(&mut operator_socket, detail).await;
             eprintln!(
                 "{} rejected by {agent_name}: {session_id} ({reason:?})",
                 kind.label()
@@ -963,6 +971,11 @@ async fn handle_operator_session(
         _ => {
             state.pending.lock().await.remove(&session_id);
             send_session_cancel(&control, &session_id).await;
+            send_operator_session_error(
+                &mut operator_socket,
+                "agent did not accept the session before timeout",
+            )
+            .await;
             eprintln!(
                 "{} acceptance timed out for {agent_name}: {session_id}",
                 kind.label()
@@ -980,6 +993,11 @@ async fn handle_operator_session(
         _ => {
             state.pending.lock().await.remove(&session_id);
             send_session_cancel(&control, &session_id).await;
+            send_operator_session_error(
+                &mut operator_socket,
+                "agent accepted the session but its data tunnel timed out",
+            )
+            .await;
             eprintln!(
                 "{} data tunnel timed out for {agent_name}: {session_id}",
                 kind.label()
@@ -1036,6 +1054,11 @@ async fn handle_legacy_operator_session(
             state.pending.lock().await.remove(&session_id);
         }
     }
+}
+
+async fn send_operator_session_error(socket: &mut WebSocket, detail: &str) {
+    let text = format!("{SESSION_ERROR_PREFIX}{detail}");
+    let _ = socket.send(Message::Text(text.into())).await;
 }
 
 async fn send_session_cancel(control: &mpsc::Sender<ControlMessage>, session_id: &str) {
