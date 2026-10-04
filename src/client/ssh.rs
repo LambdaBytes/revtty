@@ -195,6 +195,14 @@ pub async fn connect_terminal(
     }
     .await;
 
+    if result.is_err() && bridge_task.is_finished() {
+        let bridge_result = bridge_task.await;
+        return match bridge_result {
+            Ok(Err(error)) => Err(error),
+            _ => result,
+        };
+    }
+
     bridge_task.abort();
     let _ = bridge_task.await;
     result
