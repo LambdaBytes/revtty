@@ -80,11 +80,7 @@ fn jitter_sample(failures: u32) -> u64 {
     value
 }
 
-pub async fn enroll(
-    relay: &str,
-    token: &str,
-    max_sessions: usize,
-) -> Result<(), RevttyError> {
+pub async fn enroll(relay: &str, token: &str, max_sessions: usize) -> Result<(), RevttyError> {
     validate_max_sessions(max_sessions)?;
     let paths = Paths::discover()?;
     let identity = ensure_agent(&paths)?;
