@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use reqwest_websocket::{Message, Upgrade, WebSocket};
@@ -11,6 +13,24 @@ pub const DEFAULT_TRANSPORT: &str = "wss";
 
 const STREAM_BUFFER_SIZE: usize = 256 * 1024;
 const STREAM_CHUNK_SIZE: usize = 16 * 1024;
+
+/// SSH liveness policy shared by the operator client and the agent server.
+#[derive(Clone, Copy, Debug)]
+pub struct SshTimeouts {
+    /// Keepalive requests while the session is idle; a healthy peer's reply keeps it open.
+    pub keepalive_interval: Duration,
+    /// Unanswered keepalives tolerated before the peer is considered gone.
+    pub keepalive_max: usize,
+    /// No traffic at all for this long closes the session. In russh this is also the only
+    /// bound on the banner exchange and on writes the transport no longer accepts.
+    pub inactivity: Duration,
+}
+
+pub const SSH_TIMEOUTS: SshTimeouts = SshTimeouts {
+    keepalive_interval: Duration::from_secs(30),
+    keepalive_max: 3,
+    inactivity: Duration::from_secs(120),
+};
 
 pub fn websocket_byte_stream(
     websocket: WebSocket,
@@ -169,6 +189,100 @@ pub fn valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Byte streams for exercising transport stalls in tests.
+#[cfg(test)]
+pub mod test_support {
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+    const STALLED: u8 = 1;
+    const DISCARDING: u8 = 2;
+
+    /// Switches an in-memory stream between working normally, never making progress again
+    /// (a dead path), or silently dropping everything written to it (a black hole).
+    #[derive(Clone, Default)]
+    pub struct StreamControl(Arc<AtomicU8>);
+
+    impl StreamControl {
+        pub fn stall(&self) {
+            self.0.store(STALLED, Ordering::SeqCst);
+        }
+
+        pub fn discard(&self) {
+            self.0.store(DISCARDING, Ordering::SeqCst);
+        }
+
+        fn mode(&self) -> u8 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    pub struct ControlledStream {
+        inner: DuplexStream,
+        control: StreamControl,
+    }
+
+    impl ControlledStream {
+        pub fn new(inner: DuplexStream, control: StreamControl) -> Self {
+            Self { inner, control }
+        }
+    }
+
+    impl AsyncRead for ControlledStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            match self.control.mode() {
+                // Never woken again: nothing arrives any more.
+                STALLED | DISCARDING => Poll::Pending,
+                _ => Pin::new(&mut self.inner).poll_read(context, buffer),
+            }
+        }
+    }
+
+    impl AsyncWrite for ControlledStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            match self.control.mode() {
+                STALLED => Poll::Pending,
+                DISCARDING => Poll::Ready(Ok(data.len())),
+                _ => Pin::new(&mut self.inner).poll_write(context, data),
+            }
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            match self.control.mode() {
+                STALLED => Poll::Pending,
+                DISCARDING => Poll::Ready(Ok(())),
+                _ => Pin::new(&mut self.inner).poll_flush(context),
+            }
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            match self.control.mode() {
+                STALLED => Poll::Pending,
+                DISCARDING => Poll::Ready(Ok(())),
+                _ => Pin::new(&mut self.inner).poll_shutdown(context),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

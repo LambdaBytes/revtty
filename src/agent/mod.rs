@@ -21,7 +21,7 @@ use crate::identity::ensure_agent;
 use crate::error::RevttyError;
 use crate::protocol::{
     CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse, ProbeResult,
-    SessionRejectReason,
+    SESSION_ERROR_PREFIX, SessionRejectReason,
 };
 use crate::transport::{check_relay_health, connect_websocket, http_url, valid_name};
 
@@ -30,6 +30,21 @@ const RECONNECT_CAP_MILLIS: u64 = 30_000;
 const RECONNECT_JITTER_PERCENT: u64 = 20;
 /// Bound on waiting for shell teardowns at shutdown; below systemd's `TimeoutStopSec=15s`.
 const SHELL_SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// Writing one frame to the relay; a write that cannot complete means the path is dead.
+const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+struct ControlTimeouts {
+    heartbeat: Duration,
+    /// No frame at all from the relay for this long means the path is dead. The relay
+    /// answers the WebSocket ping sent with every heartbeat.
+    relay_idle: Duration,
+}
+
+const CONTROL_TIMEOUTS: ControlTimeouts = ControlTimeouts {
+    heartbeat: Duration::from_secs(15),
+    relay_idle: Duration::from_secs(45),
+};
 
 type SessionTasks = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
 
@@ -181,6 +196,7 @@ pub async fn run() -> Result<(), RevttyError> {
             &session_slots,
             &session_tasks,
             &shell_shutdown,
+            CONTROL_TIMEOUTS,
         );
 
         tokio::select! {
@@ -225,6 +241,7 @@ async fn run_control_once(
     session_slots: &Arc<Semaphore>,
     session_tasks: &SessionTasks,
     shell_shutdown: &ssh::ShellShutdown,
+    timeouts: ControlTimeouts,
 ) -> Result<(), RevttyError> {
     let relay = config.relay.as_str();
     let name = config.name.as_str();
@@ -250,8 +267,10 @@ async fn run_control_once(
     backoff.reset();
     eprintln!("agent {name} connected to {relay}");
 
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    let mut heartbeat = tokio::time::interval(timeouts.heartbeat);
     heartbeat.tick().await;
+    let idle = tokio::time::sleep(timeouts.relay_idle);
+    tokio::pin!(idle);
 
     loop {
         tokio::select! {
@@ -270,10 +289,29 @@ async fn run_control_once(
                     },
                 )
                 .await?;
+                // The relay's pong proves the path back is alive even when it has nothing
+                // to send.
+                send_frame(&mut sender, Message::Ping(Default::default()), "send control ping")
+                    .await?;
+            }
+            () = &mut idle => {
+                return Err(RevttyError::message(format!(
+                    "relay sent nothing for {}s",
+                    timeouts.relay_idle.as_secs()
+                )));
             }
             message = receiver.next() => {
+                idle.as_mut()
+                    .reset(tokio::time::Instant::now() + timeouts.relay_idle);
+
                 match message {
                     Some(Ok(Message::Text(text))) => {
+                        if let Some(detail) = text.strip_prefix(SESSION_ERROR_PREFIX) {
+                            return Err(RevttyError::message(format!(
+                                "relay rejected the control connection: {detail}"
+                            )));
+                        }
+
                         let control: ControlMessage = serde_json::from_str(&text)
                             .map_err(|error| RevttyError::runtime("decode control message", error))?;
 
@@ -369,10 +407,7 @@ async fn run_control_once(
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        sender
-                            .send(Message::Pong(data))
-                            .await
-                            .map_err(|error| RevttyError::runtime("send control pong", error))?;
+                        send_frame(&mut sender, Message::Pong(data), "send control pong").await?;
                     }
                     Some(Ok(Message::Close { .. })) | None => return Ok(()),
                     Some(Ok(_)) => {}
@@ -448,10 +483,24 @@ async fn send_control(
     let text = serde_json::to_string(&message)
         .map_err(|error| RevttyError::runtime("encode control message", error))?;
 
-    sender
-        .send(Message::Text(text))
-        .await
-        .map_err(|error| RevttyError::runtime("send control message", error))
+    send_frame(sender, Message::Text(text), "send control message").await
+}
+
+async fn send_frame(
+    sender: &mut futures_util::stream::SplitSink<
+        reqwest_websocket::WebSocket,
+        reqwest_websocket::Message,
+    >,
+    frame: Message,
+    context: &str,
+) -> Result<(), RevttyError> {
+    match tokio::time::timeout(CONTROL_SEND_TIMEOUT, sender.send(frame)).await {
+        Ok(sent) => sent.map_err(|error| RevttyError::runtime(context, error)),
+        Err(_) => Err(RevttyError::message(format!(
+            "{context}: no progress for {}s",
+            CONTROL_SEND_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 async fn send_probe(
@@ -598,10 +647,127 @@ pub async fn doctor() -> Result<(), RevttyError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::extract::ws::{Message as RelayMessage, WebSocketUpgrade};
+    use axum::routing::get;
+    use ssh_key::{Algorithm, PrivateKey};
+    use tokio::sync::{Mutex, Semaphore, mpsc, watch};
+
+    use super::config::AgentConfig;
     use super::{
-        RECONNECT_JITTER_PERCENT, ReconnectBackoff, pty_test, reconnect_base_millis,
-        reconnect_delay_millis,
+        ControlTimeouts, RECONNECT_JITTER_PERCENT, ReconnectBackoff, pty_test,
+        reconnect_base_millis, reconnect_delay_millis, run_control_once, ssh,
     };
+    use crate::protocol::SESSION_ERROR_PREFIX;
+
+    const FAST_CONTROL_TIMEOUTS: ControlTimeouts = ControlTimeouts {
+        heartbeat: Duration::from_millis(50),
+        relay_idle: Duration::from_millis(300),
+    };
+
+    #[derive(Clone, Copy)]
+    enum FakeRelay {
+        /// Accepts the control channel, then never reads or writes again.
+        Silent,
+        /// Answers the hello with an explicit rejection.
+        Rejecting,
+    }
+
+    async fn fake_relay(behaviour: FakeRelay) -> String {
+        let app = axum::Router::new().route(
+            "/v1/agent/{name}",
+            get(move |ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    let _hello = socket.recv().await;
+                    if let FakeRelay::Rejecting = behaviour {
+                        let rejection = format!(
+                            "{SESSION_ERROR_PREFIX}incompatible control protocol version 1"
+                        );
+                        let _ = socket.send(RelayMessage::Text(rejection.into())).await;
+                    }
+                    // Keep the connection open without ever polling it again.
+                    let _socket = socket;
+                    std::future::pending::<()>().await;
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake relay");
+        let address = listener.local_addr().expect("fake relay address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake relay");
+        });
+        format!("ws://{address}")
+    }
+
+    async fn run_against(relay: &str) -> Result<Result<(), crate::error::RevttyError>, ()> {
+        let operator_key = PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519)
+            .expect("operator key")
+            .public_key()
+            .to_openssh()
+            .expect("encode operator key");
+        let config = AgentConfig {
+            relay: relay.to_owned(),
+            agent_id: "agent-id".to_owned(),
+            name: "fake-agent".to_owned(),
+            control_token: "rva_test".to_owned(),
+            operator_key,
+            max_sessions: 4,
+        };
+        let (shutdown, _) = watch::channel(false);
+        let (guard, _guards) = mpsc::channel(1);
+        let shell_shutdown = ssh::ShellShutdown::new(shutdown.subscribe(), &guard);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_control_once(
+                &reqwest::Client::new(),
+                &config,
+                &mut ReconnectBackoff::default(),
+                &Arc::new(Semaphore::new(4)),
+                &Arc::new(Mutex::new(HashMap::new())),
+                &shell_shutdown,
+                FAST_CONTROL_TIMEOUTS,
+            ),
+        )
+        .await
+        .map_err(|_| ())
+    }
+
+    #[tokio::test]
+    async fn silent_relay_ends_control_connection() {
+        let relay = fake_relay(FakeRelay::Silent).await;
+        let started = tokio::time::Instant::now();
+
+        let outcome = run_against(&relay).await;
+
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "agent stayed attached to a silent relay"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn relay_rejection_ends_control_connection_with_its_reason() {
+        let relay = fake_relay(FakeRelay::Rejecting).await;
+
+        let outcome = run_against(&relay).await;
+
+        let Ok(Err(error)) = outcome else {
+            panic!("agent ignored the relay's rejection");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("incompatible control protocol version"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn reconnect_backoff_grows_and_caps() {

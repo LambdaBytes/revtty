@@ -69,10 +69,14 @@ impl Running {
     }
 
     fn wait_for_log(&self, pattern: &str, within: Duration) -> String {
+        self.wait_for_log_count(pattern, 1, within)
+    }
+
+    fn wait_for_log_count(&self, pattern: &str, count: usize, within: Duration) -> String {
         let deadline = Instant::now() + within;
         loop {
             let log = self.log();
-            if log.contains(pattern) {
+            if log.matches(pattern).count() >= count {
                 return log;
             }
             assert!(
@@ -142,10 +146,14 @@ fn field<'a>(output: &'a str, name: &str) -> &'a str {
 }
 
 fn start_relay(root: &TempRoot, relay_role: &Role) -> (Running, String) {
+    start_relay_on(root, relay_role, "127.0.0.1:0")
+}
+
+fn start_relay_on(root: &TempRoot, relay_role: &Role, bind: &str) -> (Running, String) {
     let db = root.path("relay.db");
     let mut command = relay_role.command();
     command
-        .args(["relay", "serve", "--bind", "127.0.0.1:0", "--db"])
+        .args(["relay", "serve", "--bind", bind, "--db"])
         .arg(&db)
         .env("REVTTY_DEV_TOKEN", "e2e-dev-token");
     let relay = Running::spawn(command);
@@ -427,4 +435,36 @@ fn agent_sigint_reaps_active_shell() {
         !shell_alive,
         "agent exited while its shell {pid} was still running"
     );
+}
+
+#[test]
+fn agent_recovers_after_relay_restart() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let agent_process = start_agent(&root, &agent);
+    operator.run(&["probe", AGENT_NAME, "--relay", &url]);
+
+    // Restart the relay on the same address with the same database.
+    let address = url.trim_start_matches("http://").to_owned();
+    drop(relay);
+    let (relay, restarted_url) = start_relay_on(&root, &relay_role, &address);
+    assert_eq!(restarted_url, url);
+
+    agent_process.wait_for_log_count("connected to", 2, Duration::from_secs(30));
+    relay.wait_for_log("agent online", Duration::from_secs(10));
+
+    let status = operator.run(&["status", AGENT_NAME, "--relay", &url]);
+    assert!(
+        status.contains("status    online"),
+        "agent not online after relay restart:\n{status}"
+    );
+
+    let mut terminal = Terminal::connect(&operator, &url);
+    let logs = [&relay, &agent_process];
+    terminal.wait_ready(Duration::from_secs(20), &logs);
+    terminal.send("echo REVTTY_E2E_$((6*7)); exit 7\r");
+    terminal.wait_for("REVTTY_E2E_42", Duration::from_secs(20), &logs);
+    terminal.wait_for("connection closed (exit 7)", Duration::from_secs(20), &logs);
 }
