@@ -137,7 +137,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | `relay remove NAME` | relay | Remove an agent and its unused enrollments; the audit is kept. |
 | `relay agents`, `relay sessions [--limit N]`, `relay doctor` | relay | Enrolled agents, session audit, diagnostics. |
 
-`--relay` accepts `http(s)://` or `ws(s)://`. For the operator commands it defaults to `$REVTTY_RELAY`, else `ws://127.0.0.1:8787`; `agent enroll` requires it explicitly and the agent then keeps it in `agent.toml`. Relay commands take `--db`, defaulting to `$REVTTY_DB`, else `revtty.db`.
+`--relay` accepts `https://` or `wss://`, and plain `http://` or `ws://` only for a relay on the same machine (`localhost`, `127.0.0.0/8` or `[::1]`), and a redirect to any other plain URL is not followed: every request carries a credential that only TLS protects. For the operator commands it defaults to `$REVTTY_RELAY`, else `ws://127.0.0.1:8787`; `agent enroll` requires it explicitly and the agent then keeps it in `agent.toml`. Relay commands take `--db`, defaulting to `$REVTTY_DB`, else `revtty.db`.
 
 ## Files
 

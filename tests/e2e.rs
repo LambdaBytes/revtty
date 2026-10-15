@@ -167,6 +167,40 @@ fn field<'a>(output: &'a str, name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing {name:?} in output:\n{output}"))
 }
 
+/// A plain-HTTP server on loopback that answers every request with a 307 to `location`,
+/// after reading it whole so that the client sees the answer rather than a reset.
+fn redirecting_server(location: &str) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind redirecting server");
+    let address = listener.local_addr().expect("redirecting server address");
+    let location = location.to_owned();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone redirect stream"));
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; length];
+            let _ = reader.read_exact(&mut body);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+
+    format!("http://{address}")
+}
+
 fn start_relay(root: &TempRoot, relay_role: &Role) -> (Running, String) {
     start_relay_on(root, relay_role, "127.0.0.1:0")
 }
@@ -746,6 +780,74 @@ fn doctors_check_authentication_permissions_and_tls() {
         tls.contains("corrupt message") || tls.contains("InvalidContentType"),
         "TLS failure cause not shown:\n{tls}"
     );
+}
+
+#[test]
+fn unencrypted_relays_are_refused_off_loopback() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    // A `.invalid` name never resolves, so nothing reaches the network even without the check.
+    let remote = "http://relay.invalid:8787";
+
+    let doctor = operator.run_failing(&["doctor", "--relay", remote]);
+    assert!(doctor.contains("unencrypted"), "{doctor}");
+    let enrolled = agent.run_failing(&[
+        "agent",
+        "enroll",
+        "--relay",
+        remote,
+        "--token",
+        "rve_unused",
+    ]);
+    assert!(enrolled.contains("unencrypted"), "{enrolled}");
+    assert!(!agent.config.join("agent.toml").exists());
+
+    // Nor is it reached through a redirect, which would resend the enrollment token with it.
+    let redirecting = redirecting_server(&format!("{remote}/v1/enroll"));
+    let redirected = agent.run_failing(&[
+        "agent",
+        "enroll",
+        "--relay",
+        &redirecting,
+        "--token",
+        "rve_unused",
+    ]);
+    assert!(
+        redirected.contains("redirect") && !redirected.contains("dns error"),
+        "{redirected}"
+    );
+    assert!(!agent.config.join("agent.toml").exists());
+
+    // An agent whose stored relay is refused, as an older version could enroll it, stops at
+    // start instead of retrying it forever.
+    let (_relay, url) = start_relay(&root, &relay_role);
+    enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let config_path = agent.config.join("agent.toml");
+    let config = std::fs::read_to_string(&config_path).expect("read agent config");
+    assert!(config.contains(&url), "{config}");
+    std::fs::write(&config_path, config.replace(&url, remote)).expect("store a remote relay");
+
+    let mut run = agent
+        .command()
+        .args(["agent", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agent run");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while run.try_wait().expect("poll agent run").is_none() {
+        if Instant::now() >= deadline {
+            let _ = run.kill();
+            let _ = run.wait();
+            panic!("agent run kept retrying a refused relay URL");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = run.wait_with_output().expect("agent run output");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("unencrypted"), "{stderr}");
 }
 
 #[test]

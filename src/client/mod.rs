@@ -14,7 +14,7 @@ use crate::protocol::{
     OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, ProbeResult,
     SESSION_ERROR_PREFIX, operator_auth_message, operator_list_auth_message,
 };
-use crate::transport::{check_relay_health, connect_websocket, http_url, valid_name};
+use crate::transport::{check_relay_health, connect_websocket, http_url, relay_client, valid_name};
 
 pub fn init() -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
@@ -60,7 +60,7 @@ pub async fn list(relay: &str) -> Result<(), RevttyError> {
         .to_openssh()
         .map_err(|error| RevttyError::runtime("encode operator public key", error))?;
 
-    let client = reqwest::Client::new();
+    let client = relay_client()?;
     let mut response = request_agent_list(&client, &private_key, &operator_key, relay).await?;
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         // A list challenge is void once any agent is enrolled after it was issued; one
@@ -230,7 +230,7 @@ async fn authenticate_operator(
     let private_key = PrivateKey::read_openssh_file(&identity.private_key_path)
         .map_err(|error| RevttyError::runtime("read operator private key", error))?;
 
-    let client = reqwest::Client::new();
+    let client = relay_client()?;
     let mut auth = request_operator_session(&client, &private_key, target, relay).await?;
 
     let check = crate::identity::check_agent_host_key(&paths, relay, target, &auth.host_key)?;
@@ -428,7 +428,7 @@ pub async fn connect(target: &str, relay: &str, host_key: Option<&str>) -> Resul
 pub async fn doctor(relay: &str) -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
     let identity = crate::identity::ensure_operator(&paths)?;
-    let client = reqwest::Client::new();
+    let client = relay_client()?;
 
     // Whoever can change these can swap the operator key or the pinned agent host keys.
     crate::config::check_not_writable_by_others(&paths.config_dir)?;
