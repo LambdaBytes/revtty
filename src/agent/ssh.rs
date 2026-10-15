@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use crate::config::Paths;
 use crate::error::RevttyError;
 use crate::identity::ensure_agent;
-use crate::transport::{connect_websocket, websocket_byte_stream};
+use crate::transport::{SSH_TIMEOUTS, SshTimeouts, connect_websocket, websocket_byte_stream};
 
 const PTY_IO_CHUNK: usize = 16 * 1024;
 
@@ -648,6 +648,20 @@ fn ed25519_only() -> Preferred {
     }
 }
 
+/// Keepalives detect an operator that disappears without closing the connection, so its
+/// session and capacity slot are released; the inactivity bound also limits the banner
+/// exchange and writes the transport no longer accepts.
+fn server_config(host_key: PrivateKey, timeouts: SshTimeouts) -> server::Config {
+    server::Config {
+        keys: vec![host_key],
+        preferred: ed25519_only(),
+        keepalive_interval: Some(timeouts.keepalive_interval),
+        keepalive_max: timeouts.keepalive_max,
+        inactivity_timeout: Some(timeouts.inactivity),
+        ..Default::default()
+    }
+}
+
 pub async fn serve(
     client: &Client,
     relay: &str,
@@ -672,14 +686,8 @@ pub async fn serve(
             return Err(RevttyError::message("v1 requires an Ed25519 operator key"));
         }
 
-        let config = server::Config {
-            keys: vec![host_key],
-            preferred: ed25519_only(),
-            ..Default::default()
-        };
-
         let running = server::run_stream(
-            Arc::new(config),
+            Arc::new(server_config(host_key, SSH_TIMEOUTS)),
             stream,
             AgentSshHandler::new(authorized_operator, shutdown),
         )
@@ -709,7 +717,9 @@ mod tests {
     use russh::{client, server};
     use tokio::sync::{mpsc, watch};
 
-    use super::{AgentSshHandler, ShellShutdown, ed25519_only, signal_if_running};
+    use super::{AgentSshHandler, ShellShutdown, ed25519_only, server_config, signal_if_running};
+    use crate::transport::SshTimeouts;
+    use crate::transport::test_support::{ControlledStream, StreamControl};
 
     /// The agent side of shell shutdown: strong guard sender and shutdown signal.
     struct TestShutdown {
@@ -1363,5 +1373,139 @@ mod tests {
 
         let server = shell.disconnect().await;
         let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+    }
+
+    const FAST_TIMEOUTS: SshTimeouts = SshTimeouts {
+        keepalive_interval: Duration::from_millis(100),
+        keepalive_max: 3,
+        inactivity: Duration::from_millis(300),
+    };
+
+    /// An authenticated session against the production server configuration, whose
+    /// transport can be stalled or turned into a black hole from the agent's side.
+    struct LivenessPair {
+        session: client::Handle<TestClient>,
+        server: tokio::task::JoinHandle<()>,
+        control: StreamControl,
+        _shutdown: TestShutdown,
+    }
+
+    async fn connect_with_timeouts(timeouts: SshTimeouts) -> LivenessPair {
+        let server_key = ed25519_key();
+        let expected_server_key = server_key.public_key().clone();
+        let client_key = ed25519_key();
+        let authorized_client = client_key.public_key().clone();
+
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let control = StreamControl::default();
+        let server_stream = ControlledStream::new(server_stream, control.clone());
+        let shutdown = TestShutdown::new();
+        let shell_shutdown = shutdown.handle();
+        let config = server_config(server_key, timeouts);
+
+        let server = tokio::spawn(async move {
+            if let Ok(running) = server::run_stream(
+                Arc::new(config),
+                server_stream,
+                AgentSshHandler::new(authorized_client, shell_shutdown),
+            )
+            .await
+            {
+                let _ = running.await;
+            }
+        });
+
+        // Like the operator client before keepalives were configured: it only answers the
+        // agent's keepalives and never sends its own.
+        let client_config = client::Config {
+            preferred: ed25519_only(),
+            ..Default::default()
+        };
+        let mut session = client::connect_stream(
+            Arc::new(client_config),
+            client_stream,
+            TestClient {
+                expected_server_key,
+            },
+        )
+        .await
+        .expect("connect SSH client");
+        let auth = session
+            .authenticate_publickey(
+                "revtty",
+                PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
+            )
+            .await
+            .expect("authenticate operator");
+        assert!(auth.success());
+
+        LivenessPair {
+            session,
+            server,
+            control,
+            _shutdown: shutdown,
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_session_survives_inactivity_bound_through_keepalives() {
+        let pair = connect_with_timeouts(FAST_TIMEOUTS).await;
+
+        // Five inactivity bounds without any operator traffic.
+        tokio::time::sleep(FAST_TIMEOUTS.inactivity * 5).await;
+
+        assert!(
+            !pair.server.is_finished(),
+            "agent closed a healthy idle session"
+        );
+        pair.session
+            .channel_open_session()
+            .await
+            .expect("idle session is still usable");
+        pair.server.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_transport_ends_session() {
+        let pair = connect_with_timeouts(FAST_TIMEOUTS).await;
+
+        // Nothing is read or written any more, as on a dead network path.
+        pair.control.stall();
+
+        let ended = tokio::time::timeout(FAST_TIMEOUTS.inactivity * 5, pair.server).await;
+        assert!(ended.is_ok(), "agent kept a stalled session open");
+    }
+
+    #[tokio::test]
+    async fn black_holed_transport_ends_session() {
+        let pair = connect_with_timeouts(FAST_TIMEOUTS).await;
+
+        // Writes vanish and nothing comes back: keepalives go unanswered.
+        pair.control.discard();
+
+        let ended = tokio::time::timeout(FAST_TIMEOUTS.inactivity * 5, pair.server).await;
+        assert!(ended.is_ok(), "agent kept a black-holed session open");
+    }
+
+    #[tokio::test]
+    async fn silent_peer_before_banner_is_dropped() {
+        let (_client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let shutdown = TestShutdown::new();
+        let config = server_config(ed25519_key(), FAST_TIMEOUTS);
+
+        let started = tokio::time::timeout(
+            FAST_TIMEOUTS.inactivity * 5,
+            server::run_stream(
+                Arc::new(config),
+                server_stream,
+                AgentSshHandler::new(ed25519_key().public_key().clone(), shutdown.handle()),
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(started, Ok(Err(_))),
+            "agent waited indefinitely for a peer that never sent its banner"
+        );
     }
 }

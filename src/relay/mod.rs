@@ -10,6 +10,7 @@ use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use ssh_key::{Algorithm, HashAlg, PublicKey, SshSig};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -27,17 +28,39 @@ use crate::token::{SecretToken, hash_token};
 use crate::transport::valid_name;
 
 const CONTROL_QUEUE_DEPTH: usize = 16;
-const AGENT_ACCEPT_WAIT: Duration = Duration::from_secs(5);
-const SESSION_WAIT: Duration = Duration::from_secs(10);
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const OPERATOR_CHALLENGE_TTL: Duration = Duration::from_secs(30);
 const OPERATOR_SESSION_TTL: Duration = Duration::from_secs(30);
 const MAX_PENDING_OPERATOR_AUTH: usize = 4096;
 
+#[derive(Clone, Copy)]
+struct RelayTimeouts {
+    /// No frame at all from an agent's control channel for this long drops the agent; it
+    /// sends a heartbeat every 15 s, so this is three missed heartbeats.
+    agent_idle: Duration,
+    /// A newly connected agent must identify itself with `Hello` within this time.
+    agent_hello: Duration,
+    /// Writing one message to an agent's control channel.
+    control_send: Duration,
+    /// From the operator's request, including queueing the offer, until the agent decides.
+    agent_accept: Duration,
+    /// From the agent's acceptance until its data tunnel attaches.
+    data_tunnel: Duration,
+}
+
+const RELAY_TIMEOUTS: RelayTimeouts = RelayTimeouts {
+    agent_idle: Duration::from_secs(45),
+    agent_hello: Duration::from_secs(10),
+    control_send: Duration::from_secs(10),
+    agent_accept: Duration::from_secs(5),
+    data_tunnel: Duration::from_secs(10),
+};
+
 #[derive(Clone)]
 struct RelayState {
     token: Arc<str>,
     store: Store,
+    timeouts: RelayTimeouts,
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
     pending: Arc<Mutex<HashMap<String, PendingSession>>>,
     operator_challenges: Arc<Mutex<HashMap<String, OperatorChallenge>>>,
@@ -49,11 +72,18 @@ impl RelayState {
         Self {
             token: Arc::from(token),
             store,
+            timeouts: RELAY_TIMEOUTS,
             agents: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             operator_challenges: Arc::new(Mutex::new(HashMap::new())),
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    fn with_timeouts(mut self, timeouts: RelayTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 }
 
@@ -747,6 +777,17 @@ async fn session_upgrade(
 }
 
 async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
+    let timeouts = state.timeouts;
+    let (mut sender, mut receiver) = socket.split();
+
+    // Registered only after a valid `Hello`: an agent speaking another protocol version must
+    // not be reported online or offered sessions.
+    let Some((agent_version, active_sessions, max_sessions)) =
+        receive_agent_hello(&mut sender, &mut receiver, &name, timeouts).await
+    else {
+        return;
+    };
+
     let connection_id = Uuid::new_v4();
     let (control_tx, mut control_rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
 
@@ -757,15 +798,20 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
             AgentHandle {
                 connection_id,
                 control: control_tx,
-                active_sessions: 0,
-                max_sessions: 0,
+                active_sessions,
+                max_sessions,
             },
         );
     }
 
+    if let Err(error) = state.store.mark_seen(&name, Some(&agent_version)).await {
+        eprintln!("failed to persist agent hello: {error}");
+    }
+
     eprintln!("agent online: {name}");
 
-    let (mut sender, mut receiver) = socket.split();
+    let idle = tokio::time::sleep(timeouts.agent_idle);
+    tokio::pin!(idle);
 
     loop {
         tokio::select! {
@@ -778,11 +824,24 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
                     break;
                 };
 
-                if sender.send(Message::Text(text.into())).await.is_err() {
+                let sent =
+                    tokio::time::timeout(timeouts.control_send, sender.send(Message::Text(text.into())))
+                        .await;
+                if !matches!(sent, Ok(Ok(()))) {
                     break;
                 }
             }
+            () = &mut idle => {
+                eprintln!(
+                    "agent {name} silent for {}s; dropping its control connection",
+                    timeouts.agent_idle.as_secs()
+                );
+                break;
+            }
             message = receiver.next() => {
+                idle.as_mut()
+                    .reset(tokio::time::Instant::now() + timeouts.agent_idle);
+
                 match message {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(control) = serde_json::from_str::<ControlMessage>(&text) {
@@ -875,6 +934,55 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
     }
 }
 
+/// Waits for the agent's `Hello` and validates it, returning its version and capacity.
+/// An incompatible or missing `Hello` closes the connection, with an explicit error when
+/// the agent spoke a different protocol version.
+async fn receive_agent_hello(
+    sender: &mut SplitSink<WebSocket, Message>,
+    receiver: &mut SplitStream<WebSocket>,
+    name: &str,
+    timeouts: RelayTimeouts,
+) -> Option<(String, usize, usize)> {
+    let first = match tokio::time::timeout(timeouts.agent_hello, receiver.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => text,
+        Ok(_) => return None,
+        Err(_) => {
+            eprintln!("agent {name} sent no hello; closing its control connection");
+            return None;
+        }
+    };
+
+    let rejection = match serde_json::from_str::<ControlMessage>(&first) {
+        Ok(ControlMessage::Hello {
+            version,
+            name: hello_name,
+            agent_version,
+            active_sessions,
+            max_sessions,
+        }) if version == CONTROL_PROTOCOL_VERSION && hello_name == name => {
+            return Some((agent_version, active_sessions, max_sessions));
+        }
+        Ok(ControlMessage::Hello { version, .. }) if version != CONTROL_PROTOCOL_VERSION => {
+            format!(
+                "incompatible control protocol version {version}; this relay speaks version {CONTROL_PROTOCOL_VERSION}"
+            )
+        }
+        Ok(ControlMessage::Hello { .. }) => "hello names a different agent".to_owned(),
+        _ => "expected hello as the first control message".to_owned(),
+    };
+
+    eprintln!("agent {name} rejected: {rejection}");
+    let _ = tokio::time::timeout(
+        timeouts.control_send,
+        sender.send(Message::Text(
+            format!("{SESSION_ERROR_PREFIX}{rejection}").into(),
+        )),
+    )
+    .await;
+    let _ = tokio::time::timeout(timeouts.control_send, sender.close()).await;
+    None
+}
+
 async fn record_agent_decision(
     state: &RelayState,
     agent_name: &str,
@@ -937,18 +1045,35 @@ async fn handle_operator_session(
         );
     }
 
-    if control
-        .send(kind.offer(session_id.clone(), agent_token.expose().to_owned()))
-        .await
-        .is_err()
-    {
-        state.pending.lock().await.remove(&session_id);
-        return;
+    // One deadline covers queueing the offer and the agent's decision: an agent whose
+    // control channel is not draining must not hold the operator past it.
+    let accept_deadline = tokio::time::Instant::now() + state.timeouts.agent_accept;
+    let offer = kind.offer(session_id.clone(), agent_token.expose().to_owned());
+
+    match tokio::time::timeout_at(accept_deadline, control.send(offer)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            state.pending.lock().await.remove(&session_id);
+            return;
+        }
+        Err(_) => {
+            state.pending.lock().await.remove(&session_id);
+            send_operator_session_error(
+                &mut operator_socket,
+                "agent did not accept the session before timeout",
+            )
+            .await;
+            eprintln!(
+                "{} offer could not be queued for {agent_name}: {session_id}",
+                kind.label()
+            );
+            return;
+        }
     }
 
     eprintln!("{} requested for {agent_name}: {session_id}", kind.label());
 
-    match tokio::time::timeout(AGENT_ACCEPT_WAIT, decision_rx).await {
+    match tokio::time::timeout_at(accept_deadline, decision_rx).await {
         Ok(Ok(AgentDecision::Accepted)) => {
             eprintln!("{} accepted by {agent_name}: {session_id}", kind.label());
         }
@@ -984,7 +1109,7 @@ async fn handle_operator_session(
         }
     }
 
-    match tokio::time::timeout(SESSION_WAIT, session_rx).await {
+    match tokio::time::timeout(state.timeouts.data_tunnel, session_rx).await {
         Ok(Ok(agent_socket)) => {
             state.pending.lock().await.remove(&session_id);
             eprintln!("{} paired for {agent_name}: {session_id}", kind.label());
@@ -1045,7 +1170,7 @@ async fn handle_legacy_operator_session(
         return;
     }
 
-    match tokio::time::timeout(SESSION_WAIT, session_rx).await {
+    match tokio::time::timeout(state.timeouts.data_tunnel, session_rx).await {
         Ok(Ok(agent_socket)) => {
             eprintln!(
                 "legacy {} paired for {agent_name}: {session_id}",
@@ -1064,13 +1189,13 @@ async fn send_operator_session_error(socket: &mut WebSocket, detail: &str) {
     let _ = socket.send(Message::Text(text.into())).await;
 }
 
+/// Best effort: a control channel that is full belongs to an agent that is not draining it,
+/// and the session is already abandoned on the relay side.
 async fn send_session_cancel(control: &mpsc::Sender<ControlMessage>, session_id: &str) {
-    let _ = control
-        .send(ControlMessage::SessionCancel {
-            version: CONTROL_PROTOCOL_VERSION,
-            session_id: session_id.to_owned(),
-        })
-        .await;
+    let _ = control.try_send(ControlMessage::SessionCancel {
+        version: CONTROL_PROTOCOL_VERSION,
+        session_id: session_id.to_owned(),
+    });
 }
 
 async fn attach_agent_session(socket: WebSocket, state: RelayState, session_id: String) {
@@ -1160,18 +1285,22 @@ mod tests {
         Algorithm, HashAlg as RusshHashAlg, PrivateKey, PublicKey, PublicKeyOrCertificate,
     };
     use russh::server;
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
+    use uuid::Uuid;
 
     use super::{
-        AgentDecision, PendingSession, RelayState, authorized, record_agent_decision, router,
+        AgentDecision, AgentHandle, OperatorSession, PendingSession, RelayState, RelayTimeouts,
+        authorized, record_agent_decision, router,
     };
     use crate::protocol::{
         AgentListResponse, AgentStatusResponse, CONTROL_PROTOCOL_VERSION, ControlMessage,
         EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
         OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, ProbeResult,
-        SessionRejectReason, operator_auth_message, operator_list_auth_message,
+        SESSION_ERROR_PREFIX, SessionRejectReason, operator_auth_message,
+        operator_list_auth_message,
     };
     use crate::storage::Store;
+    use crate::token::SecretToken;
     use crate::transport::{connect_websocket, websocket_byte_stream};
 
     struct TestServer {
@@ -1223,6 +1352,20 @@ mod tests {
             key: Cow::Owned(vec![Algorithm::Ed25519]),
             ..Preferred::default()
         }
+    }
+
+    /// The first control message every agent sends.
+    fn test_hello(name: &str) -> ClientMessage {
+        ClientMessage::Text(
+            serde_json::to_string(&ControlMessage::Hello {
+                version: CONTROL_PROTOCOL_VERSION,
+                name: name.to_owned(),
+                agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+                active_sessions: 0,
+                max_sessions: 4,
+            })
+            .expect("encode agent hello"),
+        )
     }
 
     #[tokio::test]
@@ -1477,7 +1620,7 @@ mod tests {
 
         let relay = format!("ws://{address}");
         let http = reqwest::Client::new();
-        let agent = connect_websocket(
+        let mut agent = connect_websocket(
             &http,
             &relay,
             "/v1/agent/signed-demo",
@@ -1485,6 +1628,10 @@ mod tests {
         )
         .await
         .expect("connect persistent agent");
+        agent
+            .send(test_hello("signed-demo"))
+            .await
+            .expect("send agent hello");
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -1747,7 +1894,7 @@ mod tests {
 
         let relay = format!("ws://{address}");
         let http = reqwest::Client::new();
-        let agent = connect_websocket(
+        let mut agent = connect_websocket(
             &http,
             &relay,
             "/v1/agent/signed-ssh",
@@ -1755,6 +1902,10 @@ mod tests {
         )
         .await
         .expect("connect persistent agent");
+        agent
+            .send(test_hello("signed-ssh"))
+            .await
+            .expect("send agent hello");
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -1928,9 +2079,13 @@ mod tests {
 
         let relay = format!("ws://{address}");
         let client = reqwest::Client::new();
-        let agent = connect_websocket(&client, &relay, "/v0/agent/demo", "secret")
+        let mut agent = connect_websocket(&client, &relay, "/v0/agent/demo", "secret")
             .await
             .expect("connect test agent");
+        agent
+            .send(test_hello("demo"))
+            .await
+            .expect("send agent hello");
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -2046,9 +2201,13 @@ mod tests {
         let client_key = ed25519_key();
         let authorized_client = client_key.public_key().clone();
 
-        let agent = connect_websocket(&http, &relay, "/v0/agent/demo", "secret")
+        let mut agent = connect_websocket(&http, &relay, "/v0/agent/demo", "secret")
             .await
             .expect("connect test agent");
+        agent
+            .send(test_hello("demo"))
+            .await
+            .expect("send agent hello");
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -2144,5 +2303,222 @@ mod tests {
         let _ = agent_task.await;
         relay_server.abort();
         let _ = relay_server.await;
+    }
+
+    const FAST_RELAY_TIMEOUTS: RelayTimeouts = RelayTimeouts {
+        agent_idle: Duration::from_millis(300),
+        agent_hello: Duration::from_millis(300),
+        control_send: Duration::from_millis(300),
+        agent_accept: Duration::from_millis(300),
+        data_tunnel: Duration::from_millis(300),
+    };
+
+    /// A relay with short timeouts on a free local port and one enrolled agent.
+    struct FastRelay {
+        state: RelayState,
+        url: String,
+        control_token: String,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    async fn fast_relay(agent: &str) -> FastRelay {
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let state =
+            RelayState::new("secret".to_owned(), store.clone()).with_timeouts(FAST_RELAY_TIMEOUTS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test relay");
+        let address = listener.local_addr().expect("test relay address");
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test relay");
+        });
+
+        let operator_key = ed25519_key()
+            .public_key()
+            .to_openssh()
+            .expect("operator key");
+        let host_key = ed25519_key().public_key().to_openssh().expect("host key");
+        let enrollment = store
+            .create_enrollment(agent, &operator_key, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        let credential = store
+            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .await
+            .expect("consume enrollment");
+
+        FastRelay {
+            state,
+            url: format!("ws://{address}"),
+            control_token: credential.control_token.expose().to_owned(),
+            server,
+        }
+    }
+
+    async fn wait_registered(state: &RelayState, name: &str, registered: bool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if state.agents.lock().await.contains_key(name) == registered {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        state.agents.lock().await.contains_key(name) == registered
+    }
+
+    #[tokio::test]
+    async fn silent_agent_is_dropped_after_idle_timeout() {
+        let relay = fast_relay("quiet-agent").await;
+        let mut agent = connect_websocket(
+            &reqwest::Client::new(),
+            &relay.url,
+            "/v1/agent/quiet-agent",
+            &relay.control_token,
+        )
+        .await
+        .expect("connect agent");
+        agent
+            .send(test_hello("quiet-agent"))
+            .await
+            .expect("send agent hello");
+        assert!(wait_registered(&relay.state, "quiet-agent", true).await);
+
+        // Still connected but sending nothing, like a host whose network vanished.
+        assert!(
+            wait_registered(&relay.state, "quiet-agent", false).await,
+            "relay kept a silent agent online"
+        );
+
+        drop(agent);
+        relay.server.abort();
+    }
+
+    #[tokio::test]
+    async fn incompatible_hello_is_rejected_explicitly() {
+        let relay = fast_relay("future-agent").await;
+        let mut agent = connect_websocket(
+            &reqwest::Client::new(),
+            &relay.url,
+            "/v1/agent/future-agent",
+            &relay.control_token,
+        )
+        .await
+        .expect("connect agent");
+        agent
+            .send(ClientMessage::Text(
+                serde_json::to_string(&ControlMessage::Hello {
+                    version: CONTROL_PROTOCOL_VERSION + 1,
+                    name: "future-agent".to_owned(),
+                    agent_version: "9.0.0".to_owned(),
+                    active_sessions: 0,
+                    max_sessions: 4,
+                })
+                .expect("encode hello"),
+            ))
+            .await
+            .expect("send agent hello");
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), agent.next())
+            .await
+            .expect("relay answers an incompatible hello");
+        let Some(Ok(ClientMessage::Text(text))) = reply else {
+            panic!("expected an error message, got {reply:?}");
+        };
+        assert!(
+            text.starts_with(SESSION_ERROR_PREFIX) && text.contains("incompatible"),
+            "unexpected rejection: {text}"
+        );
+        assert!(!relay.state.agents.lock().await.contains_key("future-agent"));
+
+        relay.server.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_without_hello_is_never_registered() {
+        let relay = fast_relay("mute-agent").await;
+        let mut agent = connect_websocket(
+            &reqwest::Client::new(),
+            &relay.url,
+            "/v1/agent/mute-agent",
+            &relay.control_token,
+        )
+        .await
+        .expect("connect agent");
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                assert!(
+                    !relay.state.agents.lock().await.contains_key("mute-agent"),
+                    "agent registered before identifying itself"
+                );
+                match agent.next().await {
+                    None | Some(Err(_)) | Some(Ok(ClientMessage::Close { .. })) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "relay kept an unidentified agent connected");
+
+        relay.server.abort();
+    }
+
+    #[tokio::test]
+    async fn offer_to_stuck_agent_times_out_within_accept_deadline() {
+        let relay = fast_relay("stuck-agent").await;
+
+        // Registered, but its control queue is full and nothing drains it.
+        let (control, _undrained) = mpsc::channel(1);
+        control
+            .try_send(ControlMessage::Heartbeat {
+                version: CONTROL_PROTOCOL_VERSION,
+                active_sessions: 0,
+            })
+            .expect("fill control queue");
+        relay.state.agents.lock().await.insert(
+            "stuck-agent".to_owned(),
+            AgentHandle {
+                connection_id: Uuid::new_v4(),
+                control,
+                active_sessions: 0,
+                max_sessions: 4,
+            },
+        );
+
+        // An operator credential as `operator_auth` issues it.
+        let session_token = SecretToken::generate("rvo").expect("operator session token");
+        relay.state.operator_sessions.lock().await.insert(
+            session_token.hash(),
+            OperatorSession {
+                agent_name: "stuck-agent".to_owned(),
+                expires_at: std::time::Instant::now() + Duration::from_secs(30),
+            },
+        );
+
+        let started = tokio::time::Instant::now();
+        let mut operator = connect_websocket(
+            &reqwest::Client::new(),
+            &relay.url,
+            "/v1/connect/stuck-agent",
+            session_token.expose(),
+        )
+        .await
+        .expect("connect operator");
+
+        let reply = tokio::time::timeout(Duration::from_secs(3), operator.next())
+            .await
+            .expect("operator was held past the acceptance deadline");
+        let Some(Ok(ClientMessage::Text(text))) = reply else {
+            panic!("expected a session error, got {reply:?}");
+        };
+        assert!(
+            text.starts_with(SESSION_ERROR_PREFIX) && text.contains("did not accept"),
+            "unexpected session error: {text}"
+        );
+        assert!(started.elapsed() < FAST_RELAY_TIMEOUTS.agent_accept + Duration::from_secs(1));
+        assert!(relay.state.pending.lock().await.is_empty());
+
+        relay.server.abort();
     }
 }

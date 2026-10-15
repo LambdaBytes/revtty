@@ -2,20 +2,24 @@ use std::borrow::Cow;
 use std::io::{self, Read};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use reqwest_websocket::WebSocket;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{Algorithm, PrivateKey, PublicKey, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect, Preferred, client};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::error::RevttyError;
-use crate::transport::websocket_byte_stream;
+use crate::transport::{SSH_TIMEOUTS, SshTimeouts, websocket_byte_stream};
 
 const STDIN_CHUNK: usize = 4096;
 const STDIN_QUEUE_DEPTH: usize = 16;
+/// Bound on key exchange plus operator authentication; russh does not bound the wait for
+/// the agent's banner on the client side.
+const SSH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct ClientHandler {
     expected_server_key: PublicKey,
@@ -90,30 +94,29 @@ fn ed25519_only() -> Preferred {
     }
 }
 
-pub async fn connect_terminal(
-    websocket: WebSocket,
-    operator_key_path: &Path,
-    encoded_host_key: &str,
-) -> Result<u32, RevttyError> {
-    let operator_key = PrivateKey::read_openssh_file(operator_key_path)
-        .map_err(|error| RevttyError::runtime("read operator SSH private key", error))?;
-    let expected_server_key = PublicKey::from_openssh(encoded_host_key)
-        .map_err(|error| RevttyError::runtime("parse pinned agent host key", error))?;
-
-    if expected_server_key.algorithm() != Algorithm::Ed25519 {
-        return Err(RevttyError::message(
-            "v1 requires an Ed25519 agent host key",
-        ));
+/// Keepalives keep an idle session open and detect an agent that disappears without
+/// closing the connection.
+fn client_config(timeouts: SshTimeouts) -> client::Config {
+    client::Config {
+        preferred: ed25519_only(),
+        keepalive_interval: Some(timeouts.keepalive_interval),
+        keepalive_max: timeouts.keepalive_max,
+        inactivity_timeout: Some(timeouts.inactivity),
+        ..Default::default()
     }
+}
 
-    let (stream, bridge_task) = websocket_byte_stream(websocket);
-
-    let result = async {
-        let config = client::Config {
-            preferred: ed25519_only(),
-            ..Default::default()
-        };
-
+async fn open_session<S>(
+    stream: S,
+    config: client::Config,
+    expected_server_key: PublicKey,
+    operator_key: PrivateKey,
+    within: Duration,
+) -> Result<client::Handle<ClientHandler>, RevttyError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let handshake = async {
         let mut session = client::connect_stream(
             Arc::new(config),
             stream,
@@ -135,6 +138,42 @@ pub async fn connect_terminal(
         if !auth.success() {
             return Err(RevttyError::message("SSH public-key authentication failed"));
         }
+
+        Ok(session)
+    };
+
+    tokio::time::timeout(within, handshake)
+        .await
+        .map_err(|_| RevttyError::message("SSH handshake with the agent timed out"))?
+}
+
+pub async fn connect_terminal(
+    websocket: WebSocket,
+    operator_key_path: &Path,
+    encoded_host_key: &str,
+) -> Result<u32, RevttyError> {
+    let operator_key = PrivateKey::read_openssh_file(operator_key_path)
+        .map_err(|error| RevttyError::runtime("read operator SSH private key", error))?;
+    let expected_server_key = PublicKey::from_openssh(encoded_host_key)
+        .map_err(|error| RevttyError::runtime("parse pinned agent host key", error))?;
+
+    if expected_server_key.algorithm() != Algorithm::Ed25519 {
+        return Err(RevttyError::message(
+            "v1 requires an Ed25519 agent host key",
+        ));
+    }
+
+    let (stream, bridge_task) = websocket_byte_stream(websocket);
+
+    let result = async {
+        let session = open_session(
+            stream,
+            client_config(SSH_TIMEOUTS),
+            expected_server_key,
+            operator_key,
+            SSH_HANDSHAKE_TIMEOUT,
+        )
+        .await?;
 
         let mut channel = session
             .channel_open_session()
@@ -251,12 +290,41 @@ mod tests {
     use russh::keys::{Algorithm, PrivateKey, PublicKey};
     use russh::{client, server};
 
-    use super::{ClientHandler, ed25519_only};
+    use std::time::Duration;
+
+    use super::{ClientHandler, client_config, ed25519_only, open_session};
+    use crate::transport::SshTimeouts;
+    use crate::transport::test_support::{ControlledStream, StreamControl};
 
     struct HandshakeOnlyServer;
 
     impl server::Handler for HandshakeOnlyServer {
         type Error = russh::Error;
+    }
+
+    /// Accepts any operator key; stands in for the agent where only liveness matters.
+    struct AcceptingServer;
+
+    impl server::Handler for AcceptingServer {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            _public_key: &PublicKey,
+        ) -> Result<server::Auth, Self::Error> {
+            Ok(server::Auth::Accept)
+        }
+    }
+
+    const FAST_TIMEOUTS: SshTimeouts = SshTimeouts {
+        keepalive_interval: Duration::from_millis(100),
+        keepalive_max: 3,
+        inactivity: Duration::from_millis(300),
+    };
+
+    fn ed25519_key() -> PrivateKey {
+        PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).expect("generate Ed25519 key")
     }
 
     #[tokio::test]
@@ -308,5 +376,75 @@ mod tests {
         drop(session);
         server_task.abort();
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn operator_session_detects_stalled_agent() {
+        let host_key = ed25519_key();
+        let expected_server_key = host_key.public_key().clone();
+        let server_config = server::Config {
+            keys: vec![host_key],
+            preferred: ed25519_only(),
+            ..Default::default()
+        };
+
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let control = StreamControl::default();
+        let client_stream = ControlledStream::new(client_stream, control.clone());
+
+        let server_task = tokio::spawn(async move {
+            if let Ok(running) =
+                server::run_stream(Arc::new(server_config), server_stream, AcceptingServer).await
+            {
+                let _ = running.await;
+            }
+        });
+
+        let session = open_session(
+            client_stream,
+            client_config(FAST_TIMEOUTS),
+            expected_server_key,
+            ed25519_key(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("open operator session");
+
+        // The agent's side goes silent and stops accepting data.
+        control.stall();
+
+        let deadline = tokio::time::Instant::now() + FAST_TIMEOUTS.inactivity * 5;
+        while !session.is_closed() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            session.is_closed(),
+            "operator session stayed open on a stalled transport"
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn handshake_times_out_when_agent_never_answers() {
+        let (client_stream, _silent_agent) = tokio::io::duplex(64 * 1024);
+
+        let opened = tokio::time::timeout(
+            Duration::from_secs(5),
+            open_session(
+                client_stream,
+                client_config(FAST_TIMEOUTS),
+                ed25519_key().public_key().clone(),
+                ed25519_key(),
+                Duration::from_millis(300),
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(opened, Ok(Err(_))),
+            "SSH handshake against a silent agent was not bounded"
+        );
     }
 }
