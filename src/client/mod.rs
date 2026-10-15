@@ -371,7 +371,11 @@ pub async fn probe(target: &str, relay: &str, host_key: Option<&str>) -> Result<
     ))
 }
 
-pub async fn connect(target: &str, relay: &str, host_key: Option<&str>) -> Result<(), RevttyError> {
+/// Exit code when the session ended without a remote exit status, as with ssh.
+const UNKNOWN_EXIT_CODE: u8 = 255;
+
+/// Returns the code `revtty connect` exits with: the remote shell's exit status.
+pub async fn connect(target: &str, relay: &str, host_key: Option<&str>) -> Result<u8, RevttyError> {
     let operator = authenticate_operator(target, relay, host_key).await?;
     let path = format!("/v1/connect/{target}");
     let websocket =
@@ -384,8 +388,16 @@ pub async fn connect(target: &str, relay: &str, host_key: Option<&str>) -> Resul
     )
     .await?;
 
-    eprintln!("\r\nconnection closed (exit {status})");
-    Ok(())
+    match status {
+        Some(status) => {
+            eprintln!("\r\nconnection closed (exit {status})");
+            Ok(u8::try_from(status).unwrap_or(u8::MAX))
+        }
+        None => {
+            eprintln!("\r\nconnection closed (exit status unknown)");
+            Ok(UNKNOWN_EXIT_CODE)
+        }
+    }
 }
 
 pub async fn doctor(relay: &str) -> Result<(), RevttyError> {

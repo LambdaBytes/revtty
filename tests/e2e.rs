@@ -400,11 +400,15 @@ fn operator_connects_to_enrolled_agent_shell() {
     terminal.wait_for("REVTTY_E2E_42", Duration::from_secs(20), &logs);
     terminal.wait_for("connection closed (exit 7)", Duration::from_secs(20), &logs);
 
-    assert!(
-        terminal.wait_exit(Duration::from_secs(5)).is_some(),
-        "revtty connect kept running after the session closed:\n{}",
-        terminal.text()
-    );
+    let status = terminal
+        .wait_exit(Duration::from_secs(5))
+        .unwrap_or_else(|| {
+            panic!(
+                "revtty connect kept running after the session closed:\n{}",
+                terminal.text()
+            )
+        });
+    assert_eq!(status.exit_code(), 7, "remote exit status not propagated");
 }
 
 fn process_alive(pid: &str) -> bool {
@@ -592,4 +596,30 @@ fn slow_interactive_host_key_confirmation_still_connects() {
     terminal.send("echo REVTTY_E2E_$((6*7)); exit 7\r");
     terminal.wait_for("REVTTY_E2E_42", Duration::from_secs(20), &logs);
     terminal.wait_for("connection closed (exit 7)", Duration::from_secs(20), &logs);
+}
+
+#[test]
+fn lost_agent_ends_session_with_unknown_exit_status() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let mut agent_process = start_agent(&root, &agent);
+
+    let mut terminal = Terminal::connect(&operator, &url, Some(&host_key));
+    terminal.wait_ready(Duration::from_secs(20), &[&relay, &agent_process]);
+
+    // The agent disappears mid-session: no exit status will ever arrive.
+    agent_process.child.kill().expect("kill agent");
+    let _ = agent_process.child.wait();
+
+    terminal.wait_for(
+        "connection closed (exit status unknown)",
+        Duration::from_secs(20),
+        &[&relay],
+    );
+    let status = terminal
+        .wait_exit(Duration::from_secs(5))
+        .expect("revtty connect exits after losing the agent");
+    assert_eq!(status.exit_code(), 255, "a lost session reported success");
 }

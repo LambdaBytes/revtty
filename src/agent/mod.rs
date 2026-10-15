@@ -312,8 +312,18 @@ async fn run_control_once(
                             )));
                         }
 
-                        let control: ControlMessage = serde_json::from_str(&text)
-                            .map_err(|error| RevttyError::runtime("decode control message", error))?;
+                        // A newer relay may send messages this agent does not know; dropping
+                        // the connection for them would only loop through reconnects.
+                        let control: ControlMessage = match serde_json::from_str(&text) {
+                            Ok(control) => control,
+                            Err(error) => {
+                                eprintln!(
+                                    "ignoring unrecognized control message ({})",
+                                    describe_undecodable(&error)
+                                );
+                                continue;
+                            }
+                        };
 
                         match control {
                             ControlMessage::ProbeOffer {
@@ -418,6 +428,17 @@ async fn run_control_once(
             }
         }
     }
+}
+
+/// Where a control message failed to decode, without any of its content: serde's own
+/// message quotes received values, which may include tunnel tokens.
+fn describe_undecodable(error: &serde_json::Error) -> String {
+    format!(
+        "{:?} error at line {}, column {}",
+        error.classify(),
+        error.line(),
+        error.column()
+    )
 }
 
 async fn reserve_session(
@@ -658,8 +679,8 @@ mod tests {
 
     use super::config::AgentConfig;
     use super::{
-        ControlTimeouts, RECONNECT_JITTER_PERCENT, ReconnectBackoff, pty_test,
-        reconnect_base_millis, reconnect_delay_millis, run_control_once, ssh,
+        ControlTimeouts, RECONNECT_JITTER_PERCENT, ReconnectBackoff, describe_undecodable,
+        pty_test, reconnect_base_millis, reconnect_delay_millis, run_control_once, ssh,
     };
     use crate::protocol::SESSION_ERROR_PREFIX;
 
@@ -674,6 +695,9 @@ mod tests {
         Silent,
         /// Answers the hello with an explicit rejection.
         Rejecting,
+        /// Sends a message type this agent does not know, keeps answering pings, then
+        /// closes the connection.
+        Extending,
     }
 
     async fn fake_relay(behaviour: FakeRelay) -> String {
@@ -687,6 +711,17 @@ mod tests {
                             "{SESSION_ERROR_PREFIX}incompatible control protocol version 1"
                         );
                         let _ = socket.send(RelayMessage::Text(rejection.into())).await;
+                    }
+                    if let FakeRelay::Extending = behaviour {
+                        let future = r#"{"type":"exec_offer","version":1,"session_id":"s"}"#;
+                        let _ = socket.send(RelayMessage::Text(future.into())).await;
+                        // Keep reading, which answers the agent's pings, for a while.
+                        let _ = tokio::time::timeout(Duration::from_millis(800), async {
+                            while socket.recv().await.is_some() {}
+                        })
+                        .await;
+                        let _ = socket.send(RelayMessage::Close(None)).await;
+                        return;
                     }
                     // Keep the connection open without ever polling it again.
                     let _socket = socket;
@@ -814,5 +849,34 @@ mod tests {
     #[test]
     fn portable_pty_smoke_test() {
         pty_test().expect("portable PTY smoke test");
+    }
+
+    #[tokio::test]
+    async fn unknown_control_message_does_not_drop_the_connection() {
+        let relay = fake_relay(FakeRelay::Extending).await;
+
+        let outcome = run_against(&relay).await;
+
+        // The relay closed the connection itself after the unknown message; the agent did
+        // not give up on it.
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "agent dropped its control connection over an unknown message: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn undecodable_control_message_is_logged_without_its_content() {
+        let message = r#"{"type":"probe_offer","version":"rvs_SECRET_MARKER","session_id":"s","tunnel_token":"t"}"#;
+        let error = serde_json::from_str::<crate::protocol::ControlMessage>(message)
+            .err()
+            .expect("message does not decode");
+
+        // serde's own message would leak the value.
+        assert!(error.to_string().contains("rvs_SECRET_MARKER"));
+        assert!(
+            !describe_undecodable(&error).contains("SECRET_MARKER"),
+            "diagnostic leaks received content"
+        );
     }
 }

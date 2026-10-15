@@ -1,8 +1,15 @@
 use crate::cli::{AgentCommand, Args, Command, RelayCommand};
 use crate::error::RevttyError;
 
-pub async fn run(args: Args) -> Result<(), RevttyError> {
-    match args.command {
+/// Runs one command and returns the process exit code.
+pub async fn run(args: Args) -> Result<u8, RevttyError> {
+    let completed = match args.command {
+        // Exits with the remote shell's status, like ssh.
+        Command::Connect {
+            target,
+            relay,
+            host_key,
+        } => return crate::client::connect(&target, &relay, host_key.as_deref()).await,
         Command::Init => crate::client::init(),
         Command::List { relay } => crate::client::list(&relay).await,
         Command::Status {
@@ -15,11 +22,6 @@ pub async fn run(args: Args) -> Result<(), RevttyError> {
             relay,
             host_key,
         } => crate::client::probe(&target, &relay, host_key.as_deref()).await,
-        Command::Connect {
-            target,
-            relay,
-            host_key,
-        } => crate::client::connect(&target, &relay, host_key.as_deref()).await,
         Command::Doctor { relay } => crate::client::doctor(&relay).await,
         Command::Agent { command } => match command {
             AgentCommand::Enroll {
@@ -44,5 +46,7 @@ pub async fn run(args: Args) -> Result<(), RevttyError> {
             RelayCommand::Serve { bind, db } => crate::relay::serve(&bind, &db).await,
             RelayCommand::Doctor { db } => crate::relay::doctor(&db).await,
         },
-    }
+    };
+
+    completed.map(|()| 0)
 }

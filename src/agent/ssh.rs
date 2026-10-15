@@ -108,6 +108,19 @@ impl AgentSshHandler {
         }
     }
 
+    /// Refuses the terminal and closes its channel, so the operator gets an answer instead of
+    /// a silent terminal.
+    fn refuse_terminal(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        session.channel_failure(channel)?;
+        session.close(channel)?;
+        self.close_shell(channel);
+        Ok(())
+    }
+
     fn close_shell(&mut self, channel: ChannelId) {
         if self
             .pending_pty
@@ -194,7 +207,7 @@ impl server::Handler for AgentSshHandler {
             }
             Err(error) => {
                 eprintln!("PTY allocation failed: {error}");
-                session.channel_failure(channel)?;
+                self.refuse_terminal(channel, session)?;
             }
         }
 
@@ -219,7 +232,7 @@ impl server::Handler for AgentSshHandler {
         let guard = match self.shutdown.guard.upgrade() {
             Some(guard) if !*self.shutdown.signal.borrow() => guard,
             _ => {
-                session.channel_failure(channel)?;
+                self.refuse_terminal(channel, session)?;
                 return Ok(());
             }
         };
@@ -235,7 +248,7 @@ impl server::Handler for AgentSshHandler {
             Ok(pty) => Arc::new(pty),
             Err(error) => {
                 eprintln!("PTY I/O setup failed: {error}");
-                session.channel_failure(channel)?;
+                self.refuse_terminal(channel, session)?;
                 return Ok(());
             }
         };
@@ -247,7 +260,7 @@ impl server::Handler for AgentSshHandler {
             Ok(child) => child,
             Err(error) => {
                 eprintln!("shell spawn failed: {error}");
-                session.channel_failure(channel)?;
+                self.refuse_terminal(channel, session)?;
                 return Ok(());
             }
         };
