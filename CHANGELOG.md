@@ -66,3 +66,5 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - Hashed revtty `known_hosts` entries were skipped, falling back to a first pin.
 - Rewriting an existing world-readable `agent.toml` kept its permissions.
 - PTY or shell failures left a silent terminal; unknown control messages dropped the agent's connection.
+- `known_hosts` was created with the default mode, so `doctor` failed after the first pin under umask 002; `relay doctor` now only warns about a group-writable database directory.
+- `probe` showed a decode error instead of the relay's reason, for example a busy agent.

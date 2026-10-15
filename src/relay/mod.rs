@@ -1496,13 +1496,16 @@ pub async fn doctor(db: &FsPath) -> Result<(), RevttyError> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| FsPath::new("."));
-    crate::config::check_not_writable_by_others(directory)?;
+    let directory_warning = crate::config::check_shared_directory(directory)?;
 
     println!("relay      ready");
     println!("protocol   v{}", crate::protocol::CONTROL_PROTOCOL_VERSION);
     println!("database   {}", db.display());
     println!("schema     v{schema}");
     println!("agents     {}", agents.len());
+    if let Some(warning) = directory_warning {
+        println!("warning    {warning}");
+    }
     Ok(())
 }
 

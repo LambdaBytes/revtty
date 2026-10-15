@@ -64,6 +64,31 @@ pub fn check_not_writable_by_others(path: &Path) -> Result<(), RevttyError> {
     Ok(())
 }
 
+/// For a directory revtty does not create, such as the one holding the relay database:
+/// world-writable fails; group-writable is returned as a warning, because with user private
+/// groups (the default on Debian and Ubuntu, with umask 002) the group is only the owner.
+pub fn check_shared_directory(path: &Path) -> Result<Option<String>, RevttyError> {
+    #[cfg(unix)]
+    {
+        let mode = file_mode(path)?;
+        if mode & 0o002 != 0 {
+            return Err(RevttyError::message(format!(
+                "{} is writable by other users (mode {mode:o}); run chmod o-w {}",
+                path.display(),
+                path.display()
+            )));
+        }
+        if mode & 0o020 != 0 {
+            return Ok(Some(format!(
+                "{} is writable by its group (mode {mode:o}); make sure only trusted accounts are in it",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Fails when another user could read `path`, which holds a credential.
 pub fn check_private_file(path: &Path) -> Result<(), RevttyError> {
     #[cfg(unix)]
@@ -112,7 +137,10 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::{check_not_writable_by_others, check_private_file, create_private_dir};
+    use super::{
+        check_not_writable_by_others, check_private_file, check_shared_directory,
+        create_private_dir,
+    };
 
     #[test]
     fn permission_checks_flag_other_users() {
@@ -138,8 +166,13 @@ mod tests {
 
         set(&root, 0o777);
         assert!(check_not_writable_by_others(&root).is_err());
+        assert!(check_shared_directory(&root).is_err());
+        set(&root, 0o775);
+        assert!(check_not_writable_by_others(&root).is_err());
+        assert!(matches!(check_shared_directory(&root), Ok(Some(_))));
         set(&root, 0o700);
         assert!(check_not_writable_by_others(&root).is_ok());
+        assert!(matches!(check_shared_directory(&root), Ok(None)));
 
         fs::remove_dir_all(root).expect("clean test directory");
     }
