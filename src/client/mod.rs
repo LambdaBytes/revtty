@@ -1,5 +1,6 @@
 mod ssh;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use futures_util::StreamExt;
@@ -44,43 +45,12 @@ pub async fn list(relay: &str) -> Result<(), RevttyError> {
         .map_err(|error| RevttyError::runtime("encode operator public key", error))?;
 
     let client = reqwest::Client::new();
-    let challenge_url = http_url(relay, "/v1/operator/list/challenge")?;
-    let challenge_response = client
-        .post(challenge_url)
-        .send()
-        .await
-        .map_err(|error| RevttyError::runtime("request operator list challenge", error))?;
-
-    let challenge_status = challenge_response.status();
-    if !challenge_status.is_success() {
-        return Err(RevttyError::message(format!(
-            "operator list challenge rejected ({challenge_status})"
-        )));
+    let mut response = request_agent_list(&client, &private_key, &operator_key, relay).await?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        // A list challenge is void once any agent is enrolled after it was issued; one
+        // fresh attempt tells that apart from a key the relay really rejects.
+        response = request_agent_list(&client, &private_key, &operator_key, relay).await?;
     }
-
-    let challenge: OperatorChallengeResponse = challenge_response
-        .json()
-        .await
-        .map_err(|error| RevttyError::runtime("decode operator list challenge", error))?;
-
-    let message = operator_list_auth_message(&challenge.challenge);
-    let signature = private_key
-        .sign(OPERATOR_AUTH_NAMESPACE, HashAlg::Sha256, message.as_bytes())
-        .map_err(|error| RevttyError::runtime("sign operator list challenge", error))?
-        .to_pem(LineEnding::LF)
-        .map_err(|error| RevttyError::runtime("encode operator list SSH signature", error))?;
-
-    let list_url = http_url(relay, "/v1/operator/list")?;
-    let response = client
-        .post(list_url)
-        .json(&OperatorListRequest {
-            operator_key,
-            challenge: challenge.challenge,
-            signature,
-        })
-        .send()
-        .await
-        .map_err(|error| RevttyError::runtime("request agent list", error))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -115,8 +85,8 @@ pub async fn list(relay: &str) -> Result<(), RevttyError> {
     Ok(())
 }
 
-pub async fn status(target: &str, relay: &str) -> Result<(), RevttyError> {
-    let operator = authenticate_operator(target, relay).await?;
+pub async fn status(target: &str, relay: &str, host_key: Option<&str>) -> Result<(), RevttyError> {
+    let operator = authenticate_operator(target, relay, host_key).await?;
     let url = http_url(relay, &format!("/v1/status/{target}"))?;
     let response = operator
         .client
@@ -162,6 +132,51 @@ pub async fn status(target: &str, relay: &str) -> Result<(), RevttyError> {
     Ok(())
 }
 
+async fn request_agent_list(
+    client: &reqwest::Client,
+    private_key: &PrivateKey,
+    operator_key: &str,
+    relay: &str,
+) -> Result<reqwest::Response, RevttyError> {
+    let challenge_url = http_url(relay, "/v1/operator/list/challenge")?;
+    let challenge_response = client
+        .post(challenge_url)
+        .send()
+        .await
+        .map_err(|error| RevttyError::runtime("request operator list challenge", error))?;
+
+    let challenge_status = challenge_response.status();
+    if !challenge_status.is_success() {
+        return Err(RevttyError::message(format!(
+            "operator list challenge rejected ({challenge_status})"
+        )));
+    }
+
+    let challenge: OperatorChallengeResponse = challenge_response
+        .json()
+        .await
+        .map_err(|error| RevttyError::runtime("decode operator list challenge", error))?;
+
+    let message = operator_list_auth_message(&challenge.challenge);
+    let signature = private_key
+        .sign(OPERATOR_AUTH_NAMESPACE, HashAlg::Sha256, message.as_bytes())
+        .map_err(|error| RevttyError::runtime("sign operator list challenge", error))?
+        .to_pem(LineEnding::LF)
+        .map_err(|error| RevttyError::runtime("encode operator list SSH signature", error))?;
+
+    let list_url = http_url(relay, "/v1/operator/list")?;
+    client
+        .post(list_url)
+        .json(&OperatorListRequest {
+            operator_key: operator_key.to_owned(),
+            challenge: challenge.challenge,
+            signature,
+        })
+        .send()
+        .await
+        .map_err(|error| RevttyError::runtime("request agent list", error))
+}
+
 fn session_capacity(status: &AgentStatusResponse) -> String {
     status.max_sessions.map_or_else(
         || "-".to_owned(),
@@ -175,9 +190,18 @@ struct AuthenticatedOperator {
     auth: OperatorAuthResponse,
 }
 
+/// How the operator approved a host key that was not pinned yet.
+enum HostKeyApproval {
+    /// `--host-key` named the fingerprint: no time passed.
+    Flag,
+    /// Answered at the terminal, which may outlast the operator credential.
+    Interactive,
+}
+
 async fn authenticate_operator(
     target: &str,
     relay: &str,
+    expected_host_key: Option<&str>,
 ) -> Result<AuthenticatedOperator, RevttyError> {
     if !valid_name(target) {
         return Err(RevttyError::message(
@@ -191,6 +215,82 @@ async fn authenticate_operator(
         .map_err(|error| RevttyError::runtime("read operator private key", error))?;
 
     let client = reqwest::Client::new();
+    let mut auth = request_operator_session(&client, &private_key, target, relay).await?;
+
+    let check = crate::identity::check_agent_host_key(&paths, relay, target, &auth.host_key)?;
+    if !check.pinned {
+        let approval = approve_host_key(target, relay, &check.fingerprint, expected_host_key)?;
+        crate::identity::pin_agent_host_key(&paths, relay, target, &auth.host_key)?;
+        eprintln!("pinned host key {}", check.fingerprint);
+
+        if let HostKeyApproval::Interactive = approval {
+            // The operator credential is short-lived and single-use; request a new one and
+            // make sure the relay still presents the key that was just approved.
+            auth = request_operator_session(&client, &private_key, target, relay).await?;
+            crate::identity::check_agent_host_key(&paths, relay, target, &auth.host_key)?;
+        }
+    }
+
+    Ok(AuthenticatedOperator {
+        client,
+        private_key_path: identity.private_key_path,
+        auth,
+    })
+}
+
+/// The relay only relays the agent's host key, so a first pin is approved by the operator,
+/// who compares the fingerprint with the one the target prints (`revtty agent status`).
+fn approve_host_key(
+    target: &str,
+    relay: &str,
+    fingerprint: &str,
+    expected: Option<&str>,
+) -> Result<HostKeyApproval, RevttyError> {
+    if let Some(expected) = expected {
+        if expected == fingerprint {
+            return Ok(HostKeyApproval::Flag);
+        }
+
+        return Err(RevttyError::message(format!(
+            "host key of {target} is {fingerprint}, not the expected {expected}; nothing was pinned"
+        )));
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return Err(RevttyError::message(format!(
+            "host key of {target} is not pinned yet (fingerprint {fingerprint}); compare it with \
+             `revtty agent status` on the target and pass --host-key {fingerprint}"
+        )));
+    }
+
+    eprint!(
+        "The host key of {target} via {relay} is not pinned yet.\n\
+         Fingerprint: {fingerprint}\n\
+         Compare it with `revtty agent status` on the target.\n\
+         Type yes or the fingerprint to pin it: "
+    );
+
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| RevttyError::runtime("read host key confirmation", error))?;
+    let answer = answer.trim();
+
+    if answer == "yes" || answer == fingerprint {
+        Ok(HostKeyApproval::Interactive)
+    } else {
+        Err(RevttyError::message(
+            "host key not confirmed; nothing was pinned",
+        ))
+    }
+}
+
+async fn request_operator_session(
+    client: &reqwest::Client,
+    private_key: &PrivateKey,
+    target: &str,
+    relay: &str,
+) -> Result<OperatorAuthResponse, RevttyError> {
     let challenge_url = http_url(relay, &format!("/v1/operator/challenge/{target}"))?;
     let challenge_response = client
         .post(challenge_url)
@@ -235,25 +335,14 @@ async fn authenticate_operator(
         )));
     }
 
-    let auth: OperatorAuthResponse = auth_response
+    auth_response
         .json()
         .await
-        .map_err(|error| RevttyError::runtime("decode operator authentication", error))?;
-
-    let host_pin = crate::identity::pin_agent_host_key(&paths, relay, target, &auth.host_key)?;
-    if host_pin.created {
-        eprintln!("pinned host key {}", host_pin.fingerprint);
-    }
-
-    Ok(AuthenticatedOperator {
-        client,
-        private_key_path: identity.private_key_path,
-        auth,
-    })
+        .map_err(|error| RevttyError::runtime("decode operator authentication", error))
 }
 
-pub async fn probe(target: &str, relay: &str) -> Result<(), RevttyError> {
-    let operator = authenticate_operator(target, relay).await?;
+pub async fn probe(target: &str, relay: &str, host_key: Option<&str>) -> Result<(), RevttyError> {
+    let operator = authenticate_operator(target, relay, host_key).await?;
     let path = format!("/v1/probe/{target}");
     let mut websocket =
         connect_websocket(&operator.client, relay, &path, &operator.auth.session_token).await?;
@@ -282,8 +371,8 @@ pub async fn probe(target: &str, relay: &str) -> Result<(), RevttyError> {
     ))
 }
 
-pub async fn connect(target: &str, relay: &str) -> Result<(), RevttyError> {
-    let operator = authenticate_operator(target, relay).await?;
+pub async fn connect(target: &str, relay: &str, host_key: Option<&str>) -> Result<(), RevttyError> {
+    let operator = authenticate_operator(target, relay, host_key).await?;
     let path = format!("/v1/connect/{target}");
     let websocket =
         connect_websocket(&operator.client, relay, &path, &operator.auth.session_token).await?;

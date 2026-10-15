@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +77,13 @@ fn write_private_file(path: &Path, content: &[u8]) -> Result<(), RevttyError> {
     let mut file = options
         .open(path)
         .map_err(|error| RevttyError::runtime("open agent configuration", error))?;
+
+    // The creation mode does not apply to an existing file; make it private before the
+    // control token is written into it.
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| RevttyError::runtime("secure agent configuration permissions", error))?;
+
     file.write_all(content)
         .map_err(|error| RevttyError::runtime("write agent configuration", error))?;
     file.sync_all()
@@ -127,6 +134,40 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+
+        fs::remove_dir_all(root).expect("clean agent config test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_a_readable_config_makes_it_private() {
+        let root = std::env::temp_dir().join(format!("revtty-agent-perms-{}", Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        fs::create_dir_all(&paths.config_dir).expect("create config directory");
+
+        // A config left world-readable, e.g. created by hand or restored from a backup.
+        let path = AgentConfig::path(&paths);
+        fs::write(&path, "stale").expect("write stale config");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("make stale config readable");
+
+        AgentConfig {
+            relay: "https://relay.example.com".to_owned(),
+            agent_id: "agent-id".to_owned(),
+            name: "store-042".to_owned(),
+            control_token: "rva_secret".to_owned(),
+            operator_key: "ssh-ed25519 AAAA".to_owned(),
+            max_sessions: 4,
+        }
+        .save(&paths)
+        .expect("save agent config");
+
+        let mode = fs::metadata(&path)
+            .expect("agent config metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "control token written to a readable file");
 
         fs::remove_dir_all(root).expect("clean agent config test directory");
     }

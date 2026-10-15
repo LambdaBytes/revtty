@@ -34,9 +34,10 @@ pub struct OperatorIdentity {
     pub created: bool,
 }
 
-pub struct HostKeyPin {
+pub struct HostKeyCheck {
     pub fingerprint: String,
-    pub created: bool,
+    /// Whether this key is already pinned for the agent on this relay.
+    pub pinned: bool,
 }
 
 pub fn ensure_agent(paths: &Paths) -> Result<AgentIdentity, RevttyError> {
@@ -113,24 +114,16 @@ pub fn ensure_operator(paths: &Paths) -> Result<OperatorIdentity, RevttyError> {
     })
 }
 
-pub fn pin_agent_host_key(
+/// Checks the relay-supplied host key of an agent against the operator's pin without ever
+/// creating one: the relay is not trusted to introduce host keys, so a first pin needs the
+/// operator's confirmation (`pin_agent_host_key`).
+pub fn check_agent_host_key(
     paths: &Paths,
     relay: &str,
     agent_name: &str,
     encoded_key: &str,
-) -> Result<HostKeyPin, RevttyError> {
-    let public_key = PublicKey::from_openssh(encoded_key)
-        .map_err(|error| RevttyError::runtime("parse enrolled agent host key", error))?;
-
-    if public_key.algorithm() != Algorithm::Ed25519 {
-        return Err(RevttyError::message(
-            "v1 requires an Ed25519 agent host key",
-        ));
-    }
-
-    fs::create_dir_all(&paths.config_dir)
-        .map_err(|error| RevttyError::runtime("create operator config directory", error))?;
-
+) -> Result<HostKeyCheck, RevttyError> {
+    let public_key = parse_agent_host_key(encoded_key)?;
     let path = paths.config_dir.join(KNOWN_HOSTS_FILE);
     let alias = known_host_alias(relay, agent_name);
     let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
@@ -138,6 +131,18 @@ pub fn pin_agent_host_key(
     if path.exists() {
         let entries = KnownHosts::read_file(&path)
             .map_err(|error| RevttyError::runtime("read revtty known_hosts", error))?;
+
+        // A hashed name could be this agent, anywhere in the file; skipping it could accept a
+        // key the hashed entry contradicts or fall back to a first pin, so fail closed.
+        if entries
+            .iter()
+            .any(|entry| matches!(entry.host_patterns(), HostPatterns::HashedName { .. }))
+        {
+            return Err(RevttyError::message(format!(
+                "{} contains hashed host names, which revtty cannot match; restore the unhashed file",
+                path.display()
+            )));
+        }
 
         for entry in entries {
             if !entry_matches_alias(&entry, &alias) {
@@ -150,10 +155,10 @@ pub fn pin_agent_host_key(
                 )));
             }
 
-            if entry.public_key() == &public_key {
-                return Ok(HostKeyPin {
+            if entry.public_key().key_data() == public_key.key_data() {
+                return Ok(HostKeyCheck {
                     fingerprint,
-                    created: false,
+                    pinned: true,
                 });
             }
 
@@ -165,28 +170,56 @@ pub fn pin_agent_host_key(
         }
     }
 
-    let public_text = public_key
+    Ok(HostKeyCheck {
+        fingerprint,
+        pinned: false,
+    })
+}
+
+/// Pins a host key the operator confirmed; a no-op when it is already pinned.
+pub fn pin_agent_host_key(
+    paths: &Paths,
+    relay: &str,
+    agent_name: &str,
+    encoded_key: &str,
+) -> Result<(), RevttyError> {
+    if check_agent_host_key(paths, relay, agent_name, encoded_key)?.pinned {
+        return Ok(());
+    }
+
+    fs::create_dir_all(&paths.config_dir)
+        .map_err(|error| RevttyError::runtime("create operator config directory", error))?;
+
+    let public_text = parse_agent_host_key(encoded_key)?
         .to_openssh()
         .map_err(|error| RevttyError::runtime("encode enrolled agent host key", error))?;
-    let line = format!("{alias} {public_text}");
+    let line = format!("{} {public_text}", known_host_alias(relay, agent_name));
     let _: KnownHostEntry = KnownHostEntry::from_str(&line)
         .map_err(|error| RevttyError::runtime("validate known_hosts entry", error))?;
 
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(paths.config_dir.join(KNOWN_HOSTS_FILE))
         .map_err(|error| RevttyError::runtime("open revtty known_hosts", error))?;
 
     writeln!(file, "{line}")
         .map_err(|error| RevttyError::runtime("write revtty known_hosts", error))?;
     file.sync_all()
-        .map_err(|error| RevttyError::runtime("sync revtty known_hosts", error))?;
+        .map_err(|error| RevttyError::runtime("sync revtty known_hosts", error))
+}
 
-    Ok(HostKeyPin {
-        fingerprint,
-        created: true,
-    })
+fn parse_agent_host_key(encoded_key: &str) -> Result<PublicKey, RevttyError> {
+    let public_key = PublicKey::from_openssh(encoded_key)
+        .map_err(|error| RevttyError::runtime("parse enrolled agent host key", error))?;
+
+    if public_key.algorithm() != Algorithm::Ed25519 {
+        return Err(RevttyError::message(
+            "v1 requires an Ed25519 agent host key",
+        ));
+    }
+
+    Ok(public_key)
 }
 
 fn known_host_alias(relay: &str, agent_name: &str) -> String {
@@ -268,7 +301,9 @@ mod tests {
     use ssh_key::{Algorithm, PrivateKey};
     use uuid::Uuid;
 
-    use super::{ensure_operator, pin_agent_host_key};
+    use std::io::Write;
+
+    use super::{check_agent_host_key, ensure_operator, pin_agent_host_key};
     use crate::config::Paths;
 
     #[test]
@@ -287,42 +322,131 @@ mod tests {
             .to_openssh()
             .expect("second agent public key");
 
-        let first = pin_agent_host_key(
+        let unknown = check_agent_host_key(
+            &paths,
+            "https://relay.example.com/",
+            "store-042",
+            &first_key,
+        )
+        .expect("check unpinned host key");
+        assert!(!unknown.pinned);
+        assert!(
+            !paths.config_dir.join("known_hosts").exists(),
+            "checking a host key must not pin it"
+        );
+
+        pin_agent_host_key(
             &paths,
             "https://relay.example.com/",
             "store-042",
             &first_key,
         )
         .expect("pin first host key");
-        assert!(first.created);
 
-        let same = pin_agent_host_key(&paths, "wss://relay.example.com", "store-042", &first_key)
+        let same = check_agent_host_key(&paths, "wss://relay.example.com", "store-042", &first_key)
             .expect("reuse same host key");
-        assert!(!same.created);
-        assert_eq!(same.fingerprint, first.fingerprint);
+        assert!(same.pinned);
+        assert_eq!(same.fingerprint, unknown.fingerprint);
 
-        let mismatch = pin_agent_host_key(
+        let mismatch = check_agent_host_key(
             &paths,
             "https://relay.example.com",
             "store-042",
             &second_key,
         );
         assert!(mismatch.is_err());
+        assert!(
+            pin_agent_host_key(
+                &paths,
+                "https://relay.example.com",
+                "store-042",
+                &second_key
+            )
+            .is_err()
+        );
 
-        let other_relay = pin_agent_host_key(
+        let other_relay = check_agent_host_key(
+            &paths,
+            "https://other-relay.example.com",
+            "store-042",
+            &second_key,
+        )
+        .expect("check same name on another relay");
+        assert!(!other_relay.pinned);
+        pin_agent_host_key(
             &paths,
             "https://other-relay.example.com",
             "store-042",
             &second_key,
         )
         .expect("pin same name on another relay");
-        assert!(other_relay.created);
 
         let known_hosts =
             fs::read_to_string(paths.config_dir.join("known_hosts")).expect("read known_hosts");
         assert_eq!(known_hosts.lines().count(), 2);
 
         fs::remove_dir_all(root).expect("clean known_hosts test directory");
+    }
+
+    #[test]
+    fn hashed_known_hosts_entries_fail_closed() {
+        let root = std::env::temp_dir().join(format!("revtty-hashed-hosts-{}", Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        fs::create_dir_all(&paths.config_dir).expect("create config directory");
+
+        let pinned_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+            .expect("pinned agent key")
+            .public_key()
+            .to_openssh()
+            .expect("pinned agent public key");
+        let other_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+            .expect("other agent key")
+            .public_key()
+            .to_openssh()
+            .expect("other agent public key");
+
+        // What `ssh-keygen -H` leaves behind: the alias replaced by a salted hash.
+        let salt = "AAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        fs::write(
+            paths.config_dir.join("known_hosts"),
+            format!("|1|{salt}|{salt} {pinned_key}\n"),
+        )
+        .expect("write hashed known_hosts");
+
+        let checked =
+            check_agent_host_key(&paths, "https://relay.example.com", "store-042", &other_key);
+        assert!(
+            checked.is_err(),
+            "a hashed entry was skipped and another host key accepted"
+        );
+
+        // A matching pin earlier in the file must not hide a later hashed entry.
+        fs::remove_file(paths.config_dir.join("known_hosts")).expect("reset known_hosts");
+        pin_agent_host_key(
+            &paths,
+            "https://relay.example.com",
+            "store-042",
+            &pinned_key,
+        )
+        .expect("pin agent host key");
+        let mut known_hosts = fs::OpenOptions::new()
+            .append(true)
+            .open(paths.config_dir.join("known_hosts"))
+            .expect("open known_hosts");
+        writeln!(known_hosts, "|1|{salt}|{salt} {other_key}").expect("append hashed entry");
+
+        assert!(
+            check_agent_host_key(
+                &paths,
+                "https://relay.example.com",
+                "store-042",
+                &pinned_key,
+            )
+            .is_err(),
+            "a hashed entry after a matching pin was not reported"
+        );
+
+        fs::remove_dir_all(root).expect("clean hashed known_hosts test directory");
     }
 
     #[test]
