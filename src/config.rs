@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 
@@ -30,6 +30,66 @@ impl Paths {
     }
 }
 
+/// Creates a revtty config or state directory, and any missing parent, private to this user:
+/// with a group-writable umask the defaults would let others replace keys or pins. Existing
+/// directories keep their mode; `doctor` reports unsafe ones.
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+
+    builder.create(path)
+}
+
+/// Fails when another user could modify `path`: replacing keys, credentials or pinned host
+/// keys would bypass revtty's checks.
+pub fn check_not_writable_by_others(path: &Path) -> Result<(), RevttyError> {
+    #[cfg(unix)]
+    {
+        let mode = file_mode(path)?;
+        if mode & 0o022 != 0 {
+            return Err(RevttyError::message(format!(
+                "{} is writable by other users (mode {mode:o}); run chmod go-w {}",
+                path.display(),
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Fails when another user could read `path`, which holds a credential.
+pub fn check_private_file(path: &Path) -> Result<(), RevttyError> {
+    #[cfg(unix)]
+    {
+        let mode = file_mode(path)?;
+        if mode & 0o077 != 0 {
+            return Err(RevttyError::message(format!(
+                "{} is accessible by other users (mode {mode:o}); run chmod 600 {}",
+                path.display(),
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_mode(path: &Path) -> Result<u32, RevttyError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+        .map_err(|error| RevttyError::runtime(&format!("inspect {}", path.display()), error))
+}
+
 fn path_override(name: &str, fallback: PathBuf) -> Result<PathBuf, RevttyError> {
     let Some(value) = std::env::var_os(name) else {
         return Ok(fallback);
@@ -43,4 +103,64 @@ fn path_override(name: &str, fallback: PathBuf) -> Result<PathBuf, RevttyError> 
     }
 
     Ok(path)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use uuid::Uuid;
+
+    use super::{check_not_writable_by_others, check_private_file, create_private_dir};
+
+    #[test]
+    fn permission_checks_flag_other_users() {
+        let root = std::env::temp_dir().join(format!("revtty-perms-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create test directory");
+        let file = root.join("credential");
+        fs::write(&file, "secret").expect("write test file");
+
+        let set = |path: &std::path::Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set mode");
+        };
+
+        set(&file, 0o600);
+        assert!(check_private_file(&file).is_ok());
+        assert!(check_not_writable_by_others(&file).is_ok());
+
+        set(&file, 0o644);
+        assert!(check_private_file(&file).is_err());
+        assert!(check_not_writable_by_others(&file).is_ok());
+
+        set(&file, 0o664);
+        assert!(check_not_writable_by_others(&file).is_err());
+
+        set(&root, 0o777);
+        assert!(check_not_writable_by_others(&root).is_err());
+        set(&root, 0o700);
+        assert!(check_not_writable_by_others(&root).is_ok());
+
+        fs::remove_dir_all(root).expect("clean test directory");
+    }
+
+    #[test]
+    fn revtty_directories_are_created_private() {
+        let root = std::env::temp_dir().join(format!("revtty-private-dir-{}", Uuid::new_v4()));
+        let nested = root.join("config").join("revtty");
+
+        create_private_dir(&nested).expect("create private directory");
+
+        for path in [&root, &root.join("config"), &nested] {
+            let mode = fs::metadata(path)
+                .expect("directory metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{} created with mode {mode:o}", path.display());
+        }
+        assert!(check_not_writable_by_others(&nested).is_ok());
+
+        fs::remove_dir_all(root).expect("clean test directory");
+    }
 }

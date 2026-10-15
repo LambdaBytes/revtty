@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -51,6 +50,25 @@ CREATE TABLE relay_meta (
 INSERT INTO relay_meta (id, enrollment_epoch) VALUES (1, 0);
 "#;
 
+/// Session audit metadata: who asked for which session and how it ended. Never terminal
+/// bytes or credentials.
+const SCHEMA_V3: &str = r#"
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY NOT NULL,
+    agent_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    operator_fingerprint TEXT NOT NULL,
+    requested_at INTEGER NOT NULL,
+    accepted_at INTEGER,
+    paired_at INTEGER,
+    ended_at INTEGER,
+    outcome TEXT
+);
+
+CREATE INDEX sessions_requested_at_idx
+    ON sessions(requested_at);
+"#;
+
 #[derive(Debug, Error)]
 enum StoreError {
     #[error(transparent)]
@@ -84,6 +102,18 @@ pub struct AgentCredential {
     pub control_token: SecretToken,
 }
 
+pub struct SessionRecord {
+    pub id: String,
+    pub agent_name: String,
+    pub kind: String,
+    pub operator_fingerprint: String,
+    pub requested_at: i64,
+    pub accepted_at: Option<i64>,
+    pub paired_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub outcome: Option<String>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AgentRecord {
     pub id: String,
@@ -97,8 +127,11 @@ pub struct AgentRecord {
 
 impl Store {
     pub async fn open(path: &Path) -> Result<Self, RevttyError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            crate::config::create_private_dir(parent)
                 .map_err(|error| RevttyError::runtime("create relay state directory", error))?;
         }
 
@@ -323,6 +356,148 @@ impl Store {
             .map_err(|error| RevttyError::runtime("get enrolled agent", error))
     }
 
+    /// `at` is when the event happened (Unix seconds); writes may run later.
+    pub async fn record_session_requested(
+        &self,
+        id: &str,
+        agent_name: &str,
+        kind: &str,
+        operator_fingerprint: &str,
+        at: i64,
+    ) -> Result<(), RevttyError> {
+        let values = (
+            id.to_owned(),
+            agent_name.to_owned(),
+            kind.to_owned(),
+            operator_fingerprint.to_owned(),
+        );
+
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO sessions (id, agent_name, kind, operator_fingerprint, requested_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![values.0, values.1, values.2, values.3, at],
+                )?;
+                Ok::<_, StoreError>(())
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("record session request", error))
+    }
+
+    pub async fn record_session_accepted(&self, id: &str, at: i64) -> Result<(), RevttyError> {
+        self.stamp_session(id, "accepted_at", at).await
+    }
+
+    pub async fn record_session_paired(&self, id: &str, at: i64) -> Result<(), RevttyError> {
+        self.stamp_session(id, "paired_at", at).await
+    }
+
+    /// Records how a session ended; only the first outcome is kept.
+    pub async fn record_session_ended(
+        &self,
+        id: &str,
+        outcome: &str,
+        at: i64,
+    ) -> Result<(), RevttyError> {
+        let id = id.to_owned();
+        let outcome = outcome.to_owned();
+
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET ended_at = ?1, outcome = ?2
+                     WHERE id = ?3 AND ended_at IS NULL",
+                    params![at, outcome, id],
+                )?;
+                Ok::<_, StoreError>(())
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("record session end", error))
+    }
+
+    /// Sessions still open belonged to a previous relay process, which took them down with
+    /// it; returns how many were closed.
+    pub async fn close_interrupted_sessions(&self) -> Result<usize, RevttyError> {
+        let now = unix_now()?;
+
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET ended_at = ?1, outcome = 'interrupted'
+                     WHERE ended_at IS NULL",
+                    params![now],
+                )
+                .map_err(StoreError::from)
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("close interrupted sessions", error))
+    }
+
+    /// Most recent sessions first.
+    pub async fn list_sessions(&self, limit: u32) -> Result<Vec<SessionRecord>, RevttyError> {
+        self.conn
+            .call(move |conn| {
+                let mut statement = conn.prepare(
+                    "SELECT id, agent_name, kind, operator_fingerprint, requested_at,
+                            accepted_at, paired_at, ended_at, outcome
+                     FROM sessions
+                     ORDER BY requested_at DESC, rowid DESC
+                     LIMIT ?1",
+                )?;
+
+                let rows = statement.query_map(params![limit], |row| {
+                    Ok(SessionRecord {
+                        id: row.get(0)?,
+                        agent_name: row.get(1)?,
+                        kind: row.get(2)?,
+                        operator_fingerprint: row.get(3)?,
+                        requested_at: row.get(4)?,
+                        accepted_at: row.get(5)?,
+                        paired_at: row.get(6)?,
+                        ended_at: row.get(7)?,
+                        outcome: row.get(8)?,
+                    })
+                })?;
+
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StoreError::from)
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("list sessions", error))
+    }
+
+    /// `column` is one of the fixed lifecycle columns, never caller input.
+    async fn stamp_session(
+        &self,
+        id: &str,
+        column: &'static str,
+        at: i64,
+    ) -> Result<(), RevttyError> {
+        let id = id.to_owned();
+
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    &format!("UPDATE sessions SET {column} = ?1 WHERE id = ?2"),
+                    params![at, id],
+                )?;
+                Ok::<_, StoreError>(())
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("record session progress", error))
+    }
+
+    pub async fn schema_version(&self) -> Result<i64, RevttyError> {
+        self.conn
+            .call(|conn| {
+                conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .map_err(StoreError::from)
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("read schema version", error))
+    }
+
     pub async fn enrollment_epoch(&self) -> Result<u64, RevttyError> {
         self.conn
             .call(|conn| read_enrollment_epoch(conn))
@@ -408,10 +583,10 @@ async fn initialize(conn: &Connection) -> Result<(), RevttyError> {
 }
 
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)])
+    Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2), M::up(SCHEMA_V3)])
 }
 
-fn unix_now() -> Result<i64, RevttyError> {
+pub fn unix_now() -> Result<i64, RevttyError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| RevttyError::runtime("read system clock", error))?;
@@ -577,5 +752,73 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[tokio::test]
+    async fn session_audit_records_event_times_once() {
+        let store = Store::open_in_memory().await.expect("open store");
+
+        store
+            .record_session_requested("s1", "store-042", "shell", "SHA256:operator", 100)
+            .await
+            .expect("record request");
+        store
+            .record_session_accepted("s1", 101)
+            .await
+            .expect("record acceptance");
+        store
+            .record_session_paired("s1", 102)
+            .await
+            .expect("record pairing");
+        store
+            .record_session_ended("s1", "completed", 160)
+            .await
+            .expect("record end");
+        // A later outcome does not overwrite the first.
+        store
+            .record_session_ended("s1", "tunnel_timeout", 999)
+            .await
+            .expect("ignore second end");
+
+        store
+            .record_session_requested("s2", "store-042", "probe", "SHA256:operator", 200)
+            .await
+            .expect("record second request");
+        assert_eq!(
+            store
+                .close_interrupted_sessions()
+                .await
+                .expect("close interrupted"),
+            1
+        );
+
+        let sessions = store.list_sessions(10).await.expect("list sessions");
+        assert_eq!(sessions.len(), 2);
+        let first = sessions
+            .iter()
+            .find(|session| session.id == "s1")
+            .expect("first session");
+        assert_eq!(first.agent_name, "store-042");
+        assert_eq!(first.kind, "shell");
+        assert_eq!(first.operator_fingerprint, "SHA256:operator");
+        // The times the events happened, whenever the writes ran.
+        assert_eq!(
+            (
+                first.requested_at,
+                first.accepted_at,
+                first.paired_at,
+                first.ended_at
+            ),
+            (100, Some(101), Some(102), Some(160))
+        );
+        assert_eq!(first.outcome.as_deref(), Some("completed"));
+        let second = sessions
+            .iter()
+            .find(|session| session.id == "s2")
+            .expect("second session");
+        assert_eq!(second.outcome.as_deref(), Some("interrupted"));
+        assert!(second.accepted_at.is_none());
+
+        assert_eq!(store.list_sessions(1).await.expect("limited list").len(), 1);
     }
 }

@@ -38,6 +38,8 @@ sudo -u "$ACCOUNT" env \
     --token <single-use-enrollment-token>
 ```
 
+`agent enroll` prints the agent's host key fingerprint (`host`). Give it to the operators: their first `status`, `probe` or `connect` pins the key with `--host-key <fingerprint>` or after confirming it interactively.
+
 Then enable the service:
 
 ```bash

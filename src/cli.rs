@@ -161,6 +161,17 @@ pub enum RelayCommand {
         db: PathBuf,
     },
 
+    /// Show recent session audit records.
+    Sessions {
+        /// Maximum number of sessions to show, most recent first.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+
+        /// Relay SQLite database path.
+        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
+        db: PathBuf,
+    },
+
     /// Run relay-specific diagnostics.
     Doctor {
         /// Relay SQLite database path.
@@ -227,6 +238,11 @@ mod tests {
             "operator.pub",
         ]);
         assert!(args.is_ok());
+    }
+
+    #[test]
+    fn parses_relay_sessions() {
+        assert!(Args::try_parse_from(["revtty", "relay", "sessions", "--limit", "5"]).is_ok());
     }
 
     #[test]

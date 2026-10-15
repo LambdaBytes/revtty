@@ -32,6 +32,7 @@ use crate::token::{SecretToken, hash_token};
 use crate::transport::valid_name;
 
 const CONTROL_QUEUE_DEPTH: usize = 16;
+const AUDIT_QUEUE_DEPTH: usize = 1024;
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const OPERATOR_CHALLENGE_TTL: Duration = Duration::from_secs(30);
 const OPERATOR_SESSION_TTL: Duration = Duration::from_secs(30);
@@ -60,9 +61,137 @@ const RELAY_TIMEOUTS: RelayTimeouts = RelayTimeouts {
     data_tunnel: Duration::from_secs(10),
 };
 
+/// A session transition and when it happened (Unix seconds): the write may run later.
+enum AuditEvent {
+    Requested {
+        id: String,
+        agent_name: String,
+        kind: &'static str,
+        operator_fingerprint: String,
+        at: i64,
+    },
+    Accepted {
+        id: String,
+        at: i64,
+    },
+    Paired {
+        id: String,
+        at: i64,
+    },
+    Ended {
+        id: String,
+        outcome: String,
+        at: i64,
+    },
+}
+
+/// Session audit records, written in order by one background task so the session path
+/// never waits on SQLite. Audit is best effort: a full queue drops a record with a warning
+/// instead of stalling sessions, and records still queued when the relay stops are lost
+/// (the next start marks those sessions interrupted).
+#[derive(Clone)]
+struct AuditLog {
+    events: mpsc::Sender<AuditEvent>,
+}
+
+impl AuditLog {
+    fn start(store: Store) -> Self {
+        let (events, mut queue) = mpsc::channel(AUDIT_QUEUE_DEPTH);
+
+        tokio::spawn(async move {
+            while let Some(event) = queue.recv().await {
+                let written = match event {
+                    AuditEvent::Requested {
+                        id,
+                        agent_name,
+                        kind,
+                        operator_fingerprint,
+                        at,
+                    } => {
+                        store
+                            .record_session_requested(
+                                &id,
+                                &agent_name,
+                                kind,
+                                &operator_fingerprint,
+                                at,
+                            )
+                            .await
+                    }
+                    AuditEvent::Accepted { id, at } => store.record_session_accepted(&id, at).await,
+                    AuditEvent::Paired { id, at } => store.record_session_paired(&id, at).await,
+                    AuditEvent::Ended { id, outcome, at } => {
+                        store.record_session_ended(&id, &outcome, at).await
+                    }
+                };
+
+                if let Err(error) = written {
+                    eprintln!("session audit write failed: {error}");
+                }
+            }
+        });
+
+        Self { events }
+    }
+
+    fn requested(
+        &self,
+        id: &str,
+        agent_name: &str,
+        kind: &'static str,
+        operator_fingerprint: &str,
+    ) {
+        self.record(|at| AuditEvent::Requested {
+            id: id.to_owned(),
+            agent_name: agent_name.to_owned(),
+            kind,
+            operator_fingerprint: operator_fingerprint.to_owned(),
+            at,
+        });
+    }
+
+    fn accepted(&self, id: &str) {
+        self.record(|at| AuditEvent::Accepted {
+            id: id.to_owned(),
+            at,
+        });
+    }
+
+    fn paired(&self, id: &str) {
+        self.record(|at| AuditEvent::Paired {
+            id: id.to_owned(),
+            at,
+        });
+    }
+
+    fn ended(&self, id: &str, outcome: &str) {
+        self.record(|at| AuditEvent::Ended {
+            id: id.to_owned(),
+            outcome: outcome.to_owned(),
+            at,
+        });
+    }
+
+    /// Stamps the event now, when it happens, and queues it.
+    fn record(&self, event: impl FnOnce(i64) -> AuditEvent) {
+        let at = match crate::storage::unix_now() {
+            Ok(at) => at,
+            Err(error) => {
+                eprintln!("session audit record dropped: {error}");
+                return;
+            }
+        };
+
+        if self.events.try_send(event(at)).is_err() {
+            eprintln!("session audit queue is full; an audit record was dropped");
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RelayState {
     store: Store,
+    audit: AuditLog,
     timeouts: RelayTimeouts,
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
     pending: Arc<Mutex<HashMap<String, PendingSession>>>,
@@ -75,6 +204,7 @@ struct RelayState {
 impl RelayState {
     fn new(store: Store) -> Result<Self, RevttyError> {
         Ok(Self {
+            audit: AuditLog::start(store.clone()),
             store,
             timeouts: RELAY_TIMEOUTS,
             agents: Arc::new(Mutex::new(HashMap::new())),
@@ -243,6 +373,8 @@ impl ChallengeSigner {
 
 struct OperatorSession {
     agent_name: String,
+    /// SHA-256 fingerprint of the operator key whose signature opened this session.
+    operator_fingerprint: String,
     expires_at: Instant,
 }
 
@@ -321,6 +453,34 @@ pub async fn list_agents(db: &FsPath) -> Result<(), RevttyError> {
     Ok(())
 }
 
+pub async fn list_sessions(db: &FsPath, limit: u32) -> Result<(), RevttyError> {
+    let store = Store::open(db).await?;
+    let sessions = store.list_sessions(limit).await?;
+
+    if sessions.is_empty() {
+        println!("No sessions recorded.");
+        return Ok(());
+    }
+
+    let time = |value: Option<i64>| value.map_or_else(|| "-".to_owned(), |value| value.to_string());
+    for session in sessions {
+        println!(
+            "{}\t{}\t{}\toperator={}\trequested={}\taccepted={}\tpaired={}\tended={}\toutcome={}",
+            session.id,
+            session.agent_name,
+            session.kind,
+            session.operator_fingerprint,
+            session.requested_at,
+            time(session.accepted_at),
+            time(session.paired_at),
+            time(session.ended_at),
+            session.outcome.as_deref().unwrap_or("-")
+        );
+    }
+
+    Ok(())
+}
+
 pub async fn serve(bind: &str, db: &FsPath) -> Result<(), RevttyError> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -332,6 +492,10 @@ pub async fn serve(bind: &str, db: &FsPath) -> Result<(), RevttyError> {
         .map_err(|error| RevttyError::runtime("read relay listen address", error))?;
 
     let store = Store::open(db).await?;
+    let interrupted = store.close_interrupted_sessions().await?;
+    if interrupted > 0 {
+        eprintln!("marked {interrupted} sessions of a previous relay process as interrupted");
+    }
     let app = router(RelayState::new(store)?);
 
     eprintln!("revtty relay listening on {address}");
@@ -350,6 +514,7 @@ fn router(state: RelayState) -> Router {
         .route("/v1/operator/challenge/{name}", post(operator_challenge))
         .route("/v1/operator/auth/{name}", post(operator_auth))
         .route("/v1/agent/{name}", get(persistent_agent_upgrade))
+        .route("/v1/agent/{name}/check", post(agent_credential_check))
         .route("/v1/status/{name}", get(operator_status))
         .route("/v1/probe/{name}", get(persistent_probe_upgrade))
         .route("/v1/connect/{name}", get(persistent_connect_upgrade))
@@ -511,6 +676,7 @@ async fn operator_auth(
         return status.into_response();
     }
 
+    let operator_fingerprint = operator_key.fingerprint(HashAlg::Sha256).to_string();
     let session_token = match SecretToken::generate("rvo") {
         Ok(token) => token,
         Err(error) => {
@@ -530,6 +696,7 @@ async fn operator_auth(
         session_token.hash(),
         OperatorSession {
             agent_name: name,
+            operator_fingerprint,
             expires_at: now + OPERATOR_SESSION_TTL,
         },
     );
@@ -641,7 +808,10 @@ async fn operator_status(
         return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
     }
 
-    if !consume_operator_session(&state, &name, &headers).await {
+    if consume_operator_session(&state, &name, &headers)
+        .await
+        .is_none()
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -703,9 +873,9 @@ async fn persistent_operator_upgrade(
         return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
     }
 
-    if !consume_operator_session(&state, &name, &headers).await {
+    let Some(session) = consume_operator_session(&state, &name, &headers).await else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
 
     let control = {
         let agents = state.agents.lock().await;
@@ -718,27 +888,33 @@ async fn persistent_operator_upgrade(
 
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_operator_session(socket, state, name, control, kind))
+        .on_upgrade(move |socket| {
+            handle_operator_session(
+                socket,
+                state,
+                name,
+                session.operator_fingerprint,
+                control,
+                kind,
+            )
+        })
         .into_response()
 }
 
+/// Spends the operator credential in `headers`, which is valid once and only for `agent_name`.
 async fn consume_operator_session(
     state: &RelayState,
     agent_name: &str,
     headers: &HeaderMap,
-) -> bool {
-    let Some(token) = bearer_token(headers) else {
-        return false;
-    };
+) -> Option<OperatorSession> {
+    let token = bearer_token(headers)?;
 
     let session = {
         let mut sessions = state.operator_sessions.lock().await;
         sessions.remove(&hash_token(token))
-    };
+    }?;
 
-    session.is_some_and(|session| {
-        session.agent_name == agent_name && session.expires_at > Instant::now()
-    })
+    (session.agent_name == agent_name && session.expires_at > Instant::now()).then_some(session)
 }
 
 async fn persistent_agent_upgrade(
@@ -773,6 +949,31 @@ async fn persistent_agent_upgrade(
         .max_frame_size(MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| handle_agent(socket, state, name))
         .into_response()
+}
+
+/// Lets `agent doctor` validate its control credential without opening a control channel,
+/// which would replace the running agent's registration.
+async fn agent_credential_check(
+    State(state): State<RelayState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !valid_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
+    }
+
+    let Some(token) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    match state.store.authenticate_agent(&name, token).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            eprintln!("agent credential check failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn persistent_session_upgrade(
@@ -1051,6 +1252,7 @@ async fn handle_operator_session(
     mut operator_socket: WebSocket,
     state: RelayState,
     agent_name: String,
+    operator_fingerprint: String,
     control: mpsc::Sender<ControlMessage>,
     kind: SessionKind,
 ) {
@@ -1078,6 +1280,13 @@ async fn handle_operator_session(
         );
     }
 
+    state.audit.requested(
+        &session_id,
+        &agent_name,
+        kind.label(),
+        &operator_fingerprint,
+    );
+
     // One deadline covers queueing the offer and the agent's decision: an agent whose
     // control channel is not draining must not hold the operator past it.
     let accept_deadline = tokio::time::Instant::now() + state.timeouts.agent_accept;
@@ -1087,10 +1296,12 @@ async fn handle_operator_session(
         Ok(Ok(())) => {}
         Ok(Err(_)) => {
             state.pending.lock().await.remove(&session_id);
+            state.audit.ended(&session_id, "agent_offline");
             return;
         }
         Err(_) => {
             state.pending.lock().await.remove(&session_id);
+            state.audit.ended(&session_id, "agent_unresponsive");
             send_operator_session_error(
                 &mut operator_socket,
                 "agent did not accept the session before timeout",
@@ -1108,10 +1319,15 @@ async fn handle_operator_session(
 
     match tokio::time::timeout_at(accept_deadline, decision_rx).await {
         Ok(Ok(AgentDecision::Accepted)) => {
+            state.audit.accepted(&session_id);
             eprintln!("{} accepted by {agent_name}: {session_id}", kind.label());
         }
         Ok(Ok(AgentDecision::Rejected(reason))) => {
             state.pending.lock().await.remove(&session_id);
+            state.audit.ended(
+                &session_id,
+                &format!("rejected:{}", reject_reason_name(reason)),
+            );
             let detail = match reason {
                 SessionRejectReason::Busy => "agent is busy",
                 SessionRejectReason::IncompatibleVersion => {
@@ -1128,6 +1344,7 @@ async fn handle_operator_session(
         }
         _ => {
             state.pending.lock().await.remove(&session_id);
+            state.audit.ended(&session_id, "accept_timeout");
             send_session_cancel(&control, &session_id).await;
             send_operator_session_error(
                 &mut operator_socket,
@@ -1145,11 +1362,14 @@ async fn handle_operator_session(
     match tokio::time::timeout(state.timeouts.data_tunnel, session_rx).await {
         Ok(Ok(agent_socket)) => {
             state.pending.lock().await.remove(&session_id);
+            state.audit.paired(&session_id);
             eprintln!("{} paired for {agent_name}: {session_id}", kind.label());
-            bridge_websockets(operator_socket, agent_socket).await;
+            let end = bridge_websockets(operator_socket, agent_socket).await;
+            state.audit.ended(&session_id, end.outcome());
         }
         _ => {
             state.pending.lock().await.remove(&session_id);
+            state.audit.ended(&session_id, "tunnel_timeout");
             send_session_cancel(&control, &session_id).await;
             send_operator_session_error(
                 &mut operator_socket,
@@ -1161,6 +1381,14 @@ async fn handle_operator_session(
                 kind.label()
             );
         }
+    }
+}
+
+fn reject_reason_name(reason: SessionRejectReason) -> &'static str {
+    match reason {
+        SessionRejectReason::Busy => "busy",
+        SessionRejectReason::IncompatibleVersion => "incompatible_version",
+        SessionRejectReason::InternalError => "internal_error",
     }
 }
 
@@ -1182,29 +1410,65 @@ async fn attach_reserved_agent_session(socket: WebSocket, sender: oneshot::Sende
     let _ = sender.send(socket);
 }
 
-async fn bridge_websockets(left: WebSocket, right: WebSocket) {
-    let (mut left_tx, mut left_rx) = left.split();
-    let (mut right_tx, mut right_rx) = right.split();
+/// How a paired tunnel ended, as far as the relay can tell without reading SSH content.
+enum TunnelEnd {
+    /// One side closed the WebSocket with a close frame.
+    Closed,
+    OperatorLost,
+    AgentLost,
+}
 
-    let left_to_right = async {
-        while let Some(Ok(message)) = left_rx.next().await {
-            if right_tx.send(message).await.is_err() {
-                break;
+impl TunnelEnd {
+    fn outcome(&self) -> &'static str {
+        match self {
+            Self::Closed => "completed",
+            Self::OperatorLost => "operator_disconnected",
+            Self::AgentLost => "agent_disconnected",
+        }
+    }
+}
+
+async fn bridge_websockets(operator: WebSocket, agent: WebSocket) -> TunnelEnd {
+    let (mut operator_tx, mut operator_rx) = operator.split();
+    let (mut agent_tx, mut agent_rx) = agent.split();
+
+    let operator_to_agent = async {
+        loop {
+            match operator_rx.next().await {
+                Some(Ok(Message::Close(frame))) => {
+                    let _ = agent_tx.send(Message::Close(frame)).await;
+                    return TunnelEnd::Closed;
+                }
+                Some(Ok(message)) => {
+                    if agent_tx.send(message).await.is_err() {
+                        return TunnelEnd::AgentLost;
+                    }
+                }
+                Some(Err(_)) | None => return TunnelEnd::OperatorLost,
             }
         }
     };
 
-    let right_to_left = async {
-        while let Some(Ok(message)) = right_rx.next().await {
-            if left_tx.send(message).await.is_err() {
-                break;
+    let agent_to_operator = async {
+        loop {
+            match agent_rx.next().await {
+                Some(Ok(Message::Close(frame))) => {
+                    let _ = operator_tx.send(Message::Close(frame)).await;
+                    return TunnelEnd::Closed;
+                }
+                Some(Ok(message)) => {
+                    if operator_tx.send(message).await.is_err() {
+                        return TunnelEnd::OperatorLost;
+                    }
+                }
+                Some(Err(_)) | None => return TunnelEnd::AgentLost,
             }
         }
     };
 
     tokio::select! {
-        _ = left_to_right => {}
-        _ = right_to_left => {}
+        end = operator_to_agent => end,
+        end = agent_to_operator => end,
     }
 }
 
@@ -1224,10 +1488,20 @@ fn public_key_fingerprint(encoded: &str) -> Result<String, RevttyError> {
 pub async fn doctor(db: &FsPath) -> Result<(), RevttyError> {
     let store = Store::open(db).await?;
     let agents = store.list_agents().await?;
+    let schema = store.schema_version().await?;
+    // Whoever can write the database, or replace it through its directory, can enroll
+    // agents and swap their keys.
+    crate::config::check_not_writable_by_others(db)?;
+    let directory = db
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| FsPath::new("."));
+    crate::config::check_not_writable_by_others(directory)?;
 
     println!("relay      ready");
     println!("protocol   v{}", crate::protocol::CONTROL_PROTOCOL_VERSION);
     println!("database   {}", db.display());
+    println!("schema     v{schema}");
     println!("agents     {}", agents.len());
     Ok(())
 }
@@ -2201,6 +2475,7 @@ mod tests {
             session_token.hash(),
             OperatorSession {
                 agent_name: "stuck-agent".to_owned(),
+                operator_fingerprint: "SHA256:stuck-operator".to_owned(),
                 expires_at: std::time::Instant::now() + Duration::from_secs(30),
             },
         );
@@ -2227,6 +2502,10 @@ mod tests {
         );
         assert!(started.elapsed() < FAST_RELAY_TIMEOUTS.agent_accept + Duration::from_secs(1));
         assert!(relay.state.pending.lock().await.is_empty());
+
+        let session = audited_outcome(&relay.state, "agent_unresponsive").await;
+        assert_eq!(session.kind, "shell");
+        assert_eq!(session.operator_fingerprint, "SHA256:stuck-operator");
 
         relay.server.abort();
     }
@@ -2504,5 +2783,234 @@ mod tests {
             Err(axum::http::StatusCode::UNAUTHORIZED),
             "an expired challenge was spent a second time"
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_session_is_audited_with_its_reason() {
+        let relay = fast_relay("busy-agent").await;
+        let mut agent = connect_websocket(
+            &reqwest::Client::new(),
+            &relay.url,
+            "/v1/agent/busy-agent",
+            &relay.control_token,
+        )
+        .await
+        .expect("connect agent");
+        agent
+            .send(test_hello("busy-agent"))
+            .await
+            .expect("send agent hello");
+        assert!(wait_registered(&relay.state, "busy-agent", true).await);
+
+        // An agent at capacity turns every offer down.
+        let agent_task = tokio::spawn(async move {
+            while let Some(Ok(message)) = agent.next().await {
+                let ClientMessage::Text(text) = message else {
+                    continue;
+                };
+                if let Ok(ControlMessage::ProbeOffer { session_id, .. }) =
+                    serde_json::from_str::<ControlMessage>(&text)
+                {
+                    let reject = ControlMessage::SessionReject {
+                        version: CONTROL_PROTOCOL_VERSION,
+                        session_id,
+                        reason: SessionRejectReason::Busy,
+                    };
+                    let encoded = serde_json::to_string(&reject).expect("encode reject");
+                    let _ = agent.send(ClientMessage::Text(encoded)).await;
+                }
+            }
+        });
+
+        let session_token = SecretToken::generate("rvo").expect("operator session token");
+        relay.state.operator_sessions.lock().await.insert(
+            session_token.hash(),
+            OperatorSession {
+                agent_name: "busy-agent".to_owned(),
+                operator_fingerprint: "SHA256:busy-operator".to_owned(),
+                expires_at: std::time::Instant::now() + Duration::from_secs(30),
+            },
+        );
+
+        let mut operator = connect_websocket(
+            &reqwest::Client::new(),
+            &relay.url,
+            "/v1/probe/busy-agent",
+            session_token.expose(),
+        )
+        .await
+        .expect("connect operator");
+        let reply = tokio::time::timeout(Duration::from_secs(3), operator.next())
+            .await
+            .expect("operator gets the rejection");
+        assert!(
+            matches!(&reply, Some(Ok(ClientMessage::Text(text))) if text.contains("agent is busy")),
+            "unexpected reply: {reply:?}"
+        );
+
+        let session = audited_outcome(&relay.state, "rejected:busy").await;
+        assert_eq!(session.agent_name, "busy-agent");
+        assert_eq!(session.kind, "probe");
+        assert_eq!(session.operator_fingerprint, "SHA256:busy-operator");
+        assert!(session.ended_at.is_some());
+
+        agent_task.abort();
+        relay.server.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_credential_check_validates_without_registering() {
+        let relay = fast_relay("checked-agent").await;
+        let http = reqwest::Client::new();
+        let url = format!(
+            "{}/v1/agent/checked-agent/check",
+            relay.url.replacen("ws://", "http://", 1)
+        );
+
+        let valid = http
+            .post(&url)
+            .bearer_auth(&relay.control_token)
+            .send()
+            .await
+            .expect("check valid credential");
+        assert_eq!(valid.status(), reqwest::StatusCode::NO_CONTENT);
+
+        let invalid = http
+            .post(&url)
+            .bearer_auth("rva_not-the-token")
+            .send()
+            .await
+            .expect("check invalid credential");
+        assert_eq!(invalid.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        assert!(
+            relay.state.agents.lock().await.is_empty(),
+            "a credential check registered the agent"
+        );
+        relay.server.abort();
+    }
+
+    /// The single audited session once it reaches `outcome`; audit writes are asynchronous.
+    async fn audited_outcome(state: &RelayState, outcome: &str) -> crate::storage::SessionRecord {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let mut sessions = state.store.list_sessions(10).await.expect("list sessions");
+            if sessions.len() == 1 && sessions[0].outcome.as_deref() == Some(outcome) {
+                return sessions.remove(0);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected one session with outcome {outcome:?}, got {:?}",
+                sessions
+                    .iter()
+                    .map(|session| session.outcome.clone())
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Pairs an operator probe with a fake agent tunnel, then ends the tunnel from the agent
+    /// side either cleanly or by dropping the connection.
+    async fn pair_and_end_tunnel(clean: bool) -> crate::storage::SessionRecord {
+        let relay = fast_relay("tunnel-agent").await;
+        let http = reqwest::Client::new();
+        let mut agent = connect_websocket(
+            &http,
+            &relay.url,
+            "/v1/agent/tunnel-agent",
+            &relay.control_token,
+        )
+        .await
+        .expect("connect agent");
+        agent
+            .send(test_hello("tunnel-agent"))
+            .await
+            .expect("send agent hello");
+        assert!(wait_registered(&relay.state, "tunnel-agent", true).await);
+
+        let tunnel_relay = relay.url.clone();
+        let agent_task = tokio::spawn(async move {
+            while let Some(Ok(message)) = agent.next().await {
+                let ClientMessage::Text(text) = message else {
+                    continue;
+                };
+                let Ok(ControlMessage::ProbeOffer {
+                    session_id,
+                    tunnel_token,
+                    ..
+                }) = serde_json::from_str::<ControlMessage>(&text)
+                else {
+                    continue;
+                };
+                let accept = ControlMessage::SessionAccept {
+                    version: CONTROL_PROTOCOL_VERSION,
+                    session_id: session_id.clone(),
+                };
+                let _ = agent
+                    .send(ClientMessage::Text(
+                        serde_json::to_string(&accept).expect("encode accept"),
+                    ))
+                    .await;
+
+                let tunnel = connect_websocket(
+                    &reqwest::Client::new(),
+                    &tunnel_relay,
+                    &format!("/v1/session/{session_id}"),
+                    &tunnel_token,
+                )
+                .await
+                .expect("open agent tunnel");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if clean {
+                    let _ = tunnel
+                        .close(reqwest_websocket::CloseCode::Normal, None)
+                        .await;
+                } else {
+                    drop(tunnel);
+                }
+            }
+        });
+
+        let session_token = SecretToken::generate("rvo").expect("operator session token");
+        relay.state.operator_sessions.lock().await.insert(
+            session_token.hash(),
+            OperatorSession {
+                agent_name: "tunnel-agent".to_owned(),
+                operator_fingerprint: "SHA256:tunnel-operator".to_owned(),
+                expires_at: std::time::Instant::now() + Duration::from_secs(30),
+            },
+        );
+        let mut operator = connect_websocket(
+            &http,
+            &relay.url,
+            "/v1/probe/tunnel-agent",
+            session_token.expose(),
+        )
+        .await
+        .expect("connect operator");
+        let _ = tokio::time::timeout(Duration::from_secs(3), operator.next()).await;
+
+        let outcome = if clean {
+            "completed"
+        } else {
+            "agent_disconnected"
+        };
+        let session = audited_outcome(&relay.state, outcome).await;
+        agent_task.abort();
+        relay.server.abort();
+        session
+    }
+
+    #[tokio::test]
+    async fn abruptly_cut_tunnel_is_not_audited_as_completed() {
+        let session = pair_and_end_tunnel(false).await;
+        assert!(session.paired_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn cleanly_closed_tunnel_is_audited_as_completed() {
+        let session = pair_and_end_tunnel(true).await;
+        assert!(session.paired_at.is_some());
     }
 }

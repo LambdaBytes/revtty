@@ -19,7 +19,11 @@ impl TempRoot {
     fn new() -> Self {
         let path =
             std::env::temp_dir().join(format!("revtty-e2e-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&path).expect("create e2e root");
+        // Private like a real deployment: the doctors reject state other users could modify.
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&path).expect("create e2e root");
         Self(path)
     }
 
@@ -409,6 +413,31 @@ fn operator_connects_to_enrolled_agent_shell() {
             )
         });
     assert_eq!(status.exit_code(), 7, "remote exit status not propagated");
+
+    // The relay audited who opened the shell and how it ended.
+    let operator_fingerprint = field(&operator.run(&["init"]), "fingerprint").to_owned();
+    let db = root.path("relay.db");
+    let db = db.to_str().expect("utf-8 path");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let audited = loop {
+        let sessions = relay_role.run(&["relay", "sessions", "--db", db]);
+        let shell = sessions
+            .lines()
+            .find(|line| line.contains("\tshell\t"))
+            .map(str::to_owned);
+        if let Some(line) = shell.filter(|line| line.contains("outcome=completed")) {
+            break line;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shell session not audited as completed:\n{sessions}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        audited.contains(&format!("operator={operator_fingerprint}")),
+        "audit record lacks the operator fingerprint: {audited}"
+    );
 }
 
 fn process_alive(pid: &str) -> bool {
@@ -622,4 +651,67 @@ fn lost_agent_ends_session_with_unknown_exit_status() {
         .wait_exit(Duration::from_secs(5))
         .expect("revtty connect exits after losing the agent");
     assert_eq!(status.exit_code(), 255, "a lost session reported success");
+}
+
+#[test]
+fn doctors_check_authentication_permissions_and_tls() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let _agent_process = start_agent(&root, &agent);
+
+    let operator_doctor = operator.run(&["doctor", "--relay", &url]);
+    assert!(
+        operator_doctor.contains("auth       ok (1 agents enrolled for this key)"),
+        "operator doctor did not prove authentication:\n{operator_doctor}"
+    );
+
+    let agent_doctor = agent.run(&["agent", "doctor"]);
+    assert!(
+        agent_doctor.contains("credential accepted by the relay"),
+        "agent doctor did not check its credential:\n{agent_doctor}"
+    );
+
+    let db = root.path("relay.db");
+    let relay_doctor =
+        relay_role.run(&["relay", "doctor", "--db", db.to_str().expect("utf-8 path")]);
+    assert!(
+        relay_doctor.contains("schema     v3"),
+        "unexpected relay doctor output:\n{relay_doctor}"
+    );
+
+    // A control credential readable by other users, or a relay database others could
+    // replace through its directory, is reported.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o777))
+            .expect("open up the relay directory");
+        let replaceable =
+            relay_role.run_failing(&["relay", "doctor", "--db", db.to_str().expect("utf-8 path")]);
+        assert!(
+            replaceable.contains("writable by other users"),
+            "writable relay directory not reported:\\n{replaceable}"
+        );
+        std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o700))
+            .expect("restore the relay directory");
+
+        let config = agent.config.join("agent.toml");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644))
+            .expect("make agent config readable");
+        let exposed = agent.run_failing(&["agent", "doctor"]);
+        assert!(
+            exposed.contains("accessible by other users"),
+            "readable agent config not reported:\n{exposed}"
+        );
+    }
+
+    // Speaking TLS to a plain-HTTP relay fails with the TLS cause, not just "request failed".
+    let tls = operator.run_failing(&["doctor", "--relay", &url.replacen("http://", "https://", 1)]);
+    assert!(
+        tls.contains("corrupt message") || tls.contains("InvalidContentType"),
+        "TLS failure cause not shown:\n{tls}"
+    );
 }

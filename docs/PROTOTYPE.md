@@ -20,7 +20,7 @@ That transport proof is now implemented together with the first authenticated SS
 - automatic reconnect after control-channel loss with bounded exponential backoff, jitter and a 30-second cap;
 - SSHSIG operator challenge/response authentication;
 - short-lived, single-use operator session credentials;
-- agent host-key pinning;
+- agent host-key pinning; a first pin needs the operator's confirmation (`--host-key` or an interactive prompt);
 - operator `list` scoped to the authenticated operator key;
 - operator `status <name>` with persisted presence metadata;
 - operator `probe <name>`;
@@ -38,9 +38,16 @@ That transport proof is now implemented together with the first authenticated SS
 - live active-session/capacity reporting in operator discovery/status;
 - explicit incompatible-offer-version rejection;
 - operator-visible pre-SSH errors for rejection and rendezvous timeout;
-- operator/agent relay-reachability diagnostics and relay SQLite diagnostics;
+- operator, agent and relay doctors: relay reachability with TLS causes, signed operator authentication, agent credential validation, file and directory permissions, relay schema version;
 - systemd template service with an explicit OS account, restart-on-failure and journald logging;
 - bounded relay/control and PTY I/O queues;
+- SSH keepalives and inactivity bounds on both ends: idle sessions stay open, sessions on a dead path end and release their capacity slot;
+- relay expiry of silent agent control channels, and agent reconnection when the relay goes silent;
+- agent registration only after a valid `Hello`, with an explicit rejection of other protocol versions;
+- stateless HMAC operator challenges bound to their scope and expiry; single use is recorded only for enrolled operators, and `list` challenges are bound to the enrollment epoch;
+- non-blocking PTY I/O with one supervisor per shell: no input is injected on disconnect, shells are reaped (SIGHUP, then SIGKILL), every PTY descriptor is released, and the agent finishes these teardowns before it exits;
+- persistent session audit metadata (`relay sessions`);
+- `connect` exits with the remote shell's status, or 255 when none arrived;
 - WebSocket frame/message limits;
 - Linux and macOS CI.
 
@@ -57,7 +64,7 @@ The current flow is:
 3. the agent enrolls its persistent Ed25519 host key and receives a separate long-lived control credential;
 4. the operator authenticates to the target using an OpenSSH SSHSIG challenge;
 5. the relay returns a short-lived operator session credential and the enrolled host key;
-6. the client pins/verifies that host key;
+6. the client verifies that host key against its pin; a first pin needs the operator's confirmation of the fingerprint the target prints, so the relay cannot introduce a host key;
 7. each rendezvous creates a new one-time agent tunnel credential;
 8. SSH authenticates the operator public key again at the agent and encrypts the terminal payload end to end.
 
@@ -65,9 +72,9 @@ Machine discovery uses a separate one-time SSHSIG challenge. The operator suppli
 
 The long-lived agent control credential is explicitly rejected on the `/v1/session` data path, and the per-session agent credential is consumed at most once.
 
-This is still pre-v1 security. Rotation, multi-operator revocation, service hardening, rate limiting and the complete fault/threat-model validation remain release work.
+Challenges are stateless HMAC tokens bound to their scope and expiry, so issuing one keeps no relay state and does not reveal whether an agent exists. A `list` challenge is also bound to the enrollment epoch, which voids it once any agent is enrolled after it was issued.
 
-The legacy `/v0` transport-proof endpoints still use `REVTTY_DEV_TOKEN`; `relay serve` currently requires that value while those endpoints remain compiled in.
+This is still pre-v1 security. Rotation, multi-operator revocation, service hardening, rate limiting and the complete fault/threat-model validation remain release work.
 
 ## Local validation
 
@@ -88,7 +95,6 @@ cargo run -- relay enroll store-042 \
   --operator-key <operator-public-key> \
   --db revtty.db
 
-export REVTTY_DEV_TOKEN='replace-with-a-long-random-development-token'
 cargo run -- relay serve --db revtty.db
 ```
 
@@ -104,14 +110,17 @@ cargo run -- agent enroll \
 cargo run -- agent run
 ```
 
-The agent now loads its persisted configuration and identity; `agent run` does not take a machine name on every launch.
+The agent now loads its persisted configuration and identity; `agent run` does not take a machine name on every launch. `agent enroll` prints the agent's host key fingerprint (`host`), and `agent status` shows it again.
 
 ### 4. Operator discovery and status
 
 ```bash
 cargo run -- list --relay http://127.0.0.1:8787
-cargo run -- status store-042 --relay http://127.0.0.1:8787
+cargo run -- status store-042 --relay http://127.0.0.1:8787 \
+  --host-key <agent-host-fingerprint>
 ```
+
+The first contact with an agent pins its host key: pass the fingerprint the target printed, or confirm it at the interactive prompt. Later commands verify against the pin and fail hard if the key changes.
 
 `list` returns only machines authorized for the current operator key. `status` reports the persisted identity, online/offline state, last-seen timestamp and agent version.
 
@@ -137,7 +146,18 @@ revtty   0.1.0
 cargo run -- connect store-042 --relay http://127.0.0.1:8787
 ```
 
-The client authenticates with its operator key, verifies the enrolled host key, requests a real PTY and forwards terminal input/output through SSH. Local terminal resizes are propagated to the remote PTY.
+The client authenticates with its operator key, verifies the pinned host key, requests a real PTY and forwards terminal input/output through SSH. Local terminal resizes are propagated to the remote PTY. `connect` exits with the remote shell's status.
+
+### 7. Audit and diagnostics
+
+```bash
+cargo run -- relay sessions --db revtty.db
+cargo run -- doctor --relay http://127.0.0.1:8787
+cargo run -- agent doctor
+cargo run -- relay doctor --db revtty.db
+```
+
+`relay sessions` lists who opened which session, its kind, timestamps and outcome; terminal bytes and credentials are never recorded.
 
 ## Independent PTY validation
 
@@ -178,7 +198,6 @@ cargo run -- relay enroll store-042 \
   --operator-key <operator-public-key> \
   --db revtty.db
 
-export REVTTY_DEV_TOKEN='a-long-random-development-token'
 cargo run -- relay serve --bind 127.0.0.1:8787 --db revtty.db
 ```
 
@@ -195,7 +214,8 @@ cargo run -- agent run
 On the operator machine:
 
 ```bash
-cargo run -- probe store-042 --relay https://revtty.example.com
+cargo run -- probe store-042 --relay https://revtty.example.com \
+  --host-key <agent-host-fingerprint>
 cargo run -- connect store-042 --relay https://revtty.example.com
 ```
 
@@ -228,15 +248,20 @@ The repository currently validates these pieces on Linux and macOS:
 - Ed25519 SSH operator authentication;
 - real PTY-backed interactive shell behavior;
 - PTY resize behavior;
+- PTY input backpressure, teardown and reaping without input injection;
+- SSH keepalive and inactivity behaviour, and silent agent/relay detection;
+- Hello-gated agent registration, stateless challenges, challenge replay and enrollment-epoch binding;
+- end-to-end runs of the real binary: enrollment, first-pin confirmation, probe, interactive shell with exit status, relay restart recovery, agent loss, SIGINT teardown, doctors and session audit;
 - format, Clippy and release compilation.
+
+The PTY lifecycle, liveness, challenge and end-to-end tests added late in M1 have so far run on Linux only; gate 3 below covers macOS.
 
 ## Next validation gates
 
 The next gates for M1 are:
 
 1. run the authenticated `connect` path across a real NAT/CGNAT boundary;
-2. validate relay restart and network-loss recovery;
-3. deepen doctor checks for TLS/authentication/filesystem-permission failures;
-4. add persistent session audit metadata.
+2. exercise recovery under real network loss and NAT mapping changes; local tests cover relay restarts, silent agents and silent relays;
+3. run the macOS CI job on the current tree (`[full ci]` or a pull request).
 
 This keeps transport, identity, SSH, PTY and lifecycle failures independently observable.
