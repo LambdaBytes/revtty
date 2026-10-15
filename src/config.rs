@@ -1,3 +1,6 @@
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
@@ -44,6 +47,36 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
     }
 
     builder.create(path)
+}
+
+/// An exclusive `flock` on `path`, held until dropped; the kernel also drops it when the
+/// process dies. Lock files are never renamed or removed, so every writer locks the same file.
+pub struct ExclusiveLock {
+    _file: File,
+}
+
+impl ExclusiveLock {
+    pub fn acquire(path: &Path) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
+
+        loop {
+            // SAFETY: `file` owns a valid descriptor for the duration of the call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(Self { _file: file });
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
 }
 
 /// Fails when another user could modify `path`: replacing keys, credentials or pinned host

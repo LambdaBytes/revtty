@@ -90,6 +90,12 @@ ALTER TABLE agents ADD COLUMN operators_revision INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE agents ADD COLUMN control_connection TEXT;
 "#;
 
+/// An enrollment that re-enrolls an existing agent (`relay enroll --replace`) names the agent
+/// instance it replaces; it can be consumed only while that instance is still the agent.
+const SCHEMA_V5: &str = r#"
+ALTER TABLE enrollments ADD COLUMN replaces_agent_id TEXT;
+"#;
+
 /// Seeds `agent_operators` with each agent's enrolled key; fingerprints are computed here,
 /// which SQL cannot do.
 fn seed_agent_operators(transaction: &Transaction) -> HookResult {
@@ -139,6 +145,15 @@ enum StoreError {
 
     #[error("operator list revision is outside the supported range")]
     InvalidRevision,
+
+    #[error("agent {0} is already enrolled; use --replace to re-enroll it")]
+    AlreadyEnrolled(String),
+
+    #[error("agent {0} is not enrolled, so there is nothing to replace")]
+    NotEnrolled(String),
+
+    #[error("the agent this enrollment replaces was re-enrolled or removed after it was created")]
+    ReplacedAgentChanged,
 }
 
 #[derive(Clone)]
@@ -150,6 +165,15 @@ pub struct Enrollment {
     pub id: String,
     pub token: SecretToken,
     pub expires_at: i64,
+    /// The agent instance a `--replace` enrollment replaces once consumed.
+    pub replaces_agent_id: Option<String>,
+}
+
+/// What `remove_agent` deleted.
+pub struct RemovedAgent {
+    pub id: String,
+    /// Unused enrollments for the name, which could otherwise bring the agent back.
+    pub cancelled_enrollments: usize,
 }
 
 pub struct AgentCredential {
@@ -254,11 +278,35 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// A single-use enrollment for a new agent; the name must not be enrolled yet.
     pub async fn create_enrollment(
         &self,
         agent_name: &str,
         operator_key: &str,
         ttl: Duration,
+    ) -> Result<Enrollment, RevttyError> {
+        self.insert_enrollment(agent_name, operator_key, ttl, false)
+            .await
+    }
+
+    /// A single-use enrollment that re-enrolls the existing agent `agent_name`: consuming it
+    /// replaces that agent instance (identity, credential and operators) by a new one.
+    pub async fn create_replacement_enrollment(
+        &self,
+        agent_name: &str,
+        operator_key: &str,
+        ttl: Duration,
+    ) -> Result<Enrollment, RevttyError> {
+        self.insert_enrollment(agent_name, operator_key, ttl, true)
+            .await
+    }
+
+    async fn insert_enrollment(
+        &self,
+        agent_name: &str,
+        operator_key: &str,
+        ttl: Duration,
+        replace: bool,
     ) -> Result<Enrollment, RevttyError> {
         let id = Uuid::new_v4().simple().to_string();
         let token = SecretToken::generate("rve")?;
@@ -274,22 +322,41 @@ impl Store {
         let name = agent_name.to_owned();
         let operator_key = operator_key.to_owned();
 
-        self.conn
+        let replaces_agent_id = self
+            .conn
             .call(move |conn| {
-                conn.execute(
+                let transaction = conn.transaction()?;
+                let enrolled = transaction
+                    .query_row(
+                        "SELECT id FROM agents WHERE name = ?1",
+                        params![name],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let replaces_agent_id = match (enrolled, replace) {
+                    (None, false) => None,
+                    (Some(_), false) => return Err(StoreError::AlreadyEnrolled(name)),
+                    (None, true) => return Err(StoreError::NotEnrolled(name)),
+                    (Some(id), true) => Some(id),
+                };
+
+                transaction.execute(
                     "INSERT INTO enrollments
-                     (id, token_hash, agent_name, operator_key, created_at, expires_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (id, token_hash, agent_name, operator_key, created_at, expires_at,
+                      replaces_agent_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         insert_id,
                         token_hash,
                         name,
                         operator_key,
                         created_at,
-                        expires_at
+                        expires_at,
+                        replaces_agent_id
                     ],
                 )?;
-                Ok::<_, StoreError>(())
+                transaction.commit()?;
+                Ok::<_, StoreError>(replaces_agent_id)
             })
             .await
             .map_err(|error| RevttyError::runtime("create enrollment", error))?;
@@ -298,6 +365,7 @@ impl Store {
             id,
             token,
             expires_at,
+            replaces_agent_id,
         })
     }
 
@@ -321,15 +389,21 @@ impl Store {
             .call(move |conn| {
                 let transaction = conn.transaction()?;
 
-                let enrollment = transaction
+                let (agent_name, operator_key, replaces_agent_id) = transaction
                     .query_row(
-                        "SELECT agent_name, operator_key
+                        "SELECT agent_name, operator_key, replaces_agent_id
                          FROM enrollments
                          WHERE token_hash = ?1
                            AND used_at IS NULL
                            AND expires_at >= ?2",
                         params![enrollment_hash, now],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        },
                     )
                     .optional()?
                     .ok_or(StoreError::InvalidEnrollment)?;
@@ -347,7 +421,19 @@ impl Store {
                 }
 
                 let operator_fingerprint =
-                    operator_fingerprint(&enrollment.1).ok_or(StoreError::InvalidOperatorKey)?;
+                    operator_fingerprint(&operator_key).ok_or(StoreError::InvalidOperatorKey)?;
+
+                // The instance it replaces goes, with its credential and operators, only while
+                // it is still the agent of that name: of two replacements, the second fails.
+                if let Some(replaced) = &replaces_agent_id {
+                    let deleted = transaction.execute(
+                        "DELETE FROM agents WHERE id = ?1 AND name = ?2",
+                        params![replaced, agent_name],
+                    )?;
+                    if deleted != 1 {
+                        return Err(StoreError::ReplacedAgentChanged);
+                    }
+                }
 
                 transaction.execute(
                     "INSERT INTO agents
@@ -355,10 +441,10 @@ impl Store {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
                     params![
                         inserted_id,
-                        enrollment.0,
+                        agent_name,
                         control_hash,
                         host_key,
-                        enrollment.1,
+                        operator_key,
                         now,
                         version
                     ],
@@ -366,7 +452,7 @@ impl Store {
                 transaction.execute(
                     "INSERT INTO agent_operators (agent_id, fingerprint, public_key)
                      VALUES (?1, ?2, ?3)",
-                    params![inserted_id, operator_fingerprint, enrollment.1],
+                    params![inserted_id, operator_fingerprint, operator_key],
                 )?;
 
                 let advanced = transaction.execute(
@@ -378,7 +464,7 @@ impl Store {
                 }
 
                 transaction.commit()?;
-                Ok::<_, StoreError>(enrollment)
+                Ok::<_, StoreError>((agent_name, operator_key))
             })
             .await
             .map_err(|error| RevttyError::runtime("consume enrollment", error))?;
@@ -513,6 +599,63 @@ impl Store {
             .map_err(|error| RevttyError::runtime("store operators report", error))
     }
 
+    /// Removes the agent `agent_name` with its operators, and the unused enrollments for that
+    /// name. The session audit is kept.
+    pub async fn remove_agent(
+        &self,
+        agent_name: &str,
+    ) -> Result<Option<RemovedAgent>, RevttyError> {
+        let name = agent_name.to_owned();
+
+        self.conn
+            .call(move |conn| {
+                let transaction = conn.transaction()?;
+                let Some(id) = transaction
+                    .query_row(
+                        "SELECT id FROM agents WHERE name = ?1",
+                        params![name],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                else {
+                    return Ok(None);
+                };
+
+                transaction.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
+                let cancelled_enrollments = transaction.execute(
+                    "DELETE FROM enrollments WHERE agent_name = ?1 AND used_at IS NULL",
+                    params![name],
+                )?;
+                transaction.commit()?;
+                Ok::<_, StoreError>(Some(RemovedAgent {
+                    id,
+                    cancelled_enrollments,
+                }))
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("remove agent", error))
+    }
+
+    /// Which of `agent_ids` still name an enrolled agent instance.
+    pub async fn existing_agent_ids(
+        &self,
+        agent_ids: Vec<String>,
+    ) -> Result<std::collections::HashSet<String>, RevttyError> {
+        self.conn
+            .call(move |conn| {
+                let mut statement = conn.prepare("SELECT 1 FROM agents WHERE id = ?1")?;
+                let mut existing = std::collections::HashSet::new();
+                for id in agent_ids {
+                    if statement.exists(params![id])? {
+                        existing.insert(id);
+                    }
+                }
+                Ok::<_, StoreError>(existing)
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("look up enrolled agents", error))
+    }
+
     /// Whether agent `agent_id` still exists and lists the operator `fingerprint`.
     pub async fn operator_authorized(
         &self,
@@ -537,12 +680,14 @@ impl Store {
             .map_err(|error| RevttyError::runtime("check operator authorization", error))
     }
 
+    /// Records that agent instance `agent_id` was just seen; a replaced or removed instance
+    /// updates nothing.
     pub async fn mark_seen(
         &self,
-        agent_name: &str,
+        agent_id: &str,
         version: Option<&str>,
     ) -> Result<(), RevttyError> {
-        let name = agent_name.to_owned();
+        let agent_id = agent_id.to_owned();
         let version = version.map(str::to_owned);
         let now = unix_now()?;
 
@@ -550,8 +695,8 @@ impl Store {
             .call(move |conn| {
                 conn.execute(
                     "UPDATE agents SET last_seen = ?1, version = COALESCE(?2, version)
-                     WHERE name = ?3",
-                    params![now, version, name],
+                     WHERE id = ?3",
+                    params![now, version, agent_id],
                 )?;
                 Ok::<_, StoreError>(())
             })
@@ -793,6 +938,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V2),
         M::up(SCHEMA_V3),
         M::up_with_hook(SCHEMA_V4, seed_agent_operators),
+        M::up(SCHEMA_V5),
     ])
 }
 
@@ -881,13 +1027,13 @@ mod tests {
             .await
             .expect("create enrollment");
 
-        store
+        let credential = store
             .consume_enrollment(enrollment.token.expose(), HOST_KEY, None)
             .await
             .expect("consume enrollment");
 
         store
-            .mark_seen("demo", Some("0.2.0"))
+            .mark_seen(&credential.id, Some("0.2.0"))
             .await
             .expect("mark seen");
 
@@ -1000,7 +1146,7 @@ mod tests {
         let store = Store::open(&path)
             .await
             .expect("open and migrate v3 database");
-        assert_eq!(store.schema_version().await.expect("schema version"), 4);
+        assert_eq!(store.schema_version().await.expect("schema version"), 5);
         let fingerprint = operator_fingerprint(OPERATOR_KEY).expect("fingerprint");
         let agent = store
             .get_agent("legacy")
@@ -1128,6 +1274,165 @@ mod tests {
                 .await
                 .expect("unknown agent"),
             OperatorsReportOutcome::NotCurrent
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_enrollment_replaces_the_instance_it_was_created_for() {
+        let replacement_key = OPERATOR_KEY.replace('B', "E");
+        let store = Store::open_in_memory().await.expect("open store");
+        let enrollment = store
+            .create_enrollment("store-042", OPERATOR_KEY, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        let original = store
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None)
+            .await
+            .expect("consume enrollment");
+
+        // A plain enrollment cannot take over an enrolled name, and nothing can be replaced
+        // that is not enrolled.
+        assert!(
+            store
+                .create_enrollment("store-042", OPERATOR_KEY, Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .create_replacement_enrollment("unknown", OPERATOR_KEY, Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+
+        let first = store
+            .create_replacement_enrollment("store-042", &replacement_key, Duration::from_secs(60))
+            .await
+            .expect("create replacement");
+        assert_eq!(
+            first.replaces_agent_id.as_deref(),
+            Some(original.id.as_str())
+        );
+        let second = store
+            .create_replacement_enrollment("store-042", &replacement_key, Duration::from_secs(60))
+            .await
+            .expect("create a second replacement");
+
+        let epoch = store.enrollment_epoch().await.expect("epoch");
+        let replaced = store
+            .consume_enrollment(first.token.expose(), HOST_KEY, None)
+            .await
+            .expect("consume replacement");
+        assert_ne!(replaced.id, original.id);
+        assert_eq!(store.enrollment_epoch().await.expect("epoch"), epoch + 1);
+        // The old instance is gone, with its credential and operators.
+        assert!(
+            store
+                .authenticate_agent("store-042", original.control_token.expose())
+                .await
+                .expect("authenticate old credential")
+                .is_none()
+        );
+        let old_operator = operator_fingerprint(OPERATOR_KEY).expect("fingerprint");
+        assert!(
+            !store
+                .operator_authorized(&original.id, &old_operator)
+                .await
+                .expect("check old operator")
+        );
+        let agent = store
+            .get_agent("store-042")
+            .await
+            .expect("get agent")
+            .expect("agent exists");
+        assert_eq!(agent.id, replaced.id);
+        assert_eq!(
+            agent.operators,
+            vec![operator_fingerprint(&replacement_key).expect("fingerprint")]
+        );
+
+        // The second replacement was created for the instance that is gone.
+        assert!(
+            store
+                .consume_enrollment(second.token.expose(), HOST_KEY, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_agent("store-042")
+                .await
+                .expect("get agent")
+                .expect("agent exists")
+                .id,
+            replaced.id
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_agent_takes_its_operators_and_pending_enrollments() {
+        let store = Store::open_in_memory().await.expect("open store");
+        let enrollment = store
+            .create_enrollment("store-042", OPERATOR_KEY, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        let credential = store
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None)
+            .await
+            .expect("consume enrollment");
+        let pending = store
+            .create_replacement_enrollment("store-042", OPERATOR_KEY, Duration::from_secs(60))
+            .await
+            .expect("create replacement");
+        store
+            .record_session_requested("s1", "store-042", "shell", "SHA256:operator", 100)
+            .await
+            .expect("record session");
+
+        let removed = store
+            .remove_agent("store-042")
+            .await
+            .expect("remove agent")
+            .expect("agent was enrolled");
+        assert_eq!(removed.id, credential.id);
+        assert_eq!(removed.cancelled_enrollments, 1);
+        assert!(
+            store
+                .get_agent("store-042")
+                .await
+                .expect("get agent")
+                .is_none()
+        );
+        assert!(
+            store
+                .existing_agent_ids(vec![credential.id.clone()])
+                .await
+                .expect("look up agents")
+                .is_empty()
+        );
+        assert!(
+            !store
+                .operator_authorized(
+                    &credential.id,
+                    &operator_fingerprint(OPERATOR_KEY).expect("fingerprint")
+                )
+                .await
+                .expect("check operator")
+        );
+        assert!(
+            store
+                .consume_enrollment(pending.token.expose(), HOST_KEY, None)
+                .await
+                .is_err(),
+            "an enrollment issued before the removal brought the agent back"
+        );
+        assert_eq!(store.list_sessions(10).await.expect("audit kept").len(), 1);
+        assert!(
+            store
+                .remove_agent("store-042")
+                .await
+                .expect("remove again")
+                .is_none()
         );
     }
 

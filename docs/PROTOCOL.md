@@ -179,6 +179,7 @@ SSH performs agent host authentication and operator public-key authentication in
 - A pending agent side is paired at most once.
 - Operator and agent rendezvous credentials are distinct.
 - The relay keeps an agent's operator list only as the agent reported it on its current control connection; SSH access is decided by the agent's own list.
+- Operator session credentials, control connections and sessions belong to one enrolled agent instance; when it is removed or re-enrolled, the relay closes them within its removal sweep (5 s), data tunnels included.
 - The relay can route terminal data without understanding the SSH payload.
 - Secret-bearing control types do not derive debug formatting.
 

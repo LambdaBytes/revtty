@@ -699,7 +699,7 @@ fn doctors_check_authentication_permissions_and_tls() {
     let relay_doctor =
         relay_role.run(&["relay", "doctor", "--db", db.to_str().expect("utf-8 path")]);
     assert!(
-        relay_doctor.contains("schema     v4"),
+        relay_doctor.contains("schema     v5"),
         "unexpected relay doctor output:\n{relay_doctor}"
     );
 
@@ -862,4 +862,104 @@ fn operators_are_managed_from_a_session_and_revocation_closes_it() {
         last.contains("last operator"),
         "last operator revoked:\n{last}"
     );
+}
+
+#[test]
+fn reinstalled_agent_is_reenrolled_in_place_and_then_removed() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let old_agent = start_agent(&root, &agent);
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+
+    let db = root.path("relay.db");
+    let db = db.to_str().expect("utf-8 path");
+    let operator_key = operator.config.join("id_ed25519.pub");
+    let operator_key = operator_key.to_str().expect("utf-8 path");
+
+    // An enrolled name is not taken over by accident.
+    let refused = relay_role.run_failing(&[
+        "relay",
+        "enroll",
+        AGENT_NAME,
+        "--operator-key",
+        operator_key,
+        "--db",
+        db,
+    ]);
+    assert!(refused.contains("--replace"), "{refused}");
+
+    // The machine is reinstalled: a new agent identity takes the old one's place.
+    let reinstalled = Role::new(&root, "reinstalled");
+    let enrollment = relay_role.run(&[
+        "relay",
+        "enroll",
+        AGENT_NAME,
+        "--operator-key",
+        operator_key,
+        "--replace",
+        "--db",
+        db,
+    ]);
+    let token = field(&enrollment, "token");
+    let enrolled = reinstalled.run(&["agent", "enroll", "--relay", &url, "--token", token]);
+    let new_host_key = field(&enrolled, "host").to_owned();
+    assert_ne!(new_host_key, host_key);
+
+    // The relay closes the old agent's connection, and its credential is gone: the
+    // reconnection after that is refused.
+    relay.wait_for_log(
+        "was removed or re-enrolled; closing its control connection",
+        Duration::from_secs(10),
+    );
+    let log = old_agent.wait_for_log_count("control connection lost", 2, Duration::from_secs(20));
+    assert!(
+        log.contains("websocket upgrade failed"),
+        "old agent reconnected:\n{log}"
+    );
+    drop(old_agent);
+    let doctor = agent.run_failing(&["agent", "doctor"]);
+    assert!(
+        doctor.contains("rejected this agent's credential"),
+        "old agent's credential still accepted:\n{doctor}"
+    );
+    let new_agent = start_agent(&root, &reinstalled);
+
+    // The pin is the old machine's: a hard failure that says how to recover.
+    let mismatch = operator.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
+    assert!(
+        mismatch.contains("HOST KEY MISMATCH") && mismatch.contains("revtty forget"),
+        "{mismatch}"
+    );
+    let forgotten = operator.run(&["forget", AGENT_NAME, "--relay", &url]);
+    assert!(forgotten.contains("forgotten"), "{forgotten}");
+    let probe = operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &new_host_key,
+    ]);
+    assert!(probe.contains("status   reachable"), "{probe}");
+
+    // Removed, the agent loses its connection and is gone for its operators.
+    let removed = relay_role.run(&["relay", "remove", AGENT_NAME, "--db", db]);
+    assert!(removed.contains("removed"), "{removed}");
+    relay.wait_for_log_count(
+        "was removed or re-enrolled; closing its control connection",
+        2,
+        Duration::from_secs(10),
+    );
+    let gone = operator.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
+    assert!(gone.contains("401"), "{gone}");
+    drop(new_agent);
 }

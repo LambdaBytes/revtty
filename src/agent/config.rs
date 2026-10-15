@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -10,7 +9,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use serde::{Deserialize, Serialize};
 use ssh_key::{Algorithm, HashAlg, PublicKey};
 
-use crate::config::Paths;
+use crate::config::{ExclusiveLock, Paths};
 use crate::error::RevttyError;
 use crate::protocol::MAX_OPERATORS;
 
@@ -251,10 +250,9 @@ impl AgentConfig {
     }
 }
 
-/// Exclusive hold on the agent configuration, released when dropped (also when the process
-/// dies, since the kernel drops `flock` locks with the last descriptor).
+/// Exclusive hold on the agent configuration, released when dropped.
 struct ConfigLock {
-    _file: File,
+    _lock: ExclusiveLock,
 }
 
 impl ConfigLock {
@@ -262,24 +260,9 @@ impl ConfigLock {
         crate::config::create_private_dir(&paths.config_dir)
             .map_err(|error| RevttyError::runtime("create agent config directory", error))?;
 
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options
-            .open(paths.config_dir.join(AGENT_CONFIG_LOCK_FILE))
-            .map_err(|error| RevttyError::runtime("open agent configuration lock", error))?;
-
-        loop {
-            // SAFETY: `file` owns a valid descriptor for the duration of the call.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(Self { _file: file });
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(RevttyError::runtime("lock agent configuration", error));
-            }
-        }
+        ExclusiveLock::acquire(&paths.config_dir.join(AGENT_CONFIG_LOCK_FILE))
+            .map(|lock| Self { _lock: lock })
+            .map_err(|error| RevttyError::runtime("lock agent configuration", error))
     }
 }
 

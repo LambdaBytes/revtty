@@ -19,6 +19,9 @@ const OPERATOR_PUBLIC_KEY_FILE: &str = "id_ed25519.pub";
 const AGENT_KEY_FILE: &str = "agent_ed25519";
 const AGENT_PUBLIC_KEY_FILE: &str = "agent_ed25519.pub";
 const KNOWN_HOSTS_FILE: &str = "known_hosts";
+/// Held by every writer of `known_hosts`: `forget` rewrites the file and would otherwise drop
+/// a pin appended meanwhile.
+const KNOWN_HOSTS_LOCK_FILE: &str = "known_hosts.lock";
 
 pub struct AgentIdentity {
     pub private_key_path: PathBuf,
@@ -163,7 +166,9 @@ pub fn check_agent_host_key(
             }
 
             return Err(RevttyError::message(format!(
-                "HOST KEY MISMATCH for {agent_name}: pinned {}, received {}",
+                "HOST KEY MISMATCH for {agent_name}: pinned {}, received {}. If the machine \
+                 was reinstalled and re-enrolled, check the new fingerprint on it \
+                 (`revtty agent status`) and run `revtty forget {agent_name} --relay {relay}`",
                 entry.public_key().fingerprint(HashAlg::Sha256),
                 fingerprint
             )));
@@ -183,12 +188,13 @@ pub fn pin_agent_host_key(
     agent_name: &str,
     encoded_key: &str,
 ) -> Result<(), RevttyError> {
+    crate::config::create_private_dir(&paths.config_dir)
+        .map_err(|error| RevttyError::runtime("create operator config directory", error))?;
+    let _lock = lock_known_hosts(paths)?;
+
     if check_agent_host_key(paths, relay, agent_name, encoded_key)?.pinned {
         return Ok(());
     }
-
-    crate::config::create_private_dir(&paths.config_dir)
-        .map_err(|error| RevttyError::runtime("create operator config directory", error))?;
 
     let public_text = parse_agent_host_key(encoded_key)?
         .to_openssh()
@@ -212,6 +218,79 @@ pub fn pin_agent_host_key(
         .map_err(|error| RevttyError::runtime("write revtty known_hosts", error))?;
     file.sync_all()
         .map_err(|error| RevttyError::runtime("sync revtty known_hosts", error))
+}
+
+/// Removes the host key pinned for `agent_name` on `relay`, returning how many entries went;
+/// every other line of the file is kept as it was.
+pub fn forget_agent_host_key(
+    paths: &Paths,
+    relay: &str,
+    agent_name: &str,
+) -> Result<usize, RevttyError> {
+    let path = paths.config_dir.join(KNOWN_HOSTS_FILE);
+    if !path.exists() {
+        return Ok(0);
+    }
+    let _lock = lock_known_hosts(paths)?;
+    let content = fs::read_to_string(&path)
+        .map_err(|error| RevttyError::runtime("read revtty known_hosts", error))?;
+
+    let alias = known_host_alias(relay, agent_name);
+    let mut forgotten = 0;
+    let mut kept = String::with_capacity(content.len());
+    for line in content.lines() {
+        let Some(entry) = KnownHostEntry::from_str(line)
+            .ok()
+            .filter(|entry| entry_matches_alias(entry, &alias))
+        else {
+            kept.push_str(line);
+            kept.push('\n');
+            continue;
+        };
+
+        // Lines revtty did not write: removing them would undo more than this pin.
+        if entry.marker().is_some() {
+            return Err(RevttyError::message(format!(
+                "the host key pinned for {agent_name} is marked in {}; edit that line by hand",
+                path.display()
+            )));
+        }
+        if matches!(entry.host_patterns(), HostPatterns::Patterns(patterns) if patterns.len() > 1) {
+            return Err(RevttyError::message(format!(
+                "a line of {} pins {agent_name} together with other hosts; edit it by hand",
+                path.display()
+            )));
+        }
+        forgotten += 1;
+    }
+    if forgotten == 0 {
+        return Ok(0);
+    }
+
+    // Replaced whole, so that a crash leaves the old pins or the new ones.
+    let temp = paths.config_dir.join(".known_hosts.tmp");
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temp)
+        .map_err(|error| RevttyError::runtime("open revtty known_hosts", error))?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| RevttyError::runtime("secure revtty known_hosts", error))?;
+    file.write_all(kept.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| RevttyError::runtime("write revtty known_hosts", error))?;
+    fs::rename(&temp, &path)
+        .map_err(|error| RevttyError::runtime("replace revtty known_hosts", error))?;
+
+    Ok(forgotten)
+}
+
+fn lock_known_hosts(paths: &Paths) -> Result<crate::config::ExclusiveLock, RevttyError> {
+    crate::config::ExclusiveLock::acquire(&paths.config_dir.join(KNOWN_HOSTS_LOCK_FILE))
+        .map_err(|error| RevttyError::runtime("lock revtty known_hosts", error))
 }
 
 fn parse_agent_host_key(encoded_key: &str) -> Result<PublicKey, RevttyError> {
@@ -308,8 +387,143 @@ mod tests {
 
     use std::io::Write;
 
-    use super::{check_agent_host_key, ensure_operator, pin_agent_host_key};
+    use super::{check_agent_host_key, ensure_operator, forget_agent_host_key, pin_agent_host_key};
     use crate::config::Paths;
+
+    fn host_key() -> String {
+        PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+            .expect("agent key")
+            .public_key()
+            .to_openssh()
+            .expect("agent public key")
+    }
+
+    #[test]
+    fn forgetting_a_pin_keeps_every_other_pin() {
+        let root = std::env::temp_dir().join(format!("revtty-forget-{}", Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        let relay = "https://relay.example.com";
+        let other_relay = "https://other-relay.example.com";
+        let (old_key, new_key, neighbour_key, elsewhere_key) =
+            (host_key(), host_key(), host_key(), host_key());
+        pin_agent_host_key(&paths, relay, "store-042", &old_key).expect("pin");
+        pin_agent_host_key(&paths, relay, "store-043", &neighbour_key).expect("pin");
+        pin_agent_host_key(&paths, other_relay, "store-042", &elsewhere_key).expect("pin");
+
+        let mismatch = check_agent_host_key(&paths, relay, "store-042", &new_key)
+            .err()
+            .expect("changed host key accepted");
+        assert!(
+            mismatch.to_string().contains("revtty forget store-042"),
+            "{mismatch}"
+        );
+
+        assert_eq!(
+            forget_agent_host_key(&paths, "wss://relay.example.com/", "store-042")
+                .expect("forget pin"),
+            1
+        );
+        // The reinstalled machine's new key can now be confirmed and pinned.
+        assert!(
+            !check_agent_host_key(&paths, relay, "store-042", &new_key)
+                .expect("check new key")
+                .pinned
+        );
+        assert!(
+            check_agent_host_key(&paths, relay, "store-043", &neighbour_key)
+                .expect("check neighbour")
+                .pinned
+        );
+        assert!(
+            check_agent_host_key(&paths, other_relay, "store-042", &elsewhere_key)
+                .expect("check other relay")
+                .pinned
+        );
+        assert_eq!(
+            forget_agent_host_key(&paths, relay, "store-042").expect("forget again"),
+            0
+        );
+
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(paths.config_dir.join("known_hosts"))
+                .expect("known_hosts metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        fs::remove_dir_all(root).expect("clean forget test directory");
+    }
+
+    #[test]
+    fn forget_refuses_lines_revtty_did_not_write() {
+        let root = std::env::temp_dir().join(format!("revtty-forget-manual-{}", Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        let relay = "https://relay.example.com";
+        pin_agent_host_key(&paths, relay, "store-042", &host_key()).expect("pin");
+        pin_agent_host_key(&paths, relay, "store-043", &host_key()).expect("pin");
+        let path = paths.config_dir.join("known_hosts");
+        let pins = fs::read_to_string(&path).expect("read known_hosts");
+        let mut lines = pins.lines().map(str::to_owned).collect::<Vec<_>>();
+        let first_alias = lines[0].split(' ').next().expect("alias").to_owned();
+        let second_alias = lines[1].split(' ').next().expect("alias").to_owned();
+
+        // Both names on one line, as an operator could have merged them.
+        let merged = lines[0].replacen(&first_alias, &format!("{first_alias},{second_alias}"), 1);
+        fs::write(&path, format!("{merged}\n")).expect("write merged line");
+        assert!(forget_agent_host_key(&paths, relay, "store-042").is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            format!("{merged}\n")
+        );
+
+        // A key marked revoked stays revoked.
+        lines[0] = format!("@revoked {}", lines[0]);
+        fs::write(&path, format!("{}\n", lines[0])).expect("write revoked line");
+        assert!(forget_agent_host_key(&paths, relay, "store-042").is_err());
+        assert!(
+            fs::read_to_string(&path)
+                .expect("read")
+                .starts_with("@revoked")
+        );
+
+        fs::remove_dir_all(root).expect("clean forget test directory");
+    }
+
+    #[test]
+    fn forgetting_while_pinning_loses_no_pin() {
+        // Every write is synced to disk: enough rounds to interleave, few enough to stay fast.
+        const PINS: usize = 25;
+        let root = std::env::temp_dir().join(format!("revtty-forget-race-{}", Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        let relay = "https://relay.example.com";
+        let churned = host_key();
+        pin_agent_host_key(&paths, relay, "churned", &churned).expect("pin");
+
+        let pinner_paths = paths.clone();
+        let pinner = std::thread::spawn(move || {
+            for index in 0..PINS {
+                pin_agent_host_key(&pinner_paths, relay, &format!("agent-{index}"), &host_key())
+                    .expect("pin");
+            }
+        });
+        for _ in 0..PINS {
+            forget_agent_host_key(&paths, relay, "churned").expect("forget");
+            pin_agent_host_key(&paths, relay, "churned", &churned).expect("pin again");
+        }
+        pinner.join().expect("pinner thread");
+
+        let pins = fs::read_to_string(paths.config_dir.join("known_hosts")).expect("read");
+        assert_eq!(
+            pins.lines().count(),
+            PINS + 1,
+            "a pin written meanwhile was lost"
+        );
+
+        fs::remove_dir_all(root).expect("clean forget test directory");
+    }
 
     #[test]
     fn host_key_pinning_is_stable_and_rejects_changes() {
