@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -123,6 +124,21 @@ fn session_error_detail(text: &str) -> Option<&str> {
         .filter(|detail| !detail.is_empty())
 }
 
+/// The HTTP client for every request to the relay. Redirects are followed as reqwest does by
+/// default, except to a URL `refuse_remote_plaintext` refuses: a 307 or 308 resends the
+/// request body, which can hold a credential (the enrollment token, for one).
+pub fn relay_client() -> Result<Client, RevttyError> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(
+            |attempt| match refuse_remote_plaintext(attempt.url().as_str()) {
+                Ok(()) => reqwest::redirect::Policy::default().redirect(attempt),
+                Err(error) => attempt.error(error.to_string()),
+            },
+        ))
+        .build()
+        .map_err(|error| RevttyError::runtime("build HTTP client", error))
+}
+
 pub async fn check_relay_health(client: &Client, relay: &str) -> Result<(), RevttyError> {
     let url = http_url(relay, "/health")?;
     let response = client
@@ -181,7 +197,9 @@ pub fn http_url(relay: &str, path: &str) -> Result<String, RevttyError> {
         ));
     };
 
-    Ok(format!("{base}{path}"))
+    let url = format!("{base}{path}");
+    refuse_remote_plaintext(&url)?;
+    Ok(url)
 }
 
 pub fn websocket_url(relay: &str, path: &str) -> Result<String, RevttyError> {
@@ -202,7 +220,42 @@ pub fn websocket_url(relay: &str, path: &str) -> Result<String, RevttyError> {
         ));
     };
 
-    Ok(format!("{base}{path}"))
+    let url = format!("{base}{path}");
+    refuse_remote_plaintext(&url)?;
+    Ok(url)
+}
+
+/// Every request to the relay carries a bearer credential (enrollment, control, tunnel or
+/// operator session token) that only TLS protects; SSH covers the terminal alone. Plain
+/// http:// and ws:// are therefore accepted only for a relay on this machine.
+fn refuse_remote_plaintext(url: &str) -> Result<(), RevttyError> {
+    if !(url.starts_with("http://") || url.starts_with("ws://")) {
+        return Ok(());
+    }
+
+    // Parsed as the request will be, so that userinfo cannot pass for the host.
+    let parsed =
+        reqwest::Url::parse(url).map_err(|error| RevttyError::runtime("parse relay URL", error))?;
+    let loopback = match parsed.host_str() {
+        Some("localhost") => true,
+        // An IPv6 host keeps its brackets.
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback()),
+        None => false,
+    };
+
+    if loopback {
+        return Ok(());
+    }
+    Err(RevttyError::message(format!(
+        "refusing unencrypted relay URL {}://{}: use https:// or wss://; http:// and ws:// are \
+         only accepted for localhost, 127.0.0.0/8 or [::1]",
+        parsed.scheme(),
+        parsed.host_str().unwrap_or_default()
+    )))
 }
 
 pub fn valid_name(name: &str) -> bool {
@@ -343,6 +396,86 @@ mod tests {
             websocket_url("http://127.0.0.1:8787", "/health").unwrap(),
             "ws://127.0.0.1:8787/health"
         );
+    }
+
+    #[test]
+    fn refuses_unencrypted_relays_off_loopback() {
+        for relay in [
+            "http://relay.example.com",
+            "ws://203.0.113.10:8787",
+            "http://10.0.0.5:8787/",
+            // The host is what follows the userinfo.
+            "http://127.0.0.1@relay.example.com",
+            "http://localhost.example.com",
+        ] {
+            let error = http_url(relay, "/health").expect_err(relay).to_string();
+            assert!(error.contains("https://"), "{relay}: {error}");
+            assert!(websocket_url(relay, "/v1/agent/demo").is_err(), "{relay}");
+        }
+    }
+
+    #[test]
+    fn accepts_unencrypted_relays_on_loopback() {
+        for relay in [
+            "http://127.0.0.1:8787",
+            "ws://127.0.0.2:8787",
+            "http://localhost:8787",
+            "ws://LOCALHOST",
+            "http://[::1]:8787",
+        ] {
+            assert!(http_url(relay, "/health").is_ok(), "{relay}");
+            assert!(websocket_url(relay, "/v1/agent/demo").is_ok(), "{relay}");
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_client_follows_redirects_except_to_unencrypted_remote_relays() {
+        use axum::http::StatusCode;
+        use axum::http::header::LOCATION;
+        use axum::routing::post;
+
+        let app = axum::Router::new()
+            .route(
+                "/to-remote",
+                post(|| async {
+                    // `.invalid` never resolves: nothing leaves this machine either way.
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(LOCATION, "http://relay.invalid:8787/v1/enroll")],
+                    )
+                }),
+            )
+            .route(
+                "/to-loopback",
+                post(|| async { (StatusCode::PERMANENT_REDIRECT, [(LOCATION, "/landed")]) }),
+            )
+            .route("/landed", post(|| async { StatusCode::NO_CONTENT }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirecting relay");
+        let address = listener.local_addr().expect("redirecting relay address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve redirecting relay");
+        });
+        let client = super::relay_client().expect("relay client");
+
+        let refused = client
+            .post(format!("http://{address}/to-remote"))
+            .json(&"rve_secret")
+            .send()
+            .await
+            .expect_err("followed a redirect to a remote plain-HTTP relay");
+        assert!(refused.is_redirect(), "{refused:?}");
+
+        let followed = client
+            .post(format!("http://{address}/to-loopback"))
+            .json(&"body")
+            .send()
+            .await
+            .expect("follow a redirect on loopback");
+        assert_eq!(followed.status(), reqwest::StatusCode::NO_CONTENT);
     }
 
     #[test]

@@ -55,6 +55,7 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - `agent.toml` holds `operators` and `operators_revision` instead of `operator_key` (older files still load) and is replaced atomically under a lock.
 - `relay agents` shows each agent's `operators=` fingerprints; operator session credentials are checked against the agent's current operators when used.
 - `relay enroll` refuses a name that is already enrolled unless `--replace` is given.
+- Operator and agent commands refuse a plain `http://` or `ws://` relay URL unless its host is `localhost`, `127.0.0.0/8` or `[::1]`, and do not follow a relay's redirect to one, since enrollment, control and session credentials would cross the network unencrypted. An agent enrolled with such a URL stops at `agent run`; change `relay` in its `agent.toml` to the `https://` URL.
 
 ### Removed
 

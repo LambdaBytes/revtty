@@ -29,7 +29,7 @@ use crate::protocol::{
     ProbeResult, SESSION_ERROR_PREFIX, SessionRejectReason,
 };
 use crate::token::SecretToken;
-use crate::transport::{check_relay_health, connect_websocket, http_url, valid_name};
+use crate::transport::{check_relay_health, connect_websocket, http_url, relay_client, valid_name};
 
 const RECONNECT_BASE_MILLIS: u64 = 1_000;
 const RECONNECT_CAP_MILLIS: u64 = 30_000;
@@ -120,7 +120,7 @@ pub async fn enroll(relay: &str, token: &str, max_sessions: usize) -> Result<(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
     };
 
-    let response = reqwest::Client::new()
+    let response = relay_client()?
         .post(url)
         .json(&request)
         .send()
@@ -196,12 +196,20 @@ pub async fn run() -> Result<(), RevttyError> {
             "stored agent name is invalid; re-enroll this agent",
         ));
     }
+    // A relay URL this version refuses, such as plain HTTP to another host enrolled by an
+    // earlier one, fails on every retry: stop instead of reconnecting forever.
+    http_url(&config.relay, "/").map_err(|error| {
+        RevttyError::message(format!(
+            "relay in {}: {error}",
+            AgentConfig::path(&paths).display()
+        ))
+    })?;
 
     let allowlist = watch_operators(
         paths.clone(),
         OperatorAllowlist::parse(config.operators_revision, &config.operators)?,
     );
-    let client = reqwest::Client::new();
+    let client = relay_client()?;
     let mut backoff = ReconnectBackoff::default();
     let session_slots = Arc::new(Semaphore::new(config.max_sessions));
     let session_tasks: SessionTasks = Arc::new(Mutex::new(HashMap::new()));
@@ -753,7 +761,7 @@ pub fn status() -> Result<(), RevttyError> {
 
 pub async fn rotate_credential() -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
-    match rotate_control_credential(&reqwest::Client::new(), &paths).await? {
+    match rotate_control_credential(&relay_client()?, &paths).await? {
         Rotation::Rotated => {
             println!("credential rotated; the relay no longer accepts the previous one");
             Ok(())
@@ -1046,7 +1054,7 @@ pub async fn doctor() -> Result<(), RevttyError> {
         ));
     }
 
-    let client = reqwest::Client::new();
+    let client = relay_client()?;
     check_relay_health(&client, &config.relay).await?;
     check_agent_credential(&client, &config).await?;
 
