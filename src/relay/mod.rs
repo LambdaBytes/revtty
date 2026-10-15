@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path as FsPath;
 use std::sync::Arc;
@@ -51,6 +51,9 @@ struct RelayTimeouts {
     agent_accept: Duration,
     /// From the agent's acceptance until its data tunnel attaches.
     data_tunnel: Duration,
+    /// How often the relay checks that the agents it serves are still enrolled, closing the
+    /// connections of removed or re-enrolled ones.
+    removal_sweep: Duration,
 }
 
 const RELAY_TIMEOUTS: RelayTimeouts = RelayTimeouts {
@@ -59,6 +62,7 @@ const RELAY_TIMEOUTS: RelayTimeouts = RelayTimeouts {
     control_send: Duration::from_secs(10),
     agent_accept: Duration::from_secs(5),
     data_tunnel: Duration::from_secs(10),
+    removal_sweep: Duration::from_secs(5),
 };
 
 /// A session transition and when it happened (Unix seconds): the write may run later.
@@ -199,6 +203,8 @@ struct RelayState {
     /// Challenges already spent by an enrolled operator, until they expire.
     spent_challenges: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
     operator_sessions: Arc<Mutex<HashMap<[u8; 32], OperatorSession>>>,
+    /// Operator sessions from their request until they end, pending or paired.
+    live_sessions: Arc<Mutex<HashMap<String, LiveSession>>>,
 }
 
 impl RelayState {
@@ -212,6 +218,7 @@ impl RelayState {
             challenges: Arc::new(ChallengeSigner::new()?),
             spent_challenges: Arc::new(Mutex::new(HashMap::new())),
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
+            live_sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -222,12 +229,23 @@ impl RelayState {
     }
 }
 
-#[derive(Clone)]
 struct AgentHandle {
+    /// The enrolled agent instance this connection authenticated as.
+    agent_id: String,
     connection_id: Uuid,
     control: mpsc::Sender<ControlMessage>,
     active_sessions: usize,
     max_sessions: usize,
+    /// Dropped when this registration is removed or replaced, which ends the connection's
+    /// control loop even while operator sessions still hold `control`.
+    _registration: oneshot::Sender<()>,
+}
+
+/// An operator session, from its request until it ends, and how to end it early when its
+/// agent instance is removed or re-enrolled.
+struct LiveSession {
+    agent_id: String,
+    cancel: oneshot::Sender<()>,
 }
 
 struct PendingSession {
@@ -393,6 +411,7 @@ pub async fn create_enrollment(
     name: &str,
     operator_key_path: &FsPath,
     ttl_secs: u64,
+    replace: bool,
 ) -> Result<(), RevttyError> {
     if !valid_name(name) {
         return Err(RevttyError::message(
@@ -415,14 +434,40 @@ pub async fn create_enrollment(
         .to_openssh()
         .map_err(|error| RevttyError::runtime("encode operator public key", error))?;
     let store = Store::open(db).await?;
-    let enrollment = store
-        .create_enrollment(name, &operator_key, Duration::from_secs(ttl_secs))
-        .await?;
+    let ttl = Duration::from_secs(ttl_secs);
+    let enrollment = if replace {
+        store
+            .create_replacement_enrollment(name, &operator_key, ttl)
+            .await?
+    } else {
+        store.create_enrollment(name, &operator_key, ttl).await?
+    };
 
     println!("enrollment {}", enrollment.id);
     println!("target     {name}");
+    if let Some(replaced) = &enrollment.replaces_agent_id {
+        println!("replaces   {replaced}");
+    }
     println!("expires    {}", enrollment.expires_at);
     println!("token      {}", enrollment.token.expose());
+    Ok(())
+}
+
+pub async fn remove_agent(db: &FsPath, name: &str) -> Result<(), RevttyError> {
+    let store = Store::open(db).await?;
+    let Some(removed) = store.remove_agent(name).await? else {
+        return Err(RevttyError::message(format!(
+            "agent {name} is not enrolled"
+        )));
+    };
+
+    println!("removed    {name}");
+    println!("id         {}", removed.id);
+    println!("enrollments cancelled {}", removed.cancelled_enrollments);
+    println!(
+        "A running relay closes its connections within {}s.",
+        RELAY_TIMEOUTS.removal_sweep.as_secs()
+    );
     Ok(())
 }
 
@@ -497,7 +542,9 @@ pub async fn serve(bind: &str, db: &FsPath) -> Result<(), RevttyError> {
     if interrupted > 0 {
         eprintln!("marked {interrupted} sessions of a previous relay process as interrupted");
     }
-    let app = router(RelayState::new(store)?);
+    let state = RelayState::new(store)?;
+    spawn_removal_sweep(state.clone());
+    let app = router(state);
 
     eprintln!("revtty relay listening on {address}");
 
@@ -763,8 +810,13 @@ async fn operator_list(
     let runtime = {
         let connected = state.agents.lock().await;
         connected
-            .iter()
-            .map(|(name, agent)| (name.clone(), (agent.active_sessions, agent.max_sessions)))
+            .values()
+            .map(|agent| {
+                (
+                    agent.agent_id.clone(),
+                    (agent.active_sessions, agent.max_sessions),
+                )
+            })
             .collect::<HashMap<_, _>>()
     };
 
@@ -774,7 +826,7 @@ async fn operator_list(
             continue;
         }
 
-        let live = runtime.get(&agent.name).copied();
+        let live = runtime.get(&agent.id).copied();
 
         visible.push(AgentStatusResponse {
             id: agent.id,
@@ -808,14 +860,16 @@ async fn operator_status(
         return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
     }
 
-    if consume_operator_session(&state, &name, &headers)
-        .await
-        .is_none()
-    {
+    let Some(session) = consume_operator_session(&state, &name, &headers).await else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
 
     let agent = match state.store.get_agent(&name).await {
+        // Re-enrolled since the credential was checked: another instance, which this
+        // operator may not be authorized for.
+        Ok(Some(agent)) if agent.id != session.agent_id => {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
         Ok(Some(agent)) => agent,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -828,7 +882,8 @@ async fn operator_status(
         let agents = state.agents.lock().await;
         agents
             .get(&name)
-            .map(|agent| (agent.active_sessions, agent.max_sessions))
+            .filter(|connected| connected.agent_id == agent.id)
+            .map(|connected| (connected.active_sessions, connected.max_sessions))
     };
 
     Json(AgentStatusResponse {
@@ -879,7 +934,10 @@ async fn persistent_operator_upgrade(
 
     let control = {
         let agents = state.agents.lock().await;
-        agents.get(&name).map(|agent| agent.control.clone())
+        agents
+            .get(&name)
+            .filter(|agent| agent.agent_id == session.agent_id)
+            .map(|agent| agent.control.clone())
     };
 
     let Some(control) = control else {
@@ -893,6 +951,7 @@ async fn persistent_operator_upgrade(
                 socket,
                 state,
                 name,
+                session.agent_id,
                 session.operator_fingerprint,
                 control,
                 kind,
@@ -956,7 +1015,7 @@ async fn persistent_agent_upgrade(
         }
     };
 
-    if let Err(error) = state.store.mark_seen(&name, None).await {
+    if let Err(error) = state.store.mark_seen(&agent_id, None).await {
         eprintln!("failed to update agent presence: {error}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -1040,6 +1099,7 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String, agent_
 
     let connection_id = Uuid::new_v4();
     let (control_tx, mut control_rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
+    let (registration, deregistered) = oneshot::channel::<()>();
 
     {
         // Claimed in the database and registered in memory under one lock: two connections
@@ -1061,15 +1121,17 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String, agent_
         agents.insert(
             name.clone(),
             AgentHandle {
+                agent_id: agent_id.clone(),
                 connection_id,
                 control: control_tx,
                 active_sessions,
                 max_sessions,
+                _registration: registration,
             },
         );
     }
 
-    if let Err(error) = state.store.mark_seen(&name, Some(&agent_version)).await {
+    if let Err(error) = state.store.mark_seen(&agent_id, Some(&agent_version)).await {
         eprintln!("failed to persist agent hello: {error}");
     }
 
@@ -1078,134 +1140,148 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String, agent_
     let idle = tokio::time::sleep(timeouts.agent_idle);
     tokio::pin!(idle);
 
-    loop {
-        tokio::select! {
-            control = control_rx.recv() => {
-                let Some(control) = control else {
-                    break;
-                };
+    // Everything the connection does stops once its registration goes, a write or a store
+    // call in progress included: removed, replaced by a newer connection, or swept as no
+    // longer enrolled.
+    let serve = async {
+        loop {
+            tokio::select! {
+                control = control_rx.recv() => {
+                    let Some(control) = control else {
+                        break;
+                    };
 
-                let Ok(text) = serde_json::to_string(&control) else {
-                    break;
-                };
+                    let Ok(text) = serde_json::to_string(&control) else {
+                        break;
+                    };
 
-                let sent =
-                    tokio::time::timeout(timeouts.control_send, sender.send(Message::Text(text.into())))
-                        .await;
-                if !matches!(sent, Ok(Ok(()))) {
+                    let sent =
+                        tokio::time::timeout(timeouts.control_send, sender.send(Message::Text(text.into())))
+                            .await;
+                    if !matches!(sent, Ok(Ok(()))) {
+                        break;
+                    }
+                }
+                () = &mut idle => {
+                    eprintln!(
+                        "agent {name} silent for {}s; dropping its control connection",
+                        timeouts.agent_idle.as_secs()
+                    );
                     break;
                 }
-            }
-            () = &mut idle => {
-                eprintln!(
-                    "agent {name} silent for {}s; dropping its control connection",
-                    timeouts.agent_idle.as_secs()
-                );
-                break;
-            }
-            message = receiver.next() => {
-                idle.as_mut()
-                    .reset(tokio::time::Instant::now() + timeouts.agent_idle);
+                message = receiver.next() => {
+                    idle.as_mut()
+                        .reset(tokio::time::Instant::now() + timeouts.agent_idle);
 
-                match message {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(control) = serde_json::from_str::<ControlMessage>(&text) {
-                            match control {
-                                ControlMessage::Hello {
-                                    version,
-                                    name: hello_name,
-                                    agent_version,
-                                    active_sessions,
-                                    max_sessions,
-                                } if version == CONTROL_PROTOCOL_VERSION && hello_name == name => {
-                                    {
-                                        let mut agents = state.agents.lock().await;
-                                        if let Some(agent) = agents
-                                            .get_mut(&name)
-                                            .filter(|agent| agent.connection_id == connection_id)
+                    match message {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(control) = serde_json::from_str::<ControlMessage>(&text) {
+                                match control {
+                                    ControlMessage::Hello {
+                                        version,
+                                        name: hello_name,
+                                        agent_version,
+                                        active_sessions,
+                                        max_sessions,
+                                    } if version == CONTROL_PROTOCOL_VERSION && hello_name == name => {
                                         {
-                                            agent.active_sessions = active_sessions;
-                                            agent.max_sessions = max_sessions;
+                                            let mut agents = state.agents.lock().await;
+                                            if let Some(agent) = agents
+                                                .get_mut(&name)
+                                                .filter(|agent| agent.connection_id == connection_id)
+                                            {
+                                                agent.active_sessions = active_sessions;
+                                                agent.max_sessions = max_sessions;
+                                            }
+                                        }
+
+                                        if let Err(error) =
+                                            state.store.mark_seen(&agent_id, Some(&agent_version)).await
+                                        {
+                                            eprintln!("failed to persist agent hello: {error}");
                                         }
                                     }
-
-                                    if let Err(error) =
-                                        state.store.mark_seen(&name, Some(&agent_version)).await
-                                    {
-                                        eprintln!("failed to persist agent hello: {error}");
-                                    }
-                                }
-                                ControlMessage::Heartbeat {
-                                    version,
-                                    active_sessions,
-                                } if version == CONTROL_PROTOCOL_VERSION => {
-                                    {
-                                        let mut agents = state.agents.lock().await;
-                                        if let Some(agent) = agents
-                                            .get_mut(&name)
-                                            .filter(|agent| agent.connection_id == connection_id)
+                                    ControlMessage::Heartbeat {
+                                        version,
+                                        active_sessions,
+                                    } if version == CONTROL_PROTOCOL_VERSION => {
                                         {
-                                            agent.active_sessions = active_sessions;
+                                            let mut agents = state.agents.lock().await;
+                                            if let Some(agent) = agents
+                                                .get_mut(&name)
+                                                .filter(|agent| agent.connection_id == connection_id)
+                                            {
+                                                agent.active_sessions = active_sessions;
+                                            }
+                                        }
+
+                                        if let Err(error) = state.store.mark_seen(&agent_id, None).await {
+                                            eprintln!("failed to persist agent heartbeat: {error}");
                                         }
                                     }
-
-                                    if let Err(error) = state.store.mark_seen(&name, None).await {
-                                        eprintln!("failed to persist agent heartbeat: {error}");
+                                    ControlMessage::SessionAccept {
+                                        version,
+                                        session_id,
+                                    } if version == CONTROL_PROTOCOL_VERSION => {
+                                        record_agent_decision(
+                                            &state,
+                                            &name,
+                                            &session_id,
+                                            AgentDecision::Accepted,
+                                        )
+                                        .await;
                                     }
-                                }
-                                ControlMessage::SessionAccept {
-                                    version,
-                                    session_id,
-                                } if version == CONTROL_PROTOCOL_VERSION => {
-                                    record_agent_decision(
-                                        &state,
-                                        &name,
-                                        &session_id,
-                                        AgentDecision::Accepted,
-                                    )
-                                    .await;
-                                }
-                                ControlMessage::SessionReject {
-                                    version,
-                                    session_id,
-                                    reason,
-                                } if version == CONTROL_PROTOCOL_VERSION => {
-                                    record_agent_decision(
-                                        &state,
-                                        &name,
-                                        &session_id,
-                                        AgentDecision::Rejected(reason),
-                                    )
-                                    .await;
-                                }
-                                ControlMessage::OperatorsReport {
-                                    version,
-                                    revision,
-                                    operators,
-                                } if version == CONTROL_PROTOCOL_VERSION => {
-                                    let keep = record_operators_report(
-                                        &state,
-                                        &name,
-                                        &agent_id,
-                                        connection_id,
+                                    ControlMessage::SessionReject {
+                                        version,
+                                        session_id,
+                                        reason,
+                                    } if version == CONTROL_PROTOCOL_VERSION => {
+                                        record_agent_decision(
+                                            &state,
+                                            &name,
+                                            &session_id,
+                                            AgentDecision::Rejected(reason),
+                                        )
+                                        .await;
+                                    }
+                                    ControlMessage::OperatorsReport {
+                                        version,
                                         revision,
-                                        &operators,
-                                    )
-                                    .await;
-                                    if !keep {
-                                        break;
+                                        operators,
+                                    } if version == CONTROL_PROTOCOL_VERSION => {
+                                        let keep = record_operators_report(
+                                            &state,
+                                            &name,
+                                            &agent_id,
+                                            connection_id,
+                                            revision,
+                                            &operators,
+                                        )
+                                        .await;
+                                        if !keep {
+                                            break;
+                                        }
                                     }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                         }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                        Some(Ok(_)) => {}
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    Some(Ok(_)) => {}
                 }
             }
         }
+    };
+
+    tokio::select! {
+        () = serve => {}
+        _ = deregistered => {}
     }
+    // The connection is over: close it now, not after the cleanup below, which can wait for
+    // the registry while another connection's registration holds it.
+    drop(sender);
+    drop(receiver);
 
     let mut agents = state.agents.lock().await;
     if agents
@@ -1360,19 +1436,69 @@ async fn record_agent_decision(
     }
 }
 
+/// Runs one operator session, registered as live until it ends so that the removal sweep can
+/// end it when its agent instance is removed or re-enrolled, whatever stage it is in.
 async fn handle_operator_session(
-    mut operator_socket: WebSocket,
+    operator_socket: WebSocket,
     state: RelayState,
     agent_name: String,
+    agent_id: String,
     operator_fingerprint: String,
     control: mpsc::Sender<ControlMessage>,
     kind: SessionKind,
 ) {
     let session_id = Uuid::new_v4().simple().to_string();
+    // Audited before the sweep can see the session, so that even a session cancelled at once
+    // has its request on record.
+    state.audit.requested(
+        &session_id,
+        &agent_name,
+        kind.label(),
+        &operator_fingerprint,
+    );
+    let (cancel, cancelled) = oneshot::channel();
+    state
+        .live_sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), LiveSession { agent_id, cancel });
+
+    tokio::select! {
+        () = run_operator_session(
+            operator_socket,
+            state.clone(),
+            session_id.clone(),
+            agent_name.clone(),
+            control,
+            kind,
+        ) => {}
+        // Dropping the session closes both of its WebSockets.
+        Ok(()) = cancelled => {
+            state.pending.lock().await.remove(&session_id);
+            state.audit.ended(&session_id, "agent_removed");
+            eprintln!(
+                "{} {session_id} for {agent_name} closed: the agent was removed or re-enrolled",
+                kind.label()
+            );
+        }
+    }
+
+    state.live_sessions.lock().await.remove(&session_id);
+}
+
+async fn run_operator_session(
+    mut operator_socket: WebSocket,
+    state: RelayState,
+    session_id: String,
+    agent_name: String,
+    control: mpsc::Sender<ControlMessage>,
+    kind: SessionKind,
+) {
     let agent_token = match SecretToken::generate("rvs") {
         Ok(token) => token,
         Err(error) => {
             eprintln!("session token generation failed: {error}");
+            state.audit.ended(&session_id, "internal_error");
             return;
         }
     };
@@ -1391,13 +1517,6 @@ async fn handle_operator_session(
             },
         );
     }
-
-    state.audit.requested(
-        &session_id,
-        &agent_name,
-        kind.label(),
-        &operator_fingerprint,
-    );
 
     // One deadline covers queueing the offer and the agent's decision: an agent whose
     // control channel is not draining must not hold the operator past it.
@@ -1516,6 +1635,86 @@ async fn send_session_cancel(control: &mpsc::Sender<ControlMessage>, session_id:
         version: CONTROL_PROTOCOL_VERSION,
         session_id: session_id.to_owned(),
     });
+}
+
+/// Checks every `timeouts.removal_sweep` that the agents the relay serves are still
+/// enrolled, independently of their control connections: a removed or re-enrolled agent
+/// instance loses its control connection and every session it is part of, also when only a
+/// data tunnel is left.
+fn spawn_removal_sweep(state: RelayState) {
+    tokio::spawn(async move {
+        let mut sweep = tokio::time::interval(state.timeouts.removal_sweep);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            sweep.tick().await;
+            sweep_removed_agents(&state).await;
+        }
+    });
+}
+
+async fn sweep_removed_agents(state: &RelayState) {
+    let mut served = state
+        .agents
+        .lock()
+        .await
+        .values()
+        .map(|agent| agent.agent_id.clone())
+        .collect::<HashSet<_>>();
+    served.extend(
+        state
+            .live_sessions
+            .lock()
+            .await
+            .values()
+            .map(|session| session.agent_id.clone()),
+    );
+    if served.is_empty() {
+        return;
+    }
+
+    let enrolled = match state
+        .store
+        .existing_agent_ids(served.iter().cloned().collect())
+        .await
+    {
+        Ok(enrolled) => enrolled,
+        // Without an answer nothing is closed, rather than every connection; the next sweep
+        // asks again.
+        Err(error) => {
+            eprintln!("removal sweep failed: {error}");
+            return;
+        }
+    };
+    let removed = served
+        .difference(&enrolled)
+        .cloned()
+        .collect::<HashSet<_>>();
+    if removed.is_empty() {
+        return;
+    }
+
+    state.agents.lock().await.retain(|name, agent| {
+        let keep = !removed.contains(&agent.agent_id);
+        if !keep {
+            eprintln!("agent {name} was removed or re-enrolled; closing its control connection");
+        }
+        keep
+    });
+
+    let cancelled = {
+        let mut sessions = state.live_sessions.lock().await;
+        let ids = sessions
+            .iter()
+            .filter(|(_, session)| removed.contains(&session.agent_id))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| sessions.remove(&id))
+            .collect::<Vec<_>>()
+    };
+    for session in cancelled {
+        let _ = session.cancel.send(());
+    }
 }
 
 async fn attach_reserved_agent_session(socket: WebSocket, sender: oneshot::Sender<WebSocket>) {
@@ -2408,6 +2607,7 @@ mod tests {
         control_send: Duration::from_millis(300),
         agent_accept: Duration::from_millis(300),
         data_tunnel: Duration::from_millis(300),
+        removal_sweep: Duration::from_millis(100),
     };
 
     /// A relay with short timeouts on a free local port and one enrolled agent.
@@ -2421,10 +2621,20 @@ mod tests {
     }
 
     async fn fast_relay(agent: &str) -> FastRelay {
+        fast_relay_with(agent, FAST_RELAY_TIMEOUTS).await
+    }
+
+    /// Production timeouts, except for a removal sweep that runs ten times a second.
+    const SWEEP_TIMEOUTS: RelayTimeouts = RelayTimeouts {
+        removal_sweep: Duration::from_millis(100),
+        ..super::RELAY_TIMEOUTS
+    };
+
+    async fn fast_relay_with(agent: &str, timeouts: RelayTimeouts) -> FastRelay {
         let store = Store::open_in_memory().await.expect("open relay store");
         let state = RelayState::new(store.clone())
             .expect("create relay state")
-            .with_timeouts(FAST_RELAY_TIMEOUTS);
+            .with_timeouts(timeouts);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test relay");
@@ -2582,10 +2792,12 @@ mod tests {
         relay.state.agents.lock().await.insert(
             "stuck-agent".to_owned(),
             AgentHandle {
+                agent_id: relay.agent_id.clone(),
                 connection_id: Uuid::new_v4(),
                 control,
                 active_sessions: 0,
                 max_sessions: 4,
+                _registration: oneshot::channel().0,
             },
         );
 
@@ -3370,6 +3582,218 @@ mod tests {
                     .iter()
                     .map(|session| session.outcome.clone())
                     .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// An agent control connection that said hello, and an operator probe or shell request
+    /// for it made with an operator credential as `operator_auth` issues it.
+    async fn connect_agent_and_operator(
+        relay: &FastRelay,
+        name: &str,
+        route: &str,
+    ) -> (reqwest_websocket::WebSocket, reqwest_websocket::WebSocket) {
+        let http = reqwest::Client::new();
+        let mut agent = connect_websocket(
+            &http,
+            &relay.url,
+            &format!("/v1/agent/{name}"),
+            &relay.control_token,
+        )
+        .await
+        .expect("connect agent");
+        agent
+            .send(test_hello(name))
+            .await
+            .expect("send agent hello");
+        assert!(wait_registered(&relay.state, name, true).await);
+
+        let session_token = SecretToken::generate("rvo").expect("operator session token");
+        relay.state.operator_sessions.lock().await.insert(
+            session_token.hash(),
+            OperatorSession {
+                agent_name: name.to_owned(),
+                agent_id: relay.agent_id.clone(),
+                operator_fingerprint: relay.operator_fingerprint.clone(),
+                expires_at: std::time::Instant::now() + Duration::from_secs(30),
+            },
+        );
+        let operator = connect_websocket(
+            &http,
+            &relay.url,
+            &format!("/v1/{route}/{name}"),
+            session_token.expose(),
+        )
+        .await
+        .expect("connect operator");
+        (agent, operator)
+    }
+
+    #[tokio::test]
+    async fn removed_agent_loses_a_tunnel_that_outlived_its_control_connection() {
+        const NAME: &str = "removed-agent";
+        let relay = fast_relay_with(NAME, SWEEP_TIMEOUTS).await;
+        super::spawn_removal_sweep(relay.state.clone());
+        let (mut agent, mut operator) = connect_agent_and_operator(&relay, NAME, "probe").await;
+
+        // The agent accepts and attaches its data tunnel, which then stays open.
+        let offer = loop {
+            let message = tokio::time::timeout(Duration::from_secs(3), agent.next())
+                .await
+                .expect("probe offer")
+                .expect("control connection open")
+                .expect("control message");
+            if let ClientMessage::Text(text) = message
+                && let Ok(ControlMessage::ProbeOffer {
+                    session_id,
+                    tunnel_token,
+                    ..
+                }) = serde_json::from_str::<ControlMessage>(&text)
+            {
+                break (session_id, tunnel_token);
+            }
+        };
+        let accept = ControlMessage::SessionAccept {
+            version: CONTROL_PROTOCOL_VERSION,
+            session_id: offer.0.clone(),
+        };
+        agent
+            .send(ClientMessage::Text(
+                serde_json::to_string(&accept).expect("encode accept"),
+            ))
+            .await
+            .expect("accept offer");
+        let mut tunnel = connect_websocket(
+            &reqwest::Client::new(),
+            &relay.url,
+            &format!("/v1/session/{}", offer.0),
+            &offer.1,
+        )
+        .await
+        .expect("open agent tunnel");
+        let _ = audited_outcome_stage(&relay.state, |session| session.paired_at.is_some()).await;
+
+        // The control connection goes; the tunnel does not.
+        drop(agent);
+        assert!(wait_registered(&relay.state, NAME, false).await);
+        assert!(!relay.state.live_sessions.lock().await.is_empty());
+
+        relay
+            .state
+            .store
+            .remove_agent(NAME)
+            .await
+            .expect("remove agent")
+            .expect("agent was enrolled");
+
+        assert!(
+            wait_closed_by_relay(&mut operator, Duration::from_secs(2)).await,
+            "operator side of a removed agent's tunnel stayed open"
+        );
+        assert!(
+            wait_closed_by_relay(&mut tunnel, Duration::from_secs(2)).await,
+            "agent side of a removed agent's tunnel stayed open"
+        );
+        let session = audited_outcome(&relay.state, "agent_removed").await;
+        assert!(session.paired_at.is_some());
+        relay.server.abort();
+    }
+
+    #[tokio::test]
+    async fn deregistered_control_connection_closes_while_the_registry_is_busy() {
+        const NAME: &str = "busy-registry";
+        let relay = fast_relay_with(NAME, SWEEP_TIMEOUTS).await;
+        let mut agent = connect_websocket(
+            &reqwest::Client::new(),
+            &relay.url,
+            &format!("/v1/agent/{NAME}"),
+            &relay.control_token,
+        )
+        .await
+        .expect("connect agent");
+        agent
+            .send(test_hello(NAME))
+            .await
+            .expect("send agent hello");
+        assert!(wait_registered(&relay.state, NAME, true).await);
+
+        // The sweep takes the registration, and the registry stays busy, as while another
+        // connection's registration waits for the database.
+        let mut agents = relay.state.agents.lock().await;
+        agents.remove(NAME);
+        let closed = wait_closed_by_relay(&mut agent, Duration::from_secs(2)).await;
+        drop(agents);
+
+        assert!(
+            closed,
+            "a deregistered control connection waited for the registry"
+        );
+        relay.server.abort();
+    }
+
+    #[tokio::test]
+    async fn reenrolled_agent_loses_its_control_connection_and_pending_sessions() {
+        const NAME: &str = "replaced-agent";
+        let relay = fast_relay_with(NAME, SWEEP_TIMEOUTS).await;
+        super::spawn_removal_sweep(relay.state.clone());
+        let (mut agent, mut operator) = connect_agent_and_operator(&relay, NAME, "connect").await;
+
+        // The agent never answers the offer: the session is pending.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while relay.state.pending.lock().await.is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "no pending session");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The machine is reinstalled and re-enrolled under the same name.
+        let operator_key = ed25519_key()
+            .public_key()
+            .to_openssh()
+            .expect("operator key");
+        let host_key = ed25519_key().public_key().to_openssh().expect("host key");
+        let replacement = relay
+            .state
+            .store
+            .create_replacement_enrollment(NAME, &operator_key, Duration::from_secs(60))
+            .await
+            .expect("create replacement");
+        relay
+            .state
+            .store
+            .consume_enrollment(replacement.token.expose(), &host_key, Some("0.1.0"))
+            .await
+            .expect("consume replacement");
+
+        assert!(
+            wait_closed_by_relay(&mut agent, Duration::from_secs(2)).await,
+            "control connection of a replaced agent stayed open"
+        );
+        assert!(
+            wait_closed_by_relay(&mut operator, Duration::from_secs(2)).await,
+            "pending session of a replaced agent stayed open"
+        );
+        assert!(!relay.state.agents.lock().await.contains_key(NAME));
+        assert!(relay.state.pending.lock().await.is_empty());
+        let session = audited_outcome(&relay.state, "agent_removed").await;
+        assert!(session.paired_at.is_none());
+        relay.server.abort();
+    }
+
+    /// The single audited session once `reached` holds for it; audit writes are asynchronous.
+    async fn audited_outcome_stage(
+        state: &RelayState,
+        reached: impl Fn(&crate::storage::SessionRecord) -> bool,
+    ) -> crate::storage::SessionRecord {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let mut sessions = state.store.list_sessions(10).await.expect("list sessions");
+            if sessions.len() == 1 && reached(&sessions[0]) {
+                return sessions.remove(0);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "audited session never reached the expected stage"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

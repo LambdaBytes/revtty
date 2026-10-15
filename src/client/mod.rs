@@ -34,6 +34,22 @@ pub fn init() -> Result<(), RevttyError> {
     Ok(())
 }
 
+pub fn forget(target: &str, relay: &str) -> Result<(), RevttyError> {
+    if !valid_name(target) {
+        return Err(RevttyError::message("invalid machine name"));
+    }
+
+    let paths = Paths::discover()?;
+    let forgotten = crate::identity::forget_agent_host_key(&paths, relay, target)?;
+    if forgotten == 0 {
+        println!("no host key pinned for {target} on {relay}");
+    } else {
+        println!("forgotten  host key of {target} on {relay}");
+        println!("The next status, probe or connect asks to pin its new host key.");
+    }
+    Ok(())
+}
+
 pub async fn list(relay: &str) -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
     let identity = crate::identity::ensure_operator(&paths)?;

@@ -23,6 +23,7 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
             host_key,
         } => crate::client::probe(&target, &relay, host_key.as_deref()).await,
         Command::Doctor { relay } => crate::client::doctor(&relay).await,
+        Command::Forget { target, relay } => crate::client::forget(&target, &relay),
         Command::Agent { command } => match command {
             AgentCommand::Enroll {
                 relay,
@@ -47,8 +48,10 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
                 name,
                 operator_key,
                 ttl,
+                replace,
                 db,
-            } => crate::relay::create_enrollment(&db, &name, &operator_key, ttl).await,
+            } => crate::relay::create_enrollment(&db, &name, &operator_key, ttl, replace).await,
+            RelayCommand::Remove { name, db } => crate::relay::remove_agent(&db, &name).await,
             RelayCommand::Agents { db } => crate::relay::list_agents(&db).await,
             RelayCommand::Sessions { limit, db } => crate::relay::list_sessions(&db, limit).await,
             RelayCommand::Serve { bind, db } => crate::relay::serve(&bind, &db).await,

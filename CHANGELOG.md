@@ -38,6 +38,7 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - `--host-key` for `status`, `probe` and `connect` to approve a first host-key pin non-interactively.
 - End-to-end tests that drive the real binary through a PTY.
 - Versioned `Cargo.lock`.
+- `relay enroll --replace` re-enrolls a reinstalled machine in place of the old agent instance, `relay remove` retires an agent, and the relay closes the control connection and every session of an agent instance that is no longer enrolled within 5 seconds (relay schema v5). `forget` clears an operator's pin of the old host key.
 - Operator lists on the agent: `agent operator list|add|revoke`. A running agent rereads its list every 2 seconds, closes the open sessions of a revoked operator and reports the list to the relay (`operators_report`), which issues session credentials only to those operators (relay schema v4).
 
 ### Changed
@@ -52,6 +53,7 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - revtty creates its configuration and state directories private to the user.
 - `agent.toml` holds `operators` and `operators_revision` instead of `operator_key` (older files still load) and is replaced atomically under a lock.
 - `relay agents` shows each agent's `operators=` fingerprints; operator session credentials are checked against the agent's current operators when used.
+- `relay enroll` refuses a name that is already enrolled unless `--replace` is given.
 
 ### Removed
 

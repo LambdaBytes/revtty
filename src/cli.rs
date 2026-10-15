@@ -73,6 +73,16 @@ pub enum Command {
         relay: String,
     },
 
+    /// Forget a machine's pinned host key, after it was reinstalled and re-enrolled.
+    Forget {
+        /// Machine name.
+        target: String,
+
+        /// Relay base URL the key was pinned for.
+        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
+        relay: String,
+    },
+
     /// Manage or run the persistent target agent.
     Agent {
         #[command(subcommand)]
@@ -161,6 +171,21 @@ pub enum RelayCommand {
         /// Enrollment lifetime in seconds.
         #[arg(long, default_value_t = 600)]
         ttl: u64,
+
+        /// Re-enroll an agent that is already enrolled, e.g. a reinstalled machine: once
+        /// the token is used, the old agent's credential, host key and operators are gone.
+        #[arg(long)]
+        replace: bool,
+
+        /// Relay SQLite database path.
+        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
+        db: PathBuf,
+    },
+
+    /// Remove an enrolled agent and its unused enrollments; the session audit is kept.
+    Remove {
+        /// Agent name.
+        name: String,
 
         /// Relay SQLite database path.
         #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
@@ -272,6 +297,25 @@ mod tests {
             "operator.pub",
         ]);
         assert!(args.is_ok());
+    }
+
+    #[test]
+    fn parses_lifecycle_commands() {
+        assert!(
+            Args::try_parse_from([
+                "revtty",
+                "relay",
+                "enroll",
+                "store-042",
+                "--operator-key",
+                "operator.pub",
+                "--replace",
+            ])
+            .is_ok()
+        );
+        assert!(Args::try_parse_from(["revtty", "relay", "remove", "store-042"]).is_ok());
+        assert!(Args::try_parse_from(["revtty", "forget", "store-042"]).is_ok());
+        assert!(Args::try_parse_from(["revtty", "forget"]).is_err());
     }
 
     #[test]
