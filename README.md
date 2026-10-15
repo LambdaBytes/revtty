@@ -4,7 +4,7 @@
 
 No inbound ports. No VPN. No exposed SSH daemon — just secure, on-demand shell access from anywhere.
 
-> Status: M1 “First Shell” works end to end on Linux. It is pre-v1.0 software: the protocol may still change, and real NAT/CGNAT and macOS validation are pending (see [Limitations](#limitations)).
+> Status: M1 “First Shell” works end to end; the full test suite, end-to-end tests included, passes on Linux and macOS in CI. It is pre-v1.0 software: the protocol may still change, and validation across a real NAT/CGNAT boundary is pending (see [Limitations](#limitations)).
 
 ## How it works
 
@@ -145,7 +145,7 @@ On Linux the defaults are `~/.config/revtty` and `~/.local/share/revtty`; `REVTT
 ## Limitations
 
 - **Pre-v1**: the protocol and database schema may still change between versions. Database migrations run automatically and only forward.
-- **Not yet validated** across a real NAT/CGNAT boundary or under real network loss; local tests cover relay restarts and silent peers. macOS is covered by CI, but the latest lifecycle and end-to-end tests have only run on Linux so far.
+- **Not yet validated** across a real NAT/CGNAT boundary or under real network loss; local tests cover relay restarts and silent peers.
 - **One operator key per agent**, fixed at enrollment. There are no commands yet to add or revoke operators, rotate credentials, or re-enroll or remove an agent.
 - **One relay process**: agent presence lives in its memory; there is no clustering or high availability.
 - **Not yet**: rate limiting, packages or signed release artifacts, a launchd service for macOS agents, Windows support.

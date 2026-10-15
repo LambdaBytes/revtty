@@ -254,14 +254,13 @@ The repository currently validates these pieces on Linux and macOS:
 - end-to-end runs of the real binary: enrollment, first-pin confirmation, probe, interactive shell with exit status, relay restart recovery, agent loss, SIGINT teardown, doctors and session audit;
 - format, Clippy and release compilation.
 
-The PTY lifecycle, liveness, challenge and end-to-end tests added late in M1 have so far run on Linux only; gate 3 below covers macOS.
+All of it, the end-to-end tests included, passes on both Linux and macOS (CI run of commit 3f73858).
 
 ## Next validation gates
 
 The next gates for M1 are:
 
 1. run the authenticated `connect` path across a real NAT/CGNAT boundary;
-2. exercise recovery under real network loss and NAT mapping changes; local tests cover relay restarts, silent agents and silent relays;
-3. run the macOS CI job on the current tree (`[full ci]` or a pull request).
+2. exercise recovery under real network loss and NAT mapping changes; local tests cover relay restarts, silent agents and silent relays.
 
 This keeps transport, identity, SSH, PTY and lifecycle failures independently observable.
