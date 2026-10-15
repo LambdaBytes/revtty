@@ -1,6 +1,7 @@
 # Project Memory: revtty
 
 ## Facts
+- Publication: developed and published directly on GitHub LambdaBytes/revtty, no GitLab (user decision 2026-10-15)
 - Single bin crate `revtty` 0.1.0, edition 2024, MSRV 1.95; client/agent/relay roles in one binary (src/app.rs)
 - Modules: src/{agent,client,relay,identity,protocol,transport}; storage.rs = SQLite (tokio-rusqlite + migrations)
 - Stack: tokio, axum ws (relay), reqwest+reqwest-websocket (client), russh aws-lc-rs, portable-pty, clap derive+env

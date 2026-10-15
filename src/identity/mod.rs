@@ -197,9 +197,14 @@ pub fn pin_agent_host_key(
     let _: KnownHostEntry = KnownHostEntry::from_str(&line)
         .map_err(|error| RevttyError::runtime("validate known_hosts entry", error))?;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+
+    // Whoever can write the pins can redirect `connect` to another host key.
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let mut file = options
         .open(paths.config_dir.join(KNOWN_HOSTS_FILE))
         .map_err(|error| RevttyError::runtime("open revtty known_hosts", error))?;
 
@@ -384,6 +389,30 @@ mod tests {
         let known_hosts =
             fs::read_to_string(paths.config_dir.join("known_hosts")).expect("read known_hosts");
         assert_eq!(known_hosts.lines().count(), 2);
+
+        fs::remove_dir_all(root).expect("clean known_hosts test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn known_hosts_is_created_private() {
+        let root = std::env::temp_dir().join(format!("revtty-known-hosts-mode-{}", Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+            .expect("agent key")
+            .public_key()
+            .to_openssh()
+            .expect("agent public key");
+
+        pin_agent_host_key(&paths, "https://relay.example.com", "store-042", &key)
+            .expect("pin host key");
+
+        let mode = fs::metadata(paths.config_dir.join("known_hosts"))
+            .expect("known_hosts metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "known_hosts created with mode {mode:o}");
 
         fs::remove_dir_all(root).expect("clean known_hosts test directory");
     }

@@ -198,6 +198,17 @@ fn enroll_agent(
     agent: &Role,
     url: &str,
 ) -> String {
+    enroll_agent_with(root, relay_role, operator, agent, url, &[])
+}
+
+fn enroll_agent_with(
+    root: &TempRoot,
+    relay_role: &Role,
+    operator: &Role,
+    agent: &Role,
+    url: &str,
+    extra: &[&str],
+) -> String {
     let db = root.path("relay.db");
     let db = db.to_str().expect("utf-8 path");
     let operator_key = operator.config.join("id_ed25519.pub");
@@ -213,7 +224,9 @@ fn enroll_agent(
     ]);
     let token = field(&enrollment, "token");
 
-    let enrolled = agent.run(&["agent", "enroll", "--relay", url, "--token", token]);
+    let mut args = vec!["agent", "enroll", "--relay", url, "--token", token];
+    args.extend_from_slice(extra);
+    let enrolled = agent.run(&args);
     field(&enrolled, "host").to_owned()
 }
 
@@ -658,9 +671,18 @@ fn doctors_check_authentication_permissions_and_tls() {
     let root = TempRoot::new();
     let (operator, agent, relay_role) = prepare(&root);
     let (_relay, url) = start_relay(&root, &relay_role);
-    enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
     let _agent_process = start_agent(&root, &agent);
 
+    // After a first pin, as on any real operator machine.
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
     let operator_doctor = operator.run(&["doctor", "--relay", &url]);
     assert!(
         operator_doctor.contains("auth       ok (1 agents enrolled for this key)"),
@@ -693,7 +715,17 @@ fn doctors_check_authentication_permissions_and_tls() {
             relay_role.run_failing(&["relay", "doctor", "--db", db.to_str().expect("utf-8 path")]);
         assert!(
             replaceable.contains("writable by other users"),
-            "writable relay directory not reported:\\n{replaceable}"
+            "writable relay directory not reported:\n{replaceable}"
+        );
+
+        // A group-writable directory, as left by the usual umask 002 with user private
+        // groups, is reported but does not fail.
+        std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o775))
+            .expect("make the relay directory group-writable");
+        let shared = relay_role.run(&["relay", "doctor", "--db", db.to_str().expect("utf-8 path")]);
+        assert!(
+            shared.contains("warning") && shared.contains("writable by its group"),
+            "group-writable relay directory not reported:\n{shared}"
         );
         std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o700))
             .expect("restore the relay directory");
@@ -713,5 +745,31 @@ fn doctors_check_authentication_permissions_and_tls() {
     assert!(
         tls.contains("corrupt message") || tls.contains("InvalidContentType"),
         "TLS failure cause not shown:\n{tls}"
+    );
+}
+
+#[test]
+fn busy_agent_is_reported_to_probe() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent_with(
+        &root,
+        &relay_role,
+        &operator,
+        &agent,
+        &url,
+        &["--max-sessions", "1"],
+    );
+    let agent_process = start_agent(&root, &agent);
+
+    // The only session slot is taken by an open shell.
+    let mut terminal = Terminal::connect(&operator, &url, Some(&host_key));
+    terminal.wait_ready(Duration::from_secs(20), &[&relay, &agent_process]);
+
+    let refused = operator.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
+    assert!(
+        refused.contains("agent is busy"),
+        "busy agent not reported to probe:\n{refused}"
     );
 }

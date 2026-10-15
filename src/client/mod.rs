@@ -12,7 +12,7 @@ use crate::error::RevttyError;
 use crate::protocol::{
     AgentListResponse, AgentStatusResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
     OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, ProbeResult,
-    operator_auth_message, operator_list_auth_message,
+    SESSION_ERROR_PREFIX, operator_auth_message, operator_list_auth_message,
 };
 use crate::transport::{check_relay_health, connect_websocket, http_url, valid_name};
 
@@ -350,6 +350,11 @@ pub async fn probe(target: &str, relay: &str, host_key: Option<&str>) -> Result<
     while let Some(message) = websocket.next().await {
         match message {
             Ok(Message::Text(text)) => {
+                // The relay explains a refused session (busy agent, timeout) before closing.
+                if let Some(detail) = text.strip_prefix(SESSION_ERROR_PREFIX) {
+                    return Err(RevttyError::message(detail.to_owned()));
+                }
+
                 let result: ProbeResult = serde_json::from_str(&text)
                     .map_err(|error| RevttyError::runtime("decode probe result", error))?;
 
