@@ -22,12 +22,12 @@ use uuid::Uuid;
 
 use crate::error::RevttyError;
 use crate::protocol::{
-    AgentListResponse, AgentStatusResponse, CONTROL_PROTOCOL_VERSION, ControlMessage,
-    EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
+    AgentListResponse, AgentRotateRequest, AgentStatusResponse, CONTROL_PROTOCOL_VERSION,
+    ControlMessage, EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
     OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, SESSION_ERROR_PREFIX,
     SessionRejectReason, operator_auth_message, operator_list_auth_message,
 };
-use crate::storage::{OperatorsReportOutcome, ReportedOperator, Store};
+use crate::storage::{OperatorsReportOutcome, ReportedOperator, RotationConfirmation, Store};
 use crate::token::{SecretToken, hash_token};
 use crate::transport::valid_name;
 
@@ -563,6 +563,11 @@ fn router(state: RelayState) -> Router {
         .route("/v1/operator/auth/{name}", post(operator_auth))
         .route("/v1/agent/{name}", get(persistent_agent_upgrade))
         .route("/v1/agent/{name}/check", post(agent_credential_check))
+        .route("/v1/agent/{name}/rotate", post(agent_rotate))
+        .route(
+            "/v1/agent/{name}/rotate/confirm",
+            post(agent_rotate_confirm),
+        )
         .route("/v1/status/{name}", get(operator_status))
         .route("/v1/probe/{name}", get(persistent_probe_upgrade))
         .route("/v1/connect/{name}", get(persistent_connect_upgrade))
@@ -1046,6 +1051,65 @@ async fn agent_credential_check(
         Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => {
             eprintln!("agent credential check failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Starts a control credential rotation, authenticated with the current credential.
+async fn agent_rotate(
+    State(state): State<RelayState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<AgentRotateRequest>,
+) -> Response {
+    if !valid_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
+    }
+    let Some(token) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let next_hash = match URL_SAFE_NO_PAD
+        .decode(&request.next_hash)
+        .ok()
+        .and_then(|hash| <[u8; 32]>::try_from(hash).ok())
+    {
+        Some(hash) => hash,
+        None => return (StatusCode::BAD_REQUEST, "invalid credential hash").into_response(),
+    };
+
+    match state.store.begin_rotation(&name, token, next_hash).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            eprintln!("agent {name} credential rotation failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Completes a rotation, authenticated with the new credential; repeating it is harmless.
+async fn agent_rotate_confirm(
+    State(state): State<RelayState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !valid_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
+    }
+    let Some(token) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    match state.store.confirm_rotation(&name, token).await {
+        Ok(RotationConfirmation::Promoted) => {
+            eprintln!("agent {name} rotated its control credential");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(RotationConfirmation::AlreadyCurrent) => StatusCode::NO_CONTENT.into_response(),
+        Ok(RotationConfirmation::Rejected) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            eprintln!("agent {name} credential rotation failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -3189,6 +3253,70 @@ mod tests {
         assert!(session.ended_at.is_some());
 
         agent_task.abort();
+        relay.server.abort();
+    }
+
+    #[tokio::test]
+    async fn rotation_routes_switch_the_control_credential() {
+        use base64::Engine as _;
+
+        let relay = fast_relay("rotating-agent").await;
+        let http = reqwest::Client::new();
+        let base = relay.url.replacen("ws://", "http://", 1);
+        let next = SecretToken::generate("rva").expect("next credential");
+        let next_hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(next.hash());
+        let post = |path: &str, token: &str, body: Option<&str>| {
+            let mut request = http
+                .post(format!("{base}/v1/agent/rotating-agent{path}"))
+                .bearer_auth(token);
+            if let Some(hash) = body {
+                request = request.json(&crate::protocol::AgentRotateRequest {
+                    next_hash: hash.to_owned(),
+                });
+            }
+            async move { request.send().await.expect("relay request").status() }
+        };
+
+        assert_eq!(
+            post("/rotate", &relay.control_token, Some("not-a-hash")).await,
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post("/rotate", next.expose(), Some(&next_hash)).await,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "a rotation started without the current credential"
+        );
+        assert_eq!(
+            post("/rotate", &relay.control_token, Some(&next_hash)).await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            post("/check", &relay.control_token, None).await,
+            reqwest::StatusCode::NO_CONTENT,
+            "the current credential stopped working before the confirmation"
+        );
+
+        assert_eq!(
+            post("/rotate/confirm", next.expose(), None).await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            post("/check", &relay.control_token, None).await,
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post("/check", next.expose(), None).await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        // Confirming again, after a lost answer, is harmless; the old credential cannot.
+        assert_eq!(
+            post("/rotate/confirm", next.expose(), None).await,
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            post("/rotate/confirm", &relay.control_token, None).await,
+            reqwest::StatusCode::UNAUTHORIZED
+        );
         relay.server.abort();
     }
 

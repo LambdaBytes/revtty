@@ -55,6 +55,7 @@ Design principles, scope and roadmap: [docs/BRIEF.md](docs/BRIEF.md), [docs/V1_S
 **Operations**
 
 - Session audit on the relay (`relay sessions`): operator key fingerprint, target, kind, request/accept/pair/end times and outcome. Terminal bytes and credentials are never recorded.
+- The agent's relay credential is replaced with `agent rotate-credential` while the agent is stopped: the agent generates the new credential and saves it before the relay learns its hash, so an interrupted rotation is finished by the next `agent run`. Only one `agent run` runs per configuration.
 - A reinstalled machine is re-enrolled under its name with `relay enroll NAME --replace`, and an agent is retired with `relay remove NAME`. Within 5 seconds the relay closes the old agent's control connection and every session it is part of, open data tunnels included; its credential no longer works. Operators then see a host key mismatch for the new machine and clear the old pin with `revtty forget NAME`.
 - `doctor`, `agent doctor` and `relay doctor`: relay reachability with the underlying TLS or network cause, signed operator authentication, agent credential validation, file and directory permissions, relay schema version.
 - A systemd template that runs the agent as an explicit OS account ([docs/SYSTEMD.md](docs/SYSTEMD.md)).
@@ -130,6 +131,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | `agent run` | target | Run the persistent agent. |
 | `agent status`, `agent doctor`, `agent pty-test` | target | Local configuration, full diagnostics, local PTY check. |
 | `agent operator list`, `agent operator add KEYFILE`, `agent operator revoke FINGERPRINT` | target | Show, authorize or revoke operator keys. |
+| `agent rotate-credential` | target | Replace the agent's relay credential; the agent must be stopped. |
 | `relay init`, `relay serve [--bind ADDR]` | relay | Create or migrate the database; serve the relay. |
 | `relay enroll NAME --operator-key FILE [--ttl SECS] [--replace]` | relay | Single-use enrollment token (default lifetime 600 s); `--replace` re-enrolls an enrolled agent. |
 | `relay remove NAME` | relay | Remove an agent and its unused enrollments; the audit is kept. |
@@ -142,7 +144,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | Role | Files | Location |
 |---|---|---|
 | operator | `id_ed25519`, `id_ed25519.pub`, `known_hosts` | config directory |
-| agent | `agent.toml` (holds the control credential and the operator list), `agent.lock` | config directory |
+| agent | `agent.toml` (holds the control credential and the operator list), `agent.lock`, `agent.run.lock` | config directory |
 | agent | `agent_ed25519`, `agent_ed25519.pub` (host key) | state directory |
 | relay | SQLite database | `--db` |
 
@@ -152,7 +154,7 @@ On Linux the defaults are `~/.config/revtty` and `~/.local/share/revtty`; `REVTT
 
 - **Pre-v1**: the protocol and database schema may still change between versions. Database migrations run automatically and only forward.
 - **Not yet validated** across a real NAT/CGNAT boundary or under real network loss; local tests cover relay restarts and silent peers.
-- **No roles**: every authorized operator of an agent can manage its operators. There is no command yet to rotate an agent's control credential; re-enrolling it with `--replace` issues a new one.
+- **No roles**: every authorized operator of an agent can manage its operators.
 - **One relay process**: agent presence lives in its memory; there is no clustering or high availability.
 - **Not yet**: rate limiting, packages or signed release artifacts, a launchd service for macOS agents, Windows support.
 - **Audit is best effort**: records are written asynchronously and dropped with a warning if the queue fills up.

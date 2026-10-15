@@ -128,6 +128,17 @@ The operator and agent rendezvous credentials are therefore distinct.
 
 `revtty list` uses a separate one-time SSHSIG inventory challenge. The client signs the canonical `scope=list` message and sends its Ed25519 public key with the signature. The relay verifies possession of that key and returns only enrolled agents whose reported operators include its SHA-256 SSH fingerprint. The inventory challenge is removed when used, including failed/replayed attempts.
 
+## Agent credential rotation
+
+The agent replaces its control credential in two HTTP steps, while it is stopped:
+
+1. it generates the new credential and saves it as pending in `agent.toml`;
+2. `POST /v1/agent/{name}/rotate` with the current credential as bearer and `{"next_hash": ...}`, the base64url SHA-256 of the new credential: the relay records it, and keeps accepting the current one;
+3. `POST /v1/agent/{name}/rotate/confirm` with the new credential as bearer: the relay makes it the control credential, after which the old one is refused. Confirming with the credential that is already current answers 204 again, so a lost answer can be retried;
+4. the agent makes the new credential its own.
+
+An agent that finds a pending credential, at its next start or rotation, confirms it: 204 finishes the rotation, 401 abandons it once the current credential is still accepted (`/check`), and 404 or 405, from a relay without rotation, abandons it.
+
 ## Operator-visible rendezvous failures
 
 Before SSH starts, the relay may send one control text frame on the operator data WebSocket using the reserved `revtty-error:` prefix. The byte-stream adapter converts that frame into a local error instead of feeding it into SSH.

@@ -113,6 +113,13 @@ pub struct EnrollResponse {
     pub operator_key: String,
 }
 
+/// Starts replacing an agent's control credential: `next_hash` is the base64url SHA-256 of the
+/// new credential, which the agent generated and saved; the relay accepts it once confirmed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRotateRequest {
+    pub next_hash: String,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorChallengeResponse {
     pub challenge: String,

@@ -34,6 +34,7 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
             AgentCommand::PtyTest => crate::agent::pty_test(),
             AgentCommand::Status => crate::agent::status(),
             AgentCommand::Doctor => crate::agent::doctor().await,
+            AgentCommand::RotateCredential => crate::agent::rotate_credential().await,
             AgentCommand::Operator { command } => match command {
                 OperatorCommand::List => crate::agent::operator_list(),
                 OperatorCommand::Add { key } => crate::agent::operator_add(&key),

@@ -699,7 +699,7 @@ fn doctors_check_authentication_permissions_and_tls() {
     let relay_doctor =
         relay_role.run(&["relay", "doctor", "--db", db.to_str().expect("utf-8 path")]);
     assert!(
-        relay_doctor.contains("schema     v5"),
+        relay_doctor.contains("schema     v6"),
         "unexpected relay doctor output:\n{relay_doctor}"
     );
 
@@ -962,4 +962,88 @@ fn reinstalled_agent_is_reenrolled_in_place_and_then_removed() {
     let gone = operator.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
     assert!(gone.contains("401"), "{gone}");
     drop(new_agent);
+}
+
+#[test]
+fn control_credential_rotates_while_the_agent_is_stopped() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let agent_process = start_agent(&root, &agent);
+    let token_before = std::fs::read_to_string(agent.config.join("agent.toml"))
+        .expect("read agent config")
+        .lines()
+        .find(|line| line.starts_with("control_token"))
+        .expect("control token line")
+        .to_owned();
+
+    // A running agent keeps its credential, and only one agent runs per configuration.
+    let refused = agent.run_failing(&["agent", "rotate-credential"]);
+    assert!(refused.contains("the agent is running"), "{refused}");
+    let second = agent.run_failing(&["agent", "run"]);
+    assert!(second.contains("another `revtty agent run`"), "{second}");
+
+    drop(agent_process);
+    let rotated = agent.run(&["agent", "rotate-credential"]);
+    assert!(rotated.contains("credential rotated"), "{rotated}");
+    relay.wait_for_log("rotated its control credential", Duration::from_secs(5));
+    let token_after = std::fs::read_to_string(agent.config.join("agent.toml"))
+        .expect("read agent config")
+        .lines()
+        .find(|line| line.starts_with("control_token"))
+        .expect("control token line")
+        .to_owned();
+    assert_ne!(token_after, token_before);
+
+    // The agent comes back with the new credential.
+    let _agent_process = start_agent(&root, &agent);
+    let doctor = agent.run(&["agent", "doctor"]);
+    assert!(
+        doctor.contains("credential accepted by the relay"),
+        "{doctor}"
+    );
+    let probe = operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+    assert!(probe.contains("status   reachable"), "{probe}");
+}
+
+#[test]
+fn agent_run_finishes_an_interrupted_rotation_before_connecting() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+
+    // A rotation interrupted before the relay heard of its credential.
+    let config_path = agent.config.join("agent.toml");
+    let mut config = std::fs::read_to_string(&config_path).expect("read agent config");
+    config.push_str("pending_control_token = \"rva_never_sent\"\n");
+    std::fs::write(&config_path, config).expect("leave a pending rotation");
+    let doctor = agent.run_failing(&["agent", "doctor"]);
+    assert!(doctor.contains("rotation was interrupted"), "{doctor}");
+
+    let agent_process = start_agent(&root, &agent);
+    let config = std::fs::read_to_string(&config_path).expect("read agent config");
+    assert!(
+        !config.contains("pending_control_token"),
+        "pending rotation left in place:\n{config}"
+    );
+    let probe = operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+    assert!(probe.contains("status   reachable"), "{probe}");
+    drop(agent_process);
+    drop(relay);
 }

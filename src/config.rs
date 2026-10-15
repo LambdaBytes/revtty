@@ -56,7 +56,18 @@ pub struct ExclusiveLock {
 }
 
 impl ExclusiveLock {
+    /// Waits until the lock is free.
     pub fn acquire(path: &Path) -> io::Result<Self> {
+        Self::lock(path, libc::LOCK_EX)?
+            .ok_or_else(|| io::Error::other("a blocking lock returned without the lock"))
+    }
+
+    /// Takes the lock only if nobody holds it.
+    pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
+        Self::lock(path, libc::LOCK_EX | libc::LOCK_NB)
+    }
+
+    fn lock(path: &Path, operation: libc::c_int) -> io::Result<Option<Self>> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
@@ -68,12 +79,14 @@ impl ExclusiveLock {
 
         loop {
             // SAFETY: `file` owns a valid descriptor for the duration of the call.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(Self { _file: file });
+            if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+                return Ok(Some(Self { _file: file }));
             }
             let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
+            match error.kind() {
+                io::ErrorKind::Interrupted => {}
+                io::ErrorKind::WouldBlock => return Ok(None),
+                _ => return Err(error),
             }
         }
     }
