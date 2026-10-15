@@ -3,6 +3,7 @@ mod ssh;
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,11 +11,13 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::Message;
-use ssh_key::{Algorithm, PublicKey};
+use ssh_key::{Algorithm, HashAlg, PublicKey};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
 use self::config::{AgentConfig, validate_max_sessions};
+use self::ssh::OperatorAllowlist;
 use crate::config::Paths;
 use crate::identity::ensure_agent;
 
@@ -32,6 +35,9 @@ const RECONNECT_JITTER_PERCENT: u64 = 20;
 const SHELL_SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 /// Writing one frame to the relay; a write that cannot complete means the path is dead.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the running agent rereads its operator list: a revoked operator's sessions are
+/// closed, and new ones refused, within this time.
+const OPERATORS_RELOAD_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy)]
 struct ControlTimeouts {
@@ -145,14 +151,14 @@ pub async fn enroll(relay: &str, token: &str, max_sessions: usize) -> Result<(),
         return Err(RevttyError::message("v1 requires an Ed25519 operator key"));
     }
 
-    AgentConfig {
-        relay: relay.trim_end_matches('/').to_owned(),
-        agent_id: enrolled.agent_id,
-        name: enrolled.name.clone(),
-        control_token: enrolled.control_token,
-        operator_key: enrolled.operator_key,
+    AgentConfig::new(
+        relay.trim_end_matches('/').to_owned(),
+        enrolled.agent_id,
+        enrolled.name.clone(),
+        enrolled.control_token,
+        enrolled.operator_key,
         max_sessions,
-    }
+    )
     .save(&paths)?;
 
     println!("agent      {}", enrolled.name);
@@ -180,6 +186,10 @@ pub async fn run() -> Result<(), RevttyError> {
         ));
     }
 
+    let allowlist = watch_operators(
+        paths.clone(),
+        OperatorAllowlist::parse(config.operators_revision, &config.operators)?,
+    );
     let client = reqwest::Client::new();
     let mut backoff = ReconnectBackoff::default();
     let session_slots = Arc::new(Semaphore::new(config.max_sessions));
@@ -192,6 +202,7 @@ pub async fn run() -> Result<(), RevttyError> {
         let control = run_control_once(
             &client,
             &config,
+            &allowlist,
             &mut backoff,
             &session_slots,
             &session_tasks,
@@ -234,9 +245,61 @@ pub async fn run() -> Result<(), RevttyError> {
     stopped.map_err(|error| RevttyError::runtime("wait for Ctrl-C", error))
 }
 
+/// Rereads the operator list from `agent.toml` on its own schedule, independent of the relay
+/// connection and its backoff, and publishes every change.
+fn watch_operators(paths: Paths, initial: OperatorAllowlist) -> watch::Receiver<OperatorAllowlist> {
+    let (publisher, allowlist) = watch::channel(initial);
+
+    tokio::spawn(async move {
+        let mut reload = tokio::time::interval(OPERATORS_RELOAD_INTERVAL);
+        reload.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut unreadable = false;
+
+        loop {
+            reload.tick().await;
+            let loaded = AgentConfig::load(&paths).and_then(|config| {
+                OperatorAllowlist::parse(config.operators_revision, &config.operators)
+            });
+
+            match loaded {
+                Ok(next) => {
+                    unreadable = false;
+                    let (revision, count) = (next.revision, next.operators.len());
+                    let published = publisher.send_if_modified(|current| {
+                        let changed = current.revision != next.revision
+                            || current.operators != next.operators;
+                        if changed {
+                            *current = next;
+                        }
+                        changed
+                    });
+                    if published {
+                        eprintln!("operator list revision {revision}: {count} operators");
+                    }
+                }
+                // The last valid list stays in force: replacing it with nothing would close
+                // every session, including the one an operator would use to repair the file.
+                // The cause is not logged, since a parse error quotes the file, which holds
+                // the control credential; `revtty agent operator list` shows it.
+                Err(_) if !unreadable => {
+                    unreadable = true;
+                    eprintln!(
+                        "cannot reload the operator list from agent.toml; keeping the previous one (run `revtty agent operator list` for the cause)"
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+    });
+
+    allowlist
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_control_once(
     client: &reqwest::Client,
     config: &AgentConfig,
+    allowlist: &watch::Receiver<OperatorAllowlist>,
     backoff: &mut ReconnectBackoff,
     session_slots: &Arc<Semaphore>,
     session_tasks: &SessionTasks,
@@ -246,8 +309,8 @@ async fn run_control_once(
     let relay = config.relay.as_str();
     let name = config.name.as_str();
     let token = config.control_token.as_str();
-    let operator_key = config.operator_key.as_str();
     let max_sessions = config.max_sessions;
+    let mut operator_changes = allowlist.clone();
     let path = format!("/v1/agent/{name}");
     let websocket = connect_websocket(client, relay, &path, token).await?;
     let (mut sender, mut receiver) = websocket.split();
@@ -263,6 +326,7 @@ async fn run_control_once(
         },
     )
     .await?;
+    send_operators_report(&mut sender, &mut operator_changes).await?;
 
     backoff.reset();
     eprintln!("agent {name} connected to {relay}");
@@ -271,9 +335,17 @@ async fn run_control_once(
     heartbeat.tick().await;
     let idle = tokio::time::sleep(timeouts.relay_idle);
     tokio::pin!(idle);
+    let mut watching_operators = true;
 
     loop {
         tokio::select! {
+            changed = operator_changes.changed(), if watching_operators => {
+                if changed.is_ok() {
+                    send_operators_report(&mut sender, &mut operator_changes).await?;
+                } else {
+                    watching_operators = false;
+                }
+            }
             _ = heartbeat.tick() => {
                 session_tasks
                     .lock()
@@ -382,7 +454,7 @@ async fn run_control_once(
 
                                 let client = client.clone();
                                 let relay = relay.to_owned();
-                                let operator_key = operator_key.to_owned();
+                                let allowlist = allowlist.clone();
                                 let task_session_id = session_id.clone();
                                 let shell_shutdown = shell_shutdown.clone();
 
@@ -393,7 +465,7 @@ async fn run_control_once(
                                         &relay,
                                         &tunnel_token,
                                         &task_session_id,
-                                        &operator_key,
+                                        allowlist,
                                         shell_shutdown,
                                     )
                                     .await
@@ -489,6 +561,30 @@ async fn reject_incompatible_offer(
             version: CONTROL_PROTOCOL_VERSION,
             session_id,
             reason: SessionRejectReason::IncompatibleVersion,
+        },
+    )
+    .await
+}
+
+/// Tells the relay which operators this agent accepts, as of the latest published list.
+async fn send_operators_report(
+    sender: &mut futures_util::stream::SplitSink<
+        reqwest_websocket::WebSocket,
+        reqwest_websocket::Message,
+    >,
+    allowlist: &mut watch::Receiver<OperatorAllowlist>,
+) -> Result<(), RevttyError> {
+    let (revision, operators) = {
+        let current = allowlist.borrow_and_update();
+        (current.revision, current.operators.clone())
+    };
+
+    send_control(
+        sender,
+        ControlMessage::OperatorsReport {
+            version: CONTROL_PROTOCOL_VERSION,
+            revision,
+            operators,
         },
     )
     .await
@@ -630,6 +726,58 @@ pub fn status() -> Result<(), RevttyError> {
     Ok(())
 }
 
+pub fn operator_list() -> Result<(), RevttyError> {
+    let paths = Paths::discover()?;
+    let config = AgentConfig::load(&paths)?;
+
+    println!("revision   {}", config.operators_revision);
+    for encoded in &config.operators {
+        let key = PublicKey::from_openssh(encoded)
+            .map_err(|error| RevttyError::runtime("parse operator key", error))?;
+        let fingerprint = key.fingerprint(HashAlg::Sha256);
+        match key.comment() {
+            "" => println!("operator   {fingerprint}"),
+            comment => println!("operator   {fingerprint} {comment}"),
+        }
+    }
+    Ok(())
+}
+
+pub fn operator_add(key_path: &Path) -> Result<(), RevttyError> {
+    let paths = Paths::discover()?;
+    let encoded = std::fs::read_to_string(key_path)
+        .map_err(|error| RevttyError::runtime("read operator public key", error))?;
+    let (fingerprint, revision) = AgentConfig::update(&paths, |config| {
+        let fingerprint = config.add_operator(&encoded)?;
+        Ok((fingerprint, config.operators_revision))
+    })?;
+
+    println!("added      {fingerprint}");
+    println!("revision   {revision}");
+    print_reload_note();
+    Ok(())
+}
+
+pub fn operator_revoke(fingerprint: &str) -> Result<(), RevttyError> {
+    let paths = Paths::discover()?;
+    let revision = AgentConfig::update(&paths, |config| {
+        config.revoke_operator(fingerprint)?;
+        Ok(config.operators_revision)
+    })?;
+
+    println!("revoked    {fingerprint}");
+    println!("revision   {revision}");
+    print_reload_note();
+    Ok(())
+}
+
+fn print_reload_note() {
+    println!(
+        "A running agent applies the change within {}s; a revoked operator's open sessions are closed.",
+        OPERATORS_RELOAD_INTERVAL.as_secs()
+    );
+}
+
 pub async fn doctor() -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
     let config = AgentConfig::load(&paths)?;
@@ -642,15 +790,6 @@ pub async fn doctor() -> Result<(), RevttyError> {
         return Err(RevttyError::message(
             "persisted agent configuration is incomplete",
         ));
-    }
-
-    match PublicKey::from_openssh(&config.operator_key) {
-        Ok(key) if key.algorithm() == Algorithm::Ed25519 => {}
-        _ => {
-            return Err(RevttyError::message(
-                "persisted operator key is not a valid Ed25519 SSH key",
-            ));
-        }
     }
 
     // Whoever can change these files can impersonate the agent or take its shells.
@@ -668,6 +807,7 @@ pub async fn doctor() -> Result<(), RevttyError> {
     println!("host key   {}", identity.fingerprint);
     println!("protocol   v{}", crate::protocol::CONTROL_PROTOCOL_VERSION);
     println!("sessions   {}", config.max_sessions);
+    println!("operators  {}", config.operators.len());
     println!("relay      {} reachable", config.relay);
     println!("credential accepted by the relay");
     println!("config     {}", AgentConfig::path(&paths).display());
@@ -711,10 +851,13 @@ mod tests {
     use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 
     use super::config::AgentConfig;
+    use super::ssh::OperatorAllowlist;
     use super::{
-        ControlTimeouts, RECONNECT_JITTER_PERCENT, ReconnectBackoff, describe_undecodable,
-        pty_test, reconnect_base_millis, reconnect_delay_millis, run_control_once, ssh,
+        ControlTimeouts, OPERATORS_RELOAD_INTERVAL, RECONNECT_JITTER_PERCENT, ReconnectBackoff,
+        describe_undecodable, pty_test, reconnect_base_millis, reconnect_delay_millis,
+        run_control_once, ssh, watch_operators,
     };
+    use crate::config::Paths;
     use crate::protocol::SESSION_ERROR_PREFIX;
 
     const FAST_CONTROL_TIMEOUTS: ControlTimeouts = ControlTimeouts {
@@ -778,14 +921,19 @@ mod tests {
             .public_key()
             .to_openssh()
             .expect("encode operator key");
-        let config = AgentConfig {
-            relay: relay.to_owned(),
-            agent_id: "agent-id".to_owned(),
-            name: "fake-agent".to_owned(),
-            control_token: "rva_test".to_owned(),
+        let config = AgentConfig::new(
+            relay.to_owned(),
+            "agent-id".to_owned(),
+            "fake-agent".to_owned(),
+            "rva_test".to_owned(),
             operator_key,
-            max_sessions: 4,
-        };
+            4,
+        );
+        let allowlist = watch::channel(
+            OperatorAllowlist::parse(config.operators_revision, &config.operators)
+                .expect("operator allowlist"),
+        )
+        .1;
         let (shutdown, _) = watch::channel(false);
         let (guard, _guards) = mpsc::channel(1);
         let shell_shutdown = ssh::ShellShutdown::new(shutdown.subscribe(), &guard);
@@ -795,6 +943,7 @@ mod tests {
             run_control_once(
                 &reqwest::Client::new(),
                 &config,
+                &allowlist,
                 &mut ReconnectBackoff::default(),
                 &Arc::new(Semaphore::new(4)),
                 &Arc::new(Mutex::new(HashMap::new())),
@@ -911,5 +1060,81 @@ mod tests {
             !describe_undecodable(&error).contains("SECRET_MARKER"),
             "diagnostic leaks received content"
         );
+    }
+
+    fn operator_key() -> String {
+        PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519)
+            .expect("operator key")
+            .public_key()
+            .to_openssh()
+            .expect("encode operator key")
+    }
+
+    #[test]
+    fn operators_report_stays_small_whatever_the_comments() {
+        // Control characters, which JSON expands sixfold, in the longest comments.
+        let operators = (0..crate::protocol::MAX_OPERATORS)
+            .map(|_| {
+                let mut key =
+                    PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519)
+                        .expect("operator key");
+                key.set_comment("\u{1}".repeat(4096));
+                key.public_key().to_openssh().expect("encode operator key")
+            })
+            .collect::<Vec<_>>();
+        let allowlist = OperatorAllowlist::parse(1, &operators).expect("operator allowlist");
+
+        let report = serde_json::to_string(&crate::protocol::ControlMessage::OperatorsReport {
+            version: crate::protocol::CONTROL_PROTOCOL_VERSION,
+            revision: allowlist.revision,
+            operators: allowlist.operators.clone(),
+        })
+        .expect("encode report");
+        assert!(report.len() < 16 * 1024, "report of {} bytes", report.len());
+        assert!(!report.contains("\\u0001"), "comments were reported");
+    }
+
+    #[tokio::test]
+    async fn operator_watch_keeps_the_last_valid_list_and_publishes_changes() {
+        let root = std::env::temp_dir().join(format!("revtty-watch-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        let first = operator_key();
+        let enrolled = AgentConfig::new(
+            "ws://127.0.0.1:9".to_owned(),
+            "agent-id".to_owned(),
+            "watched-agent".to_owned(),
+            "rva_test".to_owned(),
+            first.clone(),
+            4,
+        );
+        enrolled.save(&paths).expect("save agent config");
+        let mut allowlist = watch_operators(
+            paths.clone(),
+            OperatorAllowlist::parse(enrolled.operators_revision, &enrolled.operators)
+                .expect("operator allowlist"),
+        );
+
+        // A configuration broken by hand does not empty the list.
+        std::fs::write(AgentConfig::path(&paths), "operators = [").expect("break config");
+        tokio::time::sleep(OPERATORS_RELOAD_INTERVAL * 2).await;
+        assert!(
+            !allowlist.has_changed().expect("operator watch running"),
+            "an unreadable configuration replaced the operator list"
+        );
+        assert_eq!(allowlist.borrow().operators, vec![first.clone()]);
+
+        let mut repaired = enrolled;
+        repaired
+            .add_operator(&operator_key())
+            .expect("add operator");
+        repaired.save(&paths).expect("save repaired config");
+        tokio::time::timeout(OPERATORS_RELOAD_INTERVAL * 2, allowlist.changed())
+            .await
+            .expect("operator change not published")
+            .expect("operator watch running");
+        assert_eq!(allowlist.borrow().revision, 2);
+        assert_eq!(allowlist.borrow().operators.len(), 2);
+
+        std::fs::remove_dir_all(root).expect("clean watch test directory");
     }
 }

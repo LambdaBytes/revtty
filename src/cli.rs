@@ -114,6 +114,30 @@ pub enum AgentCommand {
 
     /// Run agent-specific diagnostics.
     Doctor,
+
+    /// Manage the operators allowed to open shells on this agent.
+    Operator {
+        #[command(subcommand)]
+        command: OperatorCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OperatorCommand {
+    /// Show the authorized operator keys and the list revision.
+    List,
+
+    /// Authorize one more operator public key (OpenSSH Ed25519).
+    Add {
+        /// Operator public key file, e.g. the id_ed25519.pub printed by `revtty init`.
+        key: PathBuf,
+    },
+
+    /// Revoke an operator; its open sessions on this agent are closed.
+    Revoke {
+        /// Fingerprint of the key to revoke (SHA256:...), as `agent operator list` shows it.
+        fingerprint: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -225,6 +249,16 @@ mod tests {
     fn parses_agent_run() {
         let args = Args::try_parse_from(["revtty", "agent", "run"]);
         assert!(args.is_ok());
+    }
+
+    #[test]
+    fn parses_agent_operator_commands() {
+        assert!(Args::try_parse_from(["revtty", "agent", "operator", "list"]).is_ok());
+        assert!(Args::try_parse_from(["revtty", "agent", "operator", "add", "op.pub"]).is_ok());
+        assert!(
+            Args::try_parse_from(["revtty", "agent", "operator", "revoke", "SHA256:abc"]).is_ok()
+        );
+        assert!(Args::try_parse_from(["revtty", "agent", "operator", "revoke"]).is_err());
     }
 
     #[test]

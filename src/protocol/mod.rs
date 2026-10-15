@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
 pub const OPERATOR_AUTH_NAMESPACE: &str = "revtty-control-v1";
 pub const SESSION_ERROR_PREFIX: &str = "revtty-error:";
+/// Bound of an agent's operator list, which `OperatorsReport` carries whole in one message.
+/// Keys are reported without their comments, so the message stays far below the relay's
+/// 64 KiB limit, which would otherwise drop the control connection on every reconnect.
+pub const MAX_OPERATORS: usize = 64;
 
 pub fn operator_auth_message(agent_name: &str, challenge: &str) -> String {
     format!("revtty-control-v1\nagent={agent_name}\nchallenge={challenge}\n")
@@ -59,6 +63,16 @@ pub enum ControlMessage {
     SessionCancel {
         version: u16,
         session_id: String,
+    },
+    /// The agent's authorized operator keys (OpenSSH), sent after `Hello` and whenever they
+    /// change. The agent's own list is what SSH authentication enforces; the relay keeps this
+    /// copy only to decide whom it issues session credentials to, and only from the agent's
+    /// current control connection. `revision` is the list's revision in `agent.toml`; keys
+    /// are sent without their OpenSSH comments.
+    OperatorsReport {
+        version: u16,
+        revision: u64,
+        operators: Vec<String>,
     },
 }
 
@@ -217,6 +231,11 @@ mod tests {
             ControlMessage::SessionCancel {
                 version: 1,
                 session_id: "session".to_owned(),
+            },
+            ControlMessage::OperatorsReport {
+                version: 1,
+                revision: 3,
+                operators: vec!["ssh-ed25519 AAAA one".to_owned()],
             },
         ] {
             let json = serde_json::to_string(&message).expect("serialize lifecycle message");

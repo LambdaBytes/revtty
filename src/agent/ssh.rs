@@ -3,17 +3,18 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 use reqwest::Client;
-use russh::keys::{Algorithm, PrivateKey, PublicKey};
+use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{self, Msg, Session};
 use russh::{Channel, ChannelId, Preferred, Pty};
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::config::Paths;
 use crate::error::RevttyError;
@@ -37,6 +38,101 @@ const HANGUP_GRACE: Duration = Duration::from_secs(5);
 const KILL_REAP_WAIT: Duration = Duration::from_secs(5);
 /// Output still forwarded after the shell exits; a background job may keep the PTY open.
 const OUTPUT_DRAIN_WAIT: Duration = Duration::from_secs(1);
+/// Time the SSH session of a revoked operator gets to end once its transport is cut.
+const REVOKED_SESSION_WAIT: Duration = Duration::from_secs(5);
+
+/// The operator keys this agent accepts, as last read from its configuration.
+#[derive(Clone)]
+pub struct OperatorAllowlist {
+    pub revision: u64,
+    /// OpenSSH encodings without comments, as reported to the relay.
+    pub operators: Vec<String>,
+    keys: Vec<PublicKey>,
+}
+
+impl OperatorAllowlist {
+    pub fn parse(revision: u64, operators: &[String]) -> Result<Self, RevttyError> {
+        let keys = operators
+            .iter()
+            .map(|encoded| {
+                let key = PublicKey::from_openssh(encoded).map_err(|error| {
+                    RevttyError::runtime("parse authorized operator key", error)
+                })?;
+                if key.algorithm() != Algorithm::Ed25519 {
+                    return Err(RevttyError::message("v1 requires Ed25519 operator keys"));
+                }
+                Ok(key)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // A comment is free text that JSON may expand sixfold; the relay needs only the key.
+        let operators = keys
+            .iter()
+            .map(|key| {
+                PublicKey::new(key.key_data().clone(), "")
+                    .to_openssh()
+                    .map_err(|error| RevttyError::runtime("encode operator key", error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            revision,
+            operators,
+            keys,
+        })
+    }
+
+    /// Compares key material only: configured keys keep their OpenSSH comment, while the key
+    /// presented in SSH authentication never carries one.
+    fn permits(&self, key: &PublicKey) -> bool {
+        self.keys
+            .iter()
+            .any(|allowed| allowed.key_data() == key.key_data())
+    }
+}
+
+/// Checks `key` against the current allowlist and, when it is allowed, runs `record` before
+/// the allowlist can change. The borrow holds the watch's read lock, which its sender needs
+/// to publish, so a revocation lands either before the check, which then refuses the key, or
+/// after `record`, where the session's own subscription sees it.
+fn authorize(
+    allowlist: &mut watch::Receiver<OperatorAllowlist>,
+    key: &PublicKey,
+    record: impl FnOnce(),
+) -> bool {
+    let current = allowlist.borrow_and_update();
+    if !current.permits(key) {
+        return false;
+    }
+
+    record();
+    true
+}
+
+/// Resolves once the key that authenticated the session is no longer allowed.
+async fn operator_revoked(
+    allowlist: &mut watch::Receiver<OperatorAllowlist>,
+    authenticated: &Mutex<Option<PublicKey>>,
+) -> PublicKey {
+    loop {
+        if allowlist.changed().await.is_err() {
+            // The agent stopped watching its configuration: the list can no longer change.
+            std::future::pending::<()>().await;
+        }
+
+        let revoked = {
+            let current = allowlist.borrow_and_update();
+            authenticated
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .filter(|key| !current.permits(key))
+                .cloned()
+        };
+        if let Some(key) = revoked {
+            return key;
+        }
+    }
+}
 
 /// Lets the agent stop every shell and wait for the teardowns before its runtime shuts down.
 #[derive(Clone)]
@@ -78,7 +174,9 @@ struct ActiveShell {
 }
 
 struct AgentSshHandler {
-    authorized_operator: PublicKey,
+    allowlist: watch::Receiver<OperatorAllowlist>,
+    /// The key this session authenticated with, watched for revocation by `serve_stream`.
+    authenticated: Arc<Mutex<Option<PublicKey>>>,
     shutdown: ShellShutdown,
     open_channel: Option<ChannelId>,
     pending_pty: Option<PendingPty>,
@@ -86,9 +184,14 @@ struct AgentSshHandler {
 }
 
 impl AgentSshHandler {
-    fn new(authorized_operator: PublicKey, shutdown: ShellShutdown) -> Self {
+    fn new(
+        allowlist: watch::Receiver<OperatorAllowlist>,
+        authenticated: Arc<Mutex<Option<PublicKey>>>,
+        shutdown: ShellShutdown,
+    ) -> Self {
         Self {
-            authorized_operator,
+            allowlist,
+            authenticated,
             shutdown,
             open_channel: None,
             pending_pty: None,
@@ -154,9 +257,13 @@ impl server::Handler for AgentSshHandler {
         user: &str,
         public_key: &PublicKey,
     ) -> Result<server::Auth, Self::Error> {
-        // Compare key material only: the enrolled key keeps its OpenSSH comment, while the key
-        // presented in SSH authentication never carries one.
-        if user == "revtty" && public_key.key_data() == self.authorized_operator.key_data() {
+        let authenticated = &self.authenticated;
+        if user == "revtty"
+            && authorize(&mut self.allowlist, public_key, || {
+                *authenticated.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(public_key.clone());
+            })
+        {
             Ok(server::Auth::Accept)
         } else {
             Ok(server::Auth::reject())
@@ -682,36 +789,28 @@ pub async fn serve(
     relay: &str,
     tunnel_token: &str,
     session_id: &str,
-    encoded_operator_key: &str,
+    allowlist: watch::Receiver<OperatorAllowlist>,
     shutdown: ShellShutdown,
 ) -> Result<(), RevttyError> {
     let path = format!("/v1/session/{session_id}");
     let websocket = connect_websocket(client, relay, &path, tunnel_token).await?;
     let (stream, bridge_task) = websocket_byte_stream(websocket);
+    let transport = bridge_task.abort_handle();
 
     let result = async {
         let paths = Paths::discover()?;
         let identity = ensure_agent(&paths)?;
         let host_key = PrivateKey::read_openssh_file(&identity.private_key_path)
             .map_err(|error| RevttyError::runtime("read agent SSH host key", error))?;
-        let authorized_operator = PublicKey::from_openssh(encoded_operator_key)
-            .map_err(|error| RevttyError::runtime("parse authorized operator key", error))?;
 
-        if authorized_operator.algorithm() != Algorithm::Ed25519 {
-            return Err(RevttyError::message("v1 requires an Ed25519 operator key"));
-        }
-
-        let running = server::run_stream(
-            Arc::new(server_config(host_key, SSH_TIMEOUTS)),
+        serve_stream(
             stream,
-            AgentSshHandler::new(authorized_operator, shutdown),
+            transport,
+            server_config(host_key, SSH_TIMEOUTS),
+            allowlist,
+            shutdown,
         )
         .await
-        .map_err(|error| RevttyError::runtime("start SSH server", error))?;
-
-        running
-            .await
-            .map_err(|error| RevttyError::runtime("run SSH session", error))
     }
     .await;
 
@@ -719,9 +818,60 @@ pub async fn serve(
     result
 }
 
+/// Runs one operator's SSH session over `stream` until it ends or the key it authenticated
+/// with is revoked. `transport` is the task that carries `stream`.
+async fn serve_stream<S>(
+    stream: S,
+    transport: AbortHandle,
+    config: server::Config,
+    allowlist: watch::Receiver<OperatorAllowlist>,
+    shutdown: ShellShutdown,
+) -> Result<(), RevttyError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let authenticated = Arc::new(Mutex::new(None));
+    // Subscribed before the handler can authenticate anyone, so every later change of the
+    // allowlist is seen here.
+    let mut changes = allowlist.clone();
+
+    let mut running = server::run_stream(
+        Arc::new(config),
+        stream,
+        AgentSshHandler::new(allowlist, Arc::clone(&authenticated), shutdown),
+    )
+    .await
+    .map_err(|error| RevttyError::runtime("start SSH server", error))?;
+
+    tokio::select! {
+        result = &mut running => {
+            result.map_err(|error| RevttyError::runtime("run SSH session", error))
+        }
+        revoked = operator_revoked(&mut changes, &authenticated) => {
+            let fingerprint = revoked.fingerprint(HashAlg::Sha256);
+            eprintln!("operator {fingerprint} was revoked; closing its session");
+            // Dropping the session would leave russh running; ending its transport stops it,
+            // and dropping its handler tears the shell down.
+            transport.abort();
+            if tokio::time::timeout(REVOKED_SESSION_WAIT, &mut running)
+                .await
+                .is_err()
+            {
+                eprintln!(
+                    "session of revoked operator {fingerprint} did not end within {}s",
+                    REVOKED_SESSION_WAIT.as_secs()
+                );
+            }
+            Err(RevttyError::message(format!(
+                "operator {fingerprint} was revoked"
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use portable_pty::Child;
@@ -731,9 +881,26 @@ mod tests {
     use russh::{client, server};
     use tokio::sync::{mpsc, watch};
 
-    use super::{AgentSshHandler, ShellShutdown, ed25519_only, server_config, signal_if_running};
-    use crate::transport::SshTimeouts;
+    use super::{
+        AgentSshHandler, OperatorAllowlist, ShellShutdown, authorize, ed25519_only,
+        operator_revoked, serve_stream, server_config, signal_if_running,
+    };
+    use crate::error::RevttyError;
     use crate::transport::test_support::{ControlledStream, StreamControl};
+    use crate::transport::{SSH_TIMEOUTS, SshTimeouts};
+
+    fn allowlist_of(keys: &[&PublicKey]) -> OperatorAllowlist {
+        let operators = keys
+            .iter()
+            .map(|key| key.to_openssh().expect("encode operator key"))
+            .collect::<Vec<_>>();
+        OperatorAllowlist::parse(1, &operators).expect("operator allowlist")
+    }
+
+    /// An allowlist that never changes: its sender is gone.
+    fn allow_only(key: &PublicKey) -> watch::Receiver<OperatorAllowlist> {
+        watch::channel(allowlist_of(&[key])).1
+    }
 
     /// The agent side of shell shutdown: strong guard sender and shutdown signal.
     struct TestShutdown {
@@ -807,7 +974,11 @@ mod tests {
             let running = server::run_stream(
                 Arc::new(server_config),
                 server_stream,
-                AgentSshHandler::new(authorized_client, shell_shutdown),
+                AgentSshHandler::new(
+                    allow_only(&authorized_client),
+                    Arc::default(),
+                    shell_shutdown,
+                ),
             )
             .await
             .expect("start SSH PTY server");
@@ -925,7 +1096,11 @@ mod tests {
             let running = server::run_stream(
                 Arc::new(server_config),
                 server_stream,
-                AgentSshHandler::new(authorized_client, shell_shutdown),
+                AgentSshHandler::new(
+                    allow_only(&authorized_client),
+                    Arc::default(),
+                    shell_shutdown,
+                ),
             )
             .await
             .expect("start SSH server");
@@ -997,7 +1172,11 @@ mod tests {
                 let running = server::run_stream(
                     Arc::new(server_config),
                     server_stream,
-                    AgentSshHandler::new(authorized_client, shell_shutdown),
+                    AgentSshHandler::new(
+                        allow_only(&authorized_client),
+                        Arc::default(),
+                        shell_shutdown,
+                    ),
                 )
                 .await
                 .expect("start SSH PTY server");
@@ -1421,7 +1600,11 @@ mod tests {
             if let Ok(running) = server::run_stream(
                 Arc::new(config),
                 server_stream,
-                AgentSshHandler::new(authorized_client, shell_shutdown),
+                AgentSshHandler::new(
+                    allow_only(&authorized_client),
+                    Arc::default(),
+                    shell_shutdown,
+                ),
             )
             .await
             {
@@ -1512,7 +1695,11 @@ mod tests {
             server::run_stream(
                 Arc::new(config),
                 server_stream,
-                AgentSshHandler::new(ed25519_key().public_key().clone(), shutdown.handle()),
+                AgentSshHandler::new(
+                    allow_only(ed25519_key().public_key()),
+                    Arc::default(),
+                    shutdown.handle(),
+                ),
             ),
         )
         .await;
@@ -1520,6 +1707,222 @@ mod tests {
         assert!(
             matches!(started, Ok(Err(_))),
             "agent waited indefinitely for a peer that never sent its banner"
+        );
+    }
+
+    /// The production session path (`serve_stream`) with a live allowlist, over a transport
+    /// task like the agent's WebSocket bridge, authenticated as `operator`.
+    struct RevocableSession {
+        allowlist: watch::Sender<OperatorAllowlist>,
+        session: client::Handle<TestClient>,
+        server: tokio::task::JoinHandle<Result<(), RevttyError>>,
+        _shutdown: TestShutdown,
+    }
+
+    async fn revocable_session(operator: &PrivateKey, allowed: &[&PublicKey]) -> RevocableSession {
+        let server_key = ed25519_key();
+        let expected_server_key = server_key.public_key().clone();
+        let (allowlist, allowlist_rx) = watch::channel(allowlist_of(allowed));
+
+        let (client_stream, relay_side) = tokio::io::duplex(256 * 1024);
+        let (application, agent_side) = tokio::io::duplex(256 * 1024);
+        // Stands in for the bridge task that carries the agent's stream over the relay.
+        let bridge = tokio::spawn(async move {
+            let (mut relay_side, mut agent_side) = (relay_side, agent_side);
+            let _ = tokio::io::copy_bidirectional(&mut relay_side, &mut agent_side).await;
+        });
+
+        let shutdown = TestShutdown::new();
+        let server = tokio::spawn(serve_stream(
+            application,
+            bridge.abort_handle(),
+            server_config(server_key, SSH_TIMEOUTS),
+            allowlist_rx,
+            shutdown.handle(),
+        ));
+
+        let client_config = client::Config {
+            preferred: ed25519_only(),
+            ..Default::default()
+        };
+        let mut session = client::connect_stream(
+            Arc::new(client_config),
+            client_stream,
+            TestClient {
+                expected_server_key,
+            },
+        )
+        .await
+        .expect("connect SSH client");
+        let auth = session
+            .authenticate_publickey(
+                "revtty",
+                PrivateKeyWithHashAlg::new(Arc::new(operator.clone()), None),
+            )
+            .await
+            .expect("authenticate operator");
+        assert!(auth.success(), "allowed operator was rejected");
+
+        RevocableSession {
+            allowlist,
+            session,
+            server,
+            _shutdown: shutdown,
+        }
+    }
+
+    async fn read_until(
+        channel: &mut russh::Channel<client::Msg>,
+        pattern: &str,
+        within: Duration,
+    ) -> String {
+        let mut output = Vec::new();
+        let read = tokio::time::timeout(within, async {
+            while let Some(message) = channel.wait().await {
+                if let ChannelMsg::Data { data } = message {
+                    output.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&output).contains(pattern) {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        let text = String::from_utf8_lossy(&output).into_owned();
+        assert!(read.is_ok(), "timed out waiting for {pattern:?}: {text}");
+        text
+    }
+
+    #[tokio::test]
+    async fn revoked_operator_session_is_closed_and_its_shell_reaped() {
+        let operator = ed25519_key();
+        let other = ed25519_key();
+        let shell =
+            revocable_session(&operator, &[operator.public_key(), other.public_key()]).await;
+
+        let mut channel = shell
+            .session
+            .channel_open_session()
+            .await
+            .expect("open terminal channel");
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .expect("request PTY");
+        channel.request_shell(true).await.expect("request shell");
+        channel
+            .data_bytes(b"echo PID=$$ END_$((3+4))\n".to_vec())
+            .await
+            .expect("send shell input");
+        let text = read_until(&mut channel, "END_7", Duration::from_secs(10)).await;
+        let pid = marker_value(&text, "PID=");
+
+        // What the operator watch publishes once `agent operator revoke` rewrote the list.
+        shell
+            .allowlist
+            .send_replace(allowlist_of(&[other.public_key()]));
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), shell.server)
+            .await
+            .expect("session of a revoked operator stayed open")
+            .expect("session task");
+        let error = ended.expect_err("revoked session ended as if completed");
+        assert!(error.to_string().contains("revoked"), "{error}");
+
+        let gone = wait_process_gone(&pid, Duration::from_secs(10)).await;
+        if !gone {
+            kill_process(&pid);
+        }
+        assert!(
+            gone,
+            "shell {pid} of a revoked operator survived its session"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowlist_change_that_keeps_the_key_keeps_the_session() {
+        let operator = ed25519_key();
+        let added = ed25519_key();
+        let shell = revocable_session(&operator, &[operator.public_key()]).await;
+
+        shell
+            .allowlist
+            .send_replace(allowlist_of(&[operator.public_key(), added.public_key()]));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            !shell.server.is_finished(),
+            "an unrelated change closed the session"
+        );
+        shell
+            .session
+            .channel_open_session()
+            .await
+            .expect("session is still usable");
+        shell.server.abort();
+    }
+
+    #[tokio::test]
+    async fn operator_added_after_start_authenticates_and_others_do_not() {
+        let operator = ed25519_key();
+        let added = ed25519_key();
+        let (allowlist, mut receiver) = watch::channel(allowlist_of(&[operator.public_key()]));
+        let authenticated = Mutex::new(None);
+        let record = |key: &PublicKey| {
+            let key = key.clone();
+            let authenticated = &authenticated;
+            move || *authenticated.lock().expect("authenticated key") = Some(key)
+        };
+
+        // Keys the agent does not list are refused, whatever the relay believes.
+        assert!(!authorize(
+            &mut receiver,
+            added.public_key(),
+            record(added.public_key())
+        ));
+
+        allowlist.send_replace(allowlist_of(&[operator.public_key(), added.public_key()]));
+        assert!(authorize(
+            &mut receiver,
+            added.public_key(),
+            record(added.public_key())
+        ));
+        assert!(
+            authenticated
+                .lock()
+                .expect("authenticated key")
+                .as_ref()
+                .is_some_and(|key| key.key_data() == added.public_key().key_data())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revocation_racing_authentication_is_never_missed() {
+        let operator = ed25519_key();
+        let (publisher, mut handler_view) = watch::channel(allowlist_of(&[operator.public_key()]));
+        let publisher = Arc::new(publisher);
+        let authenticated = Arc::new(Mutex::new(None));
+
+        // The session's own subscription, already waiting for changes, as in `serve_stream`.
+        let mut changes = handler_view.clone();
+        let watched = Arc::clone(&authenticated);
+        let watcher = tokio::spawn(async move { operator_revoked(&mut changes, &watched).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let accepted = authorize(&mut handler_view, operator.public_key(), || {
+            // The revocation is published between the check and the record of the key...
+            let racing = Arc::clone(&publisher);
+            std::thread::spawn(move || racing.send_replace(allowlist_of(&[])));
+            // ...with time for it, and for the watcher's reaction, to happen if they can.
+            std::thread::sleep(Duration::from_millis(300));
+            *authenticated.lock().expect("authenticated key") = Some(operator.public_key().clone());
+        });
+        assert!(accepted);
+
+        let revoked = tokio::time::timeout(Duration::from_secs(2), watcher).await;
+        assert!(
+            revoked.is_ok(),
+            "a revocation published during authentication was never applied"
         );
     }
 }

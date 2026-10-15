@@ -95,6 +95,20 @@ Fields:
 
 The agent tracks spawned session tasks by ID and aborts the matching task on cancellation.
 
+### operators_report
+
+The agent tells the relay which operator keys it accepts: right after `hello`, and whenever its operator list in `agent.toml` changes.
+
+Fields:
+
+- `version`
+- `revision`: the list's revision in `agent.toml`
+- `operators`: OpenSSH Ed25519 public keys, without their comments (at most 64)
+
+The relay stores a report only when it comes from the agent's current control connection, which the relay records in its database when the connection registers; whatever its revision, that report is what the agent enforces (an `agent.toml` restored from a backup goes back in revisions). A report that arrives on a replaced connection, or that the relay cannot store, closes that control connection: the agent reconnects and reports its list again. A report with an empty list or an unusable key is ignored whole. Relays that predate this message ignore it, and agents that never send it keep the operator they were enrolled for.
+
+The relay uses the list only to decide whom it issues operator session credentials to. SSH authentication on the agent enforces the agent's own list, so a relay that adds a key to its copy gains no shell.
+
 ## Operator authentication and rendezvous credentials
 
 Operator control authentication currently uses HTTP JSON endpoints around an OpenSSH SSHSIG challenge rather than a control-channel message.
@@ -104,15 +118,15 @@ The flow is:
 1. request a target-specific challenge;
 2. sign the canonical `revtty-control-v1` message with the operator Ed25519 key;
 3. submit the SSHSIG;
-4. receive a short-lived opaque operator session credential plus the enrolled agent host key;
-5. consume that credential once when opening `/v1/probe/{name}` or `/v1/connect/{name}`;
+4. receive a short-lived opaque operator session credential plus the enrolled agent host key; the relay takes the key from the signature and accepts it only if it is one of the agent's reported operators;
+5. consume that credential once when opening `/v1/probe/{name}` or `/v1/connect/{name}`; it is refused if the operator was revoked, or the agent re-enrolled, in between;
 6. the relay generates a separate one-time agent `tunnel_token` and sends the corresponding offer over the agent control channel.
 
 The operator and agent rendezvous credentials are therefore distinct.
 
 `revtty status <name>` reuses this target-scoped authentication flow and consumes the resulting operator session credential once on `GET /v1/status/{name}`. It returns persisted identity/presence metadata plus the relay's current online/offline view without opening a data tunnel.
 
-`revtty list` uses a separate one-time SSHSIG inventory challenge. The client signs the canonical `scope=list` message and sends its Ed25519 public key with the signature. The relay verifies possession of that key and returns only enrolled agents whose authorized operator key has the same SHA-256 SSH fingerprint. The inventory challenge is removed when used, including failed/replayed attempts.
+`revtty list` uses a separate one-time SSHSIG inventory challenge. The client signs the canonical `scope=list` message and sends its Ed25519 public key with the signature. The relay verifies possession of that key and returns only enrolled agents whose reported operators include its SHA-256 SSH fingerprint. The inventory challenge is removed when used, including failed/replayed attempts.
 
 ## Operator-visible rendezvous failures
 
@@ -164,6 +178,7 @@ SSH performs agent host authentication and operator public-key authentication in
 - A persistent agent control credential cannot open a `/v1/session` data tunnel.
 - A pending agent side is paired at most once.
 - Operator and agent rendezvous credentials are distinct.
+- The relay keeps an agent's operator list only as the agent reported it on its current control connection; SSH access is decided by the agent's own list.
 - The relay can route terminal data without understanding the SSH payload.
 - Secret-bearing control types do not derive debug formatting.
 

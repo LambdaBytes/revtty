@@ -1,4 +1,4 @@
-use crate::cli::{AgentCommand, Args, Command, RelayCommand};
+use crate::cli::{AgentCommand, Args, Command, OperatorCommand, RelayCommand};
 use crate::error::RevttyError;
 
 /// Runs one command and returns the process exit code.
@@ -33,6 +33,13 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
             AgentCommand::PtyTest => crate::agent::pty_test(),
             AgentCommand::Status => crate::agent::status(),
             AgentCommand::Doctor => crate::agent::doctor().await,
+            AgentCommand::Operator { command } => match command {
+                OperatorCommand::List => crate::agent::operator_list(),
+                OperatorCommand::Add { key } => crate::agent::operator_add(&key),
+                OperatorCommand::Revoke { fingerprint } => {
+                    crate::agent::operator_revoke(&fingerprint)
+                }
+            },
         },
         Command::Relay { command } => match command {
             RelayCommand::Init { db } => crate::relay::init(&db).await,

@@ -699,7 +699,7 @@ fn doctors_check_authentication_permissions_and_tls() {
     let relay_doctor =
         relay_role.run(&["relay", "doctor", "--db", db.to_str().expect("utf-8 path")]);
     assert!(
-        relay_doctor.contains("schema     v3"),
+        relay_doctor.contains("schema     v4"),
         "unexpected relay doctor output:\n{relay_doctor}"
     );
 
@@ -771,5 +771,95 @@ fn busy_agent_is_reported_to_probe() {
     assert!(
         refused.contains("agent is busy"),
         "busy agent not reported to probe:\n{refused}"
+    );
+}
+
+#[test]
+fn operators_are_managed_from_a_session_and_revocation_closes_it() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let second = Role::new(&root, "second");
+    let second_fingerprint = field(&second.run(&["init"]), "fingerprint").to_owned();
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let agent_process = start_agent(&root, &agent);
+    let logs = [&relay, &agent_process];
+
+    // The target's administrator authorizes a second operator; the running agent picks it up
+    // and tells the relay.
+    let second_key = second.config.join("id_ed25519.pub");
+    let added = agent.run(&[
+        "agent",
+        "operator",
+        "add",
+        second_key.to_str().expect("utf-8 path"),
+    ]);
+    assert_eq!(field(&added, "added"), second_fingerprint);
+    agent_process.wait_for_log("operator list revision 2", Duration::from_secs(10));
+    relay.wait_for_log("operators updated to revision 2", Duration::from_secs(10));
+
+    let mut terminal = Terminal::connect(&second, &url, Some(&host_key));
+    terminal.wait_ready(Duration::from_secs(20), &logs);
+
+    // Inside the agent's own shell, revtty manages the agent it runs under.
+    terminal.send(&format!("{REVTTY} agent operator list\r"));
+    terminal.wait_for(
+        &format!("operator   {second_fingerprint}"),
+        Duration::from_secs(10),
+        &logs,
+    );
+
+    // An operator revoking itself: the change is written, then its session is closed.
+    terminal.send(&format!(
+        "{REVTTY} agent operator revoke {second_fingerprint}\r"
+    ));
+    terminal.wait_for(
+        &format!("revoked    {second_fingerprint}"),
+        Duration::from_secs(10),
+        &logs,
+    );
+    let started = Instant::now();
+    let status = terminal
+        .wait_exit(Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "session of a revoked operator stayed open:\n{}",
+                terminal.text()
+            )
+        });
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "revocation took {:?}",
+        started.elapsed()
+    );
+    assert_ne!(
+        status.exit_code(),
+        0,
+        "a revoked session ended as a success"
+    );
+    agent_process.wait_for_log("was revoked; closing its session", Duration::from_secs(5));
+
+    // The relay no longer issues it credentials, and the agent would refuse it anyway.
+    relay.wait_for_log("operators updated to revision 3", Duration::from_secs(10));
+    let refused = second.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
+    assert!(
+        refused.contains("401"),
+        "revoked operator still authenticated:\n{refused}"
+    );
+
+    // The enrolled operator still connects, and cannot leave the agent without operators.
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+    let first_fingerprint = field(&operator.run(&["init"]), "fingerprint").to_owned();
+    let last = agent.run_failing(&["agent", "operator", "revoke", &first_fingerprint]);
+    assert!(
+        last.contains("last operator"),
+        "last operator revoked:\n{last}"
     );
 }
