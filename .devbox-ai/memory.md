@@ -1,6 +1,8 @@
 # Project Memory: revtty
 
 ## Facts
+- Operators: agent.toml `operators`+`operators_revision` decide SSH; relay copy via OperatorsReport gates credentials
+- Lifecycle CLI: agent operator list|add|revoke, agent rotate-credential, relay enroll --replace, relay remove, forget
 - Publication: developed and published directly on GitHub LambdaBytes/revtty, no GitLab (user decision 2026-10-15)
 - Single bin crate `revtty` 0.1.0, edition 2024, MSRV 1.95; client/agent/relay roles in one binary (src/app.rs)
 - Modules: src/{agent,client,relay,identity,protocol,transport}; storage.rs = SQLite (tokio-rusqlite + migrations)
@@ -24,6 +26,11 @@
 - run(app): `cargo run -- <subcmd>`; full relay/agent/operator flow in README 'Authenticated local flow'
 
 ## Gotchas
+- 2026-10-16: relay requests need transport::relay_client() + http_url/websocket_url: plain http/ws only to loopback
+- 2026-10-15: relay schema v6: v4 agent_operators+control_connection, v5 replaces_agent_id, v6 next_control_hash
+- 2026-10-15: agent run holds agent.run.lock (flock NB): rotate-credential and a 2nd agent run refuse while it runs
+- 2026-10-15: agent.toml errors must never quote content (control token): AgentConfig::load reports only the line
+- 2026-10-15: mutation tests: restoring a file with its old mtime (shutil.copy2, cp -p) makes cargo reuse the mutated binary
 - 2026-10-15: relay schema v3 = sessions audit; queued best-effort writes stamped at the event (relay AuditLog)
 - 2026-10-15: doctors fail on group/other-writable revtty dirs (like OpenSSH StrictModes); revtty creates them 0700
 - 2026-10-15: first host-key pin needs --host-key <SHA256 fp from agent enroll/status> or a TTY yes; e2e passes the flag
