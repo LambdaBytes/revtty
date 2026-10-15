@@ -40,6 +40,17 @@ CREATE INDEX agents_last_seen_idx
     ON agents(last_seen);
 "#;
 
+/// Enrollment epoch: advances with every consumed enrollment, so a signed operator `list`
+/// request issued before an enrollment cannot be replayed to see the newly enrolled agent.
+const SCHEMA_V2: &str = r#"
+CREATE TABLE relay_meta (
+    id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+    enrollment_epoch INTEGER NOT NULL
+);
+
+INSERT INTO relay_meta (id, enrollment_epoch) VALUES (1, 0);
+"#;
+
 #[derive(Debug, Error)]
 enum StoreError {
     #[error(transparent)]
@@ -50,6 +61,9 @@ enum StoreError {
 
     #[error("enrollment token could not be consumed atomically")]
     EnrollmentRace,
+
+    #[error("relay metadata is missing or invalid")]
+    InvalidRelayMeta,
 }
 
 #[derive(Clone)]
@@ -213,6 +227,14 @@ impl Store {
                     ],
                 )?;
 
+                let advanced = transaction.execute(
+                    "UPDATE relay_meta SET enrollment_epoch = enrollment_epoch + 1 WHERE id = 1",
+                    [],
+                )?;
+                if advanced != 1 {
+                    return Err(StoreError::InvalidRelayMeta);
+                }
+
                 transaction.commit()?;
                 Ok::<_, StoreError>(enrollment)
             })
@@ -301,33 +323,71 @@ impl Store {
             .map_err(|error| RevttyError::runtime("get enrolled agent", error))
     }
 
-    pub async fn list_agents(&self) -> Result<Vec<AgentRecord>, RevttyError> {
+    pub async fn enrollment_epoch(&self) -> Result<u64, RevttyError> {
+        self.conn
+            .call(|conn| read_enrollment_epoch(conn))
+            .await
+            .map_err(|error| RevttyError::runtime("read enrollment epoch", error))
+    }
+
+    /// The enrollment epoch and the enrolled agents, read from one snapshot.
+    pub async fn list_agents_with_epoch(&self) -> Result<(u64, Vec<AgentRecord>), RevttyError> {
         self.conn
             .call(|conn| {
-                let mut statement = conn.prepare(
-                    "SELECT id, name, host_key, operator_key, created_at, last_seen, version
-                     FROM agents
-                     ORDER BY name",
-                )?;
-
-                let rows = statement.query_map([], |row| {
-                    Ok(AgentRecord {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        host_key: row.get(2)?,
-                        operator_key: row.get(3)?,
-                        created_at: row.get(4)?,
-                        last_seen: row.get(5)?,
-                        version: row.get(6)?,
-                    })
-                })?;
-
-                rows.collect::<Result<Vec<_>, _>>()
-                    .map_err(StoreError::from)
+                let transaction = conn.transaction()?;
+                let epoch = read_enrollment_epoch(&transaction)?;
+                let agents = read_agents(&transaction)?;
+                transaction.commit()?;
+                Ok::<_, StoreError>((epoch, agents))
             })
             .await
             .map_err(|error| RevttyError::runtime("list enrolled agents", error))
     }
+
+    pub async fn list_agents(&self) -> Result<Vec<AgentRecord>, RevttyError> {
+        self.conn
+            .call(|conn| read_agents(conn))
+            .await
+            .map_err(|error| RevttyError::runtime("list enrolled agents", error))
+    }
+}
+
+fn read_enrollment_epoch(conn: &tokio_rusqlite::rusqlite::Connection) -> Result<u64, StoreError> {
+    let epoch: i64 = conn
+        .query_row(
+            "SELECT enrollment_epoch FROM relay_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(StoreError::InvalidRelayMeta)?;
+
+    u64::try_from(epoch).map_err(|_| StoreError::InvalidRelayMeta)
+}
+
+fn read_agents(
+    conn: &tokio_rusqlite::rusqlite::Connection,
+) -> Result<Vec<AgentRecord>, StoreError> {
+    let mut statement = conn.prepare(
+        "SELECT id, name, host_key, operator_key, created_at, last_seen, version
+         FROM agents
+         ORDER BY name",
+    )?;
+
+    let rows = statement.query_map([], |row| {
+        Ok(AgentRecord {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            host_key: row.get(2)?,
+            operator_key: row.get(3)?,
+            created_at: row.get(4)?,
+            last_seen: row.get(5)?,
+            version: row.get(6)?,
+        })
+    })?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
 }
 
 async fn initialize(conn: &Connection) -> Result<(), RevttyError> {
@@ -348,7 +408,7 @@ async fn initialize(conn: &Connection) -> Result<(), RevttyError> {
 }
 
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(SCHEMA_V1)])
+    Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)])
 }
 
 fn unix_now() -> Result<i64, RevttyError> {
@@ -364,7 +424,9 @@ fn unix_now() -> Result<i64, RevttyError> {
 mod tests {
     use std::time::Duration;
 
-    use super::{Store, migrations};
+    use tokio_rusqlite::rusqlite::{Connection as SqliteConnection, params};
+
+    use super::{SCHEMA_V1, Store, migrations};
 
     const OPERATOR_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB operator";
@@ -439,5 +501,81 @@ mod tests {
 
         assert!(agent.last_seen.is_some());
         assert_eq!(agent.version.as_deref(), Some("0.2.0"));
+    }
+
+    #[tokio::test]
+    async fn enrollment_epoch_advances_with_each_enrollment() {
+        let store = Store::open_in_memory().await.expect("open store");
+        assert_eq!(store.enrollment_epoch().await.expect("read epoch"), 0);
+
+        for (round, name) in ["first", "second"].into_iter().enumerate() {
+            let enrollment = store
+                .create_enrollment(name, OPERATOR_KEY, Duration::from_secs(60))
+                .await
+                .expect("create enrollment");
+            store
+                .consume_enrollment(enrollment.token.expose(), HOST_KEY, None)
+                .await
+                .expect("consume enrollment");
+
+            let (epoch, agents) = store
+                .list_agents_with_epoch()
+                .await
+                .expect("list agents with epoch");
+            assert_eq!(epoch, round as u64 + 1);
+            assert_eq!(agents.len(), round + 1);
+        }
+
+        // An unconsumed or rejected enrollment does not advance it.
+        let unused = store
+            .create_enrollment("third", OPERATOR_KEY, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        assert!(
+            store
+                .consume_enrollment("rve_not-a-token", HOST_KEY, None)
+                .await
+                .is_err()
+        );
+        drop(unused);
+        assert_eq!(store.enrollment_epoch().await.expect("read epoch"), 2);
+    }
+
+    #[tokio::test]
+    async fn v1_database_migrates_with_agents_intact() {
+        let path = std::env::temp_dir().join(format!(
+            "revtty-migrate-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        {
+            let conn = SqliteConnection::open(&path).expect("create v1 database");
+            conn.execute_batch(SCHEMA_V1).expect("apply schema v1");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("mark schema v1");
+            conn.execute(
+                "INSERT INTO agents
+                 (id, name, control_hash, host_key, operator_key, created_at, last_seen, version)
+                 VALUES ('agent-id', 'legacy', x'00', ?1, ?2, 1, 1, '0.1.0')",
+                params![HOST_KEY, OPERATOR_KEY],
+            )
+            .expect("insert v1 agent");
+        }
+
+        let store = Store::open(&path)
+            .await
+            .expect("open and migrate v1 database");
+        let (epoch, agents) = store
+            .list_agents_with_epoch()
+            .await
+            .expect("list migrated agents");
+        assert_eq!(epoch, 0);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "legacy");
+
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }

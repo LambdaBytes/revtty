@@ -5,9 +5,21 @@ pub async fn run(args: Args) -> Result<(), RevttyError> {
     match args.command {
         Command::Init => crate::client::init(),
         Command::List { relay } => crate::client::list(&relay).await,
-        Command::Status { target, relay } => crate::client::status(&target, &relay).await,
-        Command::Probe { target, relay } => crate::client::probe(&target, &relay).await,
-        Command::Connect { target, relay } => crate::client::connect(&target, &relay).await,
+        Command::Status {
+            target,
+            relay,
+            host_key,
+        } => crate::client::status(&target, &relay, host_key.as_deref()).await,
+        Command::Probe {
+            target,
+            relay,
+            host_key,
+        } => crate::client::probe(&target, &relay, host_key.as_deref()).await,
+        Command::Connect {
+            target,
+            relay,
+            host_key,
+        } => crate::client::connect(&target, &relay, host_key.as_deref()).await,
         Command::Doctor { relay } => crate::client::doctor(&relay).await,
         Command::Agent { command } => match command {
             AgentCommand::Enroll {
@@ -29,7 +41,7 @@ pub async fn run(args: Args) -> Result<(), RevttyError> {
                 db,
             } => crate::relay::create_enrollment(&db, &name, &operator_key, ttl).await,
             RelayCommand::Agents { db } => crate::relay::list_agents(&db).await,
-            RelayCommand::Serve { bind, token, db } => crate::relay::serve(&bind, token, &db).await,
+            RelayCommand::Serve { bind, db } => crate::relay::serve(&bind, &db).await,
             RelayCommand::Doctor { db } => crate::relay::doctor(&db).await,
         },
     }

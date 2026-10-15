@@ -137,6 +137,24 @@ impl Role {
     }
 }
 
+impl Role {
+    fn run_failing(&self, args: &[&str]) -> String {
+        let output = self
+            .command()
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run revtty");
+        let text = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "revtty {args:?} unexpectedly succeeded:\n{text}"
+        );
+        text
+    }
+}
+
 fn field<'a>(output: &'a str, name: &str) -> &'a str {
     output
         .lines()
@@ -154,8 +172,7 @@ fn start_relay_on(root: &TempRoot, relay_role: &Role, bind: &str) -> (Running, S
     let mut command = relay_role.command();
     command
         .args(["relay", "serve", "--bind", bind, "--db"])
-        .arg(&db)
-        .env("REVTTY_DEV_TOKEN", "e2e-dev-token");
+        .arg(&db);
     let relay = Running::spawn(command);
 
     let log = relay.wait_for_log("listening on ", Duration::from_secs(15));
@@ -169,7 +186,14 @@ fn start_relay_on(root: &TempRoot, relay_role: &Role, bind: &str) -> (Running, S
     (relay, format!("http://{address}"))
 }
 
-fn enroll_agent(root: &TempRoot, relay_role: &Role, operator: &Role, agent: &Role, url: &str) {
+/// Enrolls the agent and returns its host key fingerprint, as the target prints it.
+fn enroll_agent(
+    root: &TempRoot,
+    relay_role: &Role,
+    operator: &Role,
+    agent: &Role,
+    url: &str,
+) -> String {
     let db = root.path("relay.db");
     let db = db.to_str().expect("utf-8 path");
     let operator_key = operator.config.join("id_ed25519.pub");
@@ -185,7 +209,8 @@ fn enroll_agent(root: &TempRoot, relay_role: &Role, operator: &Role, agent: &Rol
     ]);
     let token = field(&enrollment, "token");
 
-    agent.run(&["agent", "enroll", "--relay", url, "--token", token]);
+    let enrolled = agent.run(&["agent", "enroll", "--relay", url, "--token", token]);
+    field(&enrolled, "host").to_owned()
 }
 
 fn start_agent(root: &TempRoot, agent: &Role) -> Running {
@@ -212,7 +237,7 @@ struct Terminal {
 }
 
 impl Terminal {
-    fn connect(operator: &Role, url: &str) -> Self {
+    fn connect(operator: &Role, url: &str, host_key: Option<&str>) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -224,6 +249,9 @@ impl Terminal {
 
         let mut command = CommandBuilder::new(REVTTY);
         command.args(["connect", AGENT_NAME, "--relay", url]);
+        if let Some(host_key) = host_key {
+            command.args(["--host-key", host_key]);
+        }
         command.env("REVTTY_CONFIG_DIR", &operator.config);
         command.env("REVTTY_STATE_DIR", &operator.state);
         command.env("TERM", "xterm");
@@ -347,16 +375,23 @@ fn operator_connects_to_enrolled_agent_shell() {
     let root = TempRoot::new();
     let (operator, agent, relay_role) = prepare(&root);
     let (relay, url) = start_relay(&root, &relay_role);
-    enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
     let agent_process = start_agent(&root, &agent);
 
-    let probe = operator.run(&["probe", AGENT_NAME, "--relay", &url]);
+    let probe = operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
     assert!(
         probe.contains("status   reachable"),
         "unexpected probe output:\n{probe}"
     );
 
-    let mut terminal = Terminal::connect(&operator, &url);
+    let mut terminal = Terminal::connect(&operator, &url, None);
     let logs = [&relay, &agent_process];
     terminal.wait_ready(Duration::from_secs(20), &logs);
 
@@ -385,10 +420,10 @@ fn agent_sigint_reaps_active_shell() {
     let root = TempRoot::new();
     let (operator, agent, relay_role) = prepare(&root);
     let (relay, url) = start_relay(&root, &relay_role);
-    enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
     let mut agent_process = start_agent(&root, &agent);
 
-    let mut terminal = Terminal::connect(&operator, &url);
+    let mut terminal = Terminal::connect(&operator, &url, Some(&host_key));
     let logs = [&relay, &agent_process];
     terminal.wait_ready(Duration::from_secs(20), &logs);
 
@@ -442,9 +477,16 @@ fn agent_recovers_after_relay_restart() {
     let root = TempRoot::new();
     let (operator, agent, relay_role) = prepare(&root);
     let (relay, url) = start_relay(&root, &relay_role);
-    enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
     let agent_process = start_agent(&root, &agent);
-    operator.run(&["probe", AGENT_NAME, "--relay", &url]);
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
 
     // Restart the relay on the same address with the same database.
     let address = url.trim_start_matches("http://").to_owned();
@@ -461,8 +503,91 @@ fn agent_recovers_after_relay_restart() {
         "agent not online after relay restart:\n{status}"
     );
 
-    let mut terminal = Terminal::connect(&operator, &url);
+    let mut terminal = Terminal::connect(&operator, &url, None);
     let logs = [&relay, &agent_process];
+    terminal.wait_ready(Duration::from_secs(20), &logs);
+    terminal.send("echo REVTTY_E2E_$((6*7)); exit 7\r");
+    terminal.wait_for("REVTTY_E2E_42", Duration::from_secs(20), &logs);
+    terminal.wait_for("connection closed (exit 7)", Duration::from_secs(20), &logs);
+}
+
+#[test]
+fn first_contact_requires_host_key_confirmation() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let _agent_process = start_agent(&root, &agent);
+    let known_hosts = operator.config.join("known_hosts");
+
+    // Without a terminal and without --host-key, nothing the relay says gets pinned.
+    let refused = operator.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
+    assert!(
+        refused.contains("not pinned yet") && refused.contains(&host_key),
+        "unexpected refusal:\n{refused}"
+    );
+    assert!(
+        !known_hosts.exists(),
+        "a host key was pinned without approval"
+    );
+
+    let mismatched = operator.run_failing(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        "SHA256:not-the-agent",
+    ]);
+    assert!(
+        mismatched.contains("nothing was pinned"),
+        "unexpected mismatch report:\n{mismatched}"
+    );
+    assert!(!known_hosts.exists(), "a mismatched host key was pinned");
+
+    let probe = operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+    assert!(
+        probe.contains("status   reachable"),
+        "unexpected probe output:\n{probe}"
+    );
+    assert!(known_hosts.exists());
+
+    // Once pinned, no confirmation is needed.
+    operator.run(&["probe", AGENT_NAME, "--relay", &url]);
+}
+
+#[test]
+fn slow_interactive_host_key_confirmation_still_connects() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let agent_process = start_agent(&root, &agent);
+
+    let mut terminal = Terminal::connect(&operator, &url, None);
+    let logs = [&relay, &agent_process];
+    terminal.wait_for(
+        "Type yes or the fingerprint",
+        Duration::from_secs(20),
+        &logs,
+    );
+    assert!(
+        terminal.text().contains(&host_key),
+        "prompt did not show the agent fingerprint:\n{}",
+        terminal.text()
+    );
+
+    // Longer than the 30 s operator credential obtained before the prompt.
+    std::thread::sleep(Duration::from_secs(32));
+    terminal.send("yes\r");
+
     terminal.wait_ready(Duration::from_secs(20), &logs);
     terminal.send("echo REVTTY_E2E_$((6*7)); exit 7\r");
     terminal.wait_for("REVTTY_E2E_42", Duration::from_secs(20), &logs);

@@ -10,8 +10,12 @@ use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 use ssh_key::{Algorithm, HashAlg, PublicKey, SshSig};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -58,26 +62,27 @@ const RELAY_TIMEOUTS: RelayTimeouts = RelayTimeouts {
 
 #[derive(Clone)]
 struct RelayState {
-    token: Arc<str>,
     store: Store,
     timeouts: RelayTimeouts,
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
     pending: Arc<Mutex<HashMap<String, PendingSession>>>,
-    operator_challenges: Arc<Mutex<HashMap<String, OperatorChallenge>>>,
+    challenges: Arc<ChallengeSigner>,
+    /// Challenges already spent by an enrolled operator, until they expire.
+    spent_challenges: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
     operator_sessions: Arc<Mutex<HashMap<[u8; 32], OperatorSession>>>,
 }
 
 impl RelayState {
-    fn new(token: String, store: Store) -> Self {
-        Self {
-            token: Arc::from(token),
+    fn new(store: Store) -> Result<Self, RevttyError> {
+        Ok(Self {
             store,
             timeouts: RELAY_TIMEOUTS,
             agents: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
-            operator_challenges: Arc::new(Mutex::new(HashMap::new())),
+            challenges: Arc::new(ChallengeSigner::new()?),
+            spent_challenges: Arc::new(Mutex::new(HashMap::new())),
             operator_sessions: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
     #[cfg(test)]
@@ -138,14 +143,102 @@ impl SessionKind {
     }
 }
 
-enum OperatorChallengeScope {
-    Agent(String),
-    List,
+/// What an operator challenge authorizes.
+enum ChallengeScope<'a> {
+    Agent(&'a str),
+    /// Bound to the enrollment epoch: a list request signed before an enrollment is void
+    /// after it, even when it was not spent because it listed nothing.
+    List {
+        epoch: u64,
+    },
 }
 
-struct OperatorChallenge {
-    scope: OperatorChallengeScope,
-    expires_at: Instant,
+const CHALLENGE_PREFIX: &str = "rvc_";
+const CHALLENGE_NONCE_LEN: usize = 16;
+const CHALLENGE_EXPIRY_LEN: usize = 8;
+const CHALLENGE_TAG_LEN: usize = 32;
+
+/// Operator challenges carry their own authenticity: an HMAC binds scope, expiry and nonce
+/// under a key that lives only in this relay process. Issuing one keeps no state, so an
+/// unauthenticated flood cannot lock operators out.
+struct ChallengeSigner {
+    key: [u8; 64],
+    started: Instant,
+}
+
+impl ChallengeSigner {
+    fn new() -> Result<Self, RevttyError> {
+        let mut key = [0_u8; 64];
+        getrandom::fill(&mut key)
+            .map_err(|error| RevttyError::runtime("generate challenge key", error))?;
+
+        Ok(Self {
+            key,
+            started: Instant::now(),
+        })
+    }
+
+    fn issue(&self, scope: &ChallengeScope<'_>) -> Result<String, RevttyError> {
+        let mut nonce = [0_u8; CHALLENGE_NONCE_LEN];
+        getrandom::fill(&mut nonce)
+            .map_err(|error| RevttyError::runtime("generate challenge nonce", error))?;
+        let expires_at = u64::try_from(
+            (Instant::now() + OPERATOR_CHALLENGE_TTL)
+                .duration_since(self.started)
+                .as_millis(),
+        )
+        .map_err(|_| RevttyError::message("relay uptime is outside the supported range"))?;
+
+        let mut raw =
+            Vec::with_capacity(CHALLENGE_NONCE_LEN + CHALLENGE_EXPIRY_LEN + CHALLENGE_TAG_LEN);
+        raw.extend_from_slice(&nonce);
+        raw.extend_from_slice(&expires_at.to_be_bytes());
+        raw.extend_from_slice(&self.mac(scope, expires_at, &nonce).finalize().into_bytes());
+
+        Ok(format!("{CHALLENGE_PREFIX}{}", URL_SAFE_NO_PAD.encode(raw)))
+    }
+
+    /// When `challenge` was issued by this process for `scope` and is still valid, returns
+    /// its expiry.
+    fn verify(&self, challenge: &str, scope: &ChallengeScope<'_>) -> Option<Instant> {
+        let raw = URL_SAFE_NO_PAD
+            .decode(challenge.strip_prefix(CHALLENGE_PREFIX)?)
+            .ok()?;
+        if raw.len() != CHALLENGE_NONCE_LEN + CHALLENGE_EXPIRY_LEN + CHALLENGE_TAG_LEN {
+            return None;
+        }
+
+        let (nonce, rest) = raw.split_at(CHALLENGE_NONCE_LEN);
+        let (expiry, tag) = rest.split_at(CHALLENGE_EXPIRY_LEN);
+        let expires_at = u64::from_be_bytes(expiry.try_into().ok()?);
+
+        // Constant-time tag comparison.
+        self.mac(scope, expires_at, nonce).verify_slice(tag).ok()?;
+
+        let expires_at = self
+            .started
+            .checked_add(Duration::from_millis(expires_at))?;
+        (expires_at > Instant::now()).then_some(expires_at)
+    }
+
+    fn mac(&self, scope: &ChallengeScope<'_>, expires_at: u64, nonce: &[u8]) -> Hmac<Sha256> {
+        let mut mac = Hmac::<Sha256>::new(&self.key.into());
+        mac.update(b"revtty-operator-challenge-v1");
+        match scope {
+            // Agent names never contain NUL, so the separators keep scopes unambiguous.
+            ChallengeScope::Agent(name) => {
+                mac.update(b"\0agent\0");
+                mac.update(name.as_bytes());
+            }
+            ChallengeScope::List { epoch } => {
+                mac.update(b"\0list\0");
+                mac.update(&epoch.to_be_bytes());
+            }
+        }
+        mac.update(&expires_at.to_be_bytes());
+        mac.update(nonce);
+        mac
+    }
 }
 
 struct OperatorSession {
@@ -228,7 +321,7 @@ pub async fn list_agents(db: &FsPath) -> Result<(), RevttyError> {
     Ok(())
 }
 
-pub async fn serve(bind: &str, token: String, db: &FsPath) -> Result<(), RevttyError> {
+pub async fn serve(bind: &str, db: &FsPath) -> Result<(), RevttyError> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| RevttyError::runtime("bind relay", error))?;
@@ -239,9 +332,9 @@ pub async fn serve(bind: &str, token: String, db: &FsPath) -> Result<(), RevttyE
         .map_err(|error| RevttyError::runtime("read relay listen address", error))?;
 
     let store = Store::open(db).await?;
-    let app = router(RelayState::new(token, store));
+    let app = router(RelayState::new(store)?);
 
-    eprintln!("revtty relay transport proof listening on {address}");
+    eprintln!("revtty relay listening on {address}");
 
     axum::serve(listener, app)
         .await
@@ -251,9 +344,6 @@ pub async fn serve(bind: &str, token: String, db: &FsPath) -> Result<(), RevttyE
 fn router(state: RelayState) -> Router {
     Router::new()
         .route("/health", get(|| async { StatusCode::NO_CONTENT }))
-        .route("/v0/agent/{name}", get(agent_upgrade))
-        .route("/v0/probe/{name}", get(probe_upgrade))
-        .route("/v0/session/{session_id}", get(session_upgrade))
         .route("/v1/enroll", post(enroll_agent))
         .route("/v1/operator/list/challenge", post(operator_list_challenge))
         .route("/v1/operator/list", post(operator_list))
@@ -315,52 +405,63 @@ async fn operator_challenge(State(state): State<RelayState>, Path(name): Path<St
         return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
     }
 
-    match state.store.get_agent(&name).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => {
-            eprintln!("operator challenge lookup failed: {error}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    }
-
-    issue_operator_challenge(&state, OperatorChallengeScope::Agent(name)).await
+    // No lookup: whether the agent exists is not revealed before authentication.
+    issue_operator_challenge(&state, &ChallengeScope::Agent(&name))
 }
 
 async fn operator_list_challenge(State(state): State<RelayState>) -> Response {
-    issue_operator_challenge(&state, OperatorChallengeScope::List).await
-}
-
-async fn issue_operator_challenge(state: &RelayState, scope: OperatorChallengeScope) -> Response {
-    let challenge = match SecretToken::generate("rvc") {
-        Ok(challenge) => challenge.expose().to_owned(),
+    let epoch = match state.store.enrollment_epoch().await {
+        Ok(epoch) => epoch,
         Err(error) => {
-            eprintln!("operator challenge generation failed: {error}");
+            eprintln!("operator list challenge lookup failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
 
-    let now = Instant::now();
-    let mut challenges = state.operator_challenges.lock().await;
-    challenges.retain(|_, value| value.expires_at > now);
+    issue_operator_challenge(&state, &ChallengeScope::List { epoch })
+}
 
-    if challenges.len() >= MAX_PENDING_OPERATOR_AUTH {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
+fn issue_operator_challenge(state: &RelayState, scope: &ChallengeScope<'_>) -> Response {
+    match state.challenges.issue(scope) {
+        Ok(challenge) => Json(OperatorChallengeResponse {
+            challenge,
+            expires_in_secs: OPERATOR_CHALLENGE_TTL.as_secs(),
+        })
+        .into_response(),
+        Err(error) => {
+            eprintln!("operator challenge generation failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Makes a verified challenge single-use. Only challenges signed by an enrolled operator are
+/// recorded, so outsiders cannot fill the set; a full set refuses instead of evicting a
+/// challenge that is still valid, which would allow its replay.
+async fn spend_challenge(
+    state: &RelayState,
+    challenge: &str,
+    expires_at: Instant,
+) -> Result<(), StatusCode> {
+    let mut spent = state.spent_challenges.lock().await;
+    let now = Instant::now();
+    // A challenge verified before its expiry may only get here after it, when its spent
+    // record (which expires with it) can already be purged: past the expiry it is void.
+    if expires_at <= now {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    spent.retain(|_, expiry| *expiry > now);
+
+    let key = hash_token(challenge);
+    if spent.contains_key(&key) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if spent.len() >= MAX_PENDING_OPERATOR_AUTH {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    challenges.insert(
-        challenge.clone(),
-        OperatorChallenge {
-            scope,
-            expires_at: now + OPERATOR_CHALLENGE_TTL,
-        },
-    );
-
-    Json(OperatorChallengeResponse {
-        challenge,
-        expires_in_secs: OPERATOR_CHALLENGE_TTL.as_secs(),
-    })
-    .into_response()
+    spent.insert(key, expires_at);
+    Ok(())
 }
 
 async fn operator_auth(
@@ -372,27 +473,17 @@ async fn operator_auth(
         return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
     }
 
-    let challenge = {
-        let mut challenges = state.operator_challenges.lock().await;
-        challenges.remove(&request.challenge)
-    };
-
-    let Some(challenge) = challenge else {
+    let Some(expires_at) = state
+        .challenges
+        .verify(&request.challenge, &ChallengeScope::Agent(&name))
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-
-    if challenge.expires_at <= Instant::now()
-        || !matches!(
-            challenge.scope,
-            OperatorChallengeScope::Agent(ref agent_name) if agent_name == &name
-        )
-    {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
 
     let agent = match state.store.get_agent(&name).await {
         Ok(Some(agent)) => agent,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        // Same answer as a bad signature: agent names stay private.
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => {
             eprintln!("operator auth lookup failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -414,6 +505,10 @@ async fn operator_auth(
         .is_err()
     {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    if let Err(status) = spend_challenge(&state, &request.challenge, expires_at).await {
+        return status.into_response();
     }
 
     let session_token = match SecretToken::generate("rvo") {
@@ -454,20 +549,22 @@ async fn operator_list(
     State(state): State<RelayState>,
     Json(request): Json<OperatorListRequest>,
 ) -> Response {
-    let challenge = {
-        let mut challenges = state.operator_challenges.lock().await;
-        challenges.remove(&request.challenge)
+    // The epoch and the agents come from one snapshot, so an enrollment either voids the
+    // challenge or is not part of the answer.
+    let (epoch, agents) = match state.store.list_agents_with_epoch().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("operator list lookup failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
 
-    let Some(challenge) = challenge else {
+    let Some(expires_at) = state
+        .challenges
+        .verify(&request.challenge, &ChallengeScope::List { epoch })
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-
-    if challenge.expires_at <= Instant::now()
-        || !matches!(challenge.scope, OperatorChallengeScope::List)
-    {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
 
     let operator_key = match PublicKey::from_openssh(&request.operator_key) {
         Ok(key) if key.algorithm() == Algorithm::Ed25519 => key,
@@ -487,13 +584,6 @@ async fn operator_list(
     }
 
     let operator_fingerprint = operator_key.fingerprint(HashAlg::Sha256).to_string();
-    let agents = match state.store.list_agents().await {
-        Ok(agents) => agents,
-        Err(error) => {
-            eprintln!("operator list lookup failed: {error}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
 
     let runtime = {
         let connected = state.agents.lock().await;
@@ -529,6 +619,14 @@ async fn operator_list(
             last_seen: agent.last_seen,
             version: agent.version,
         });
+    }
+
+    // Replaying a request that listed nothing reveals nothing, and the epoch voids it once
+    // an enrollment could change that; only an enrolled operator's request is recorded.
+    if !visible.is_empty()
+        && let Err(status) = spend_challenge(&state, &request.challenge, expires_at).await
+    {
+        return status.into_response();
     }
 
     Json(AgentListResponse { agents: visible }).into_response()
@@ -708,71 +806,6 @@ async fn persistent_session_upgrade(
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| attach_reserved_agent_session(socket, sender))
-        .into_response()
-}
-
-async fn agent_upgrade(
-    State(state): State<RelayState>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    if !authorized(&headers, &state.token) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    if !valid_name(&name) {
-        return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
-    }
-
-    ws.max_message_size(MAX_MESSAGE_SIZE)
-        .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_agent(socket, state, name))
-        .into_response()
-}
-
-async fn probe_upgrade(
-    State(state): State<RelayState>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    if !authorized(&headers, &state.token) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    if !valid_name(&name) {
-        return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
-    }
-
-    let control = {
-        let agents = state.agents.lock().await;
-        agents.get(&name).map(|agent| agent.control.clone())
-    };
-
-    let Some(control) = control else {
-        return (StatusCode::NOT_FOUND, "agent is offline").into_response();
-    };
-
-    ws.max_message_size(MAX_MESSAGE_SIZE)
-        .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| {
-            handle_legacy_operator_session(socket, state, name, control, SessionKind::Probe)
-        })
-        .into_response()
-}
-
-async fn session_upgrade(
-    State(state): State<RelayState>,
-    Path(session_id): Path<String>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    if !authorized(&headers, &state.token) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
-    ws.max_message_size(MAX_MESSAGE_SIZE)
-        .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| attach_agent_session(socket, state, session_id))
         .into_response()
 }
 
@@ -1131,59 +1164,6 @@ async fn handle_operator_session(
     }
 }
 
-async fn handle_legacy_operator_session(
-    operator_socket: WebSocket,
-    state: RelayState,
-    agent_name: String,
-    control: mpsc::Sender<ControlMessage>,
-    kind: SessionKind,
-) {
-    let session_id = Uuid::new_v4().simple().to_string();
-    let agent_token = match SecretToken::generate("rvs") {
-        Ok(token) => token,
-        Err(error) => {
-            eprintln!("session token generation failed: {error}");
-            return;
-        }
-    };
-    let (session_tx, session_rx) = oneshot::channel();
-
-    {
-        let mut pending = state.pending.lock().await;
-        pending.insert(
-            session_id.clone(),
-            PendingSession {
-                agent_name: agent_name.clone(),
-                agent_token_hash: agent_token.hash(),
-                sender: Some(session_tx),
-                decision_sender: None,
-            },
-        );
-    }
-
-    if control
-        .send(kind.offer(session_id.clone(), agent_token.expose().to_owned()))
-        .await
-        .is_err()
-    {
-        state.pending.lock().await.remove(&session_id);
-        return;
-    }
-
-    match tokio::time::timeout(state.timeouts.data_tunnel, session_rx).await {
-        Ok(Ok(agent_socket)) => {
-            eprintln!(
-                "legacy {} paired for {agent_name}: {session_id}",
-                kind.label()
-            );
-            bridge_websockets(operator_socket, agent_socket).await;
-        }
-        _ => {
-            state.pending.lock().await.remove(&session_id);
-        }
-    }
-}
-
 async fn send_operator_session_error(socket: &mut WebSocket, detail: &str) {
     let text = format!("{SESSION_ERROR_PREFIX}{detail}");
     let _ = socket.send(Message::Text(text.into())).await;
@@ -1196,19 +1176,6 @@ async fn send_session_cancel(control: &mpsc::Sender<ControlMessage>, session_id:
         version: CONTROL_PROTOCOL_VERSION,
         session_id: session_id.to_owned(),
     });
-}
-
-async fn attach_agent_session(socket: WebSocket, state: RelayState, session_id: String) {
-    let pending = {
-        let mut pending = state.pending.lock().await;
-        pending.remove(&session_id)
-    };
-
-    if let Some(mut pending) = pending
-        && let Some(sender) = pending.sender.take()
-    {
-        let _ = sender.send(socket);
-    }
 }
 
 async fn attach_reserved_agent_session(socket: WebSocket, sender: oneshot::Sender<WebSocket>) {
@@ -1248,10 +1215,6 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
-fn authorized(headers: &HeaderMap, token: &str) -> bool {
-    bearer_token(headers).is_some_and(|candidate| candidate == token)
-}
-
 fn public_key_fingerprint(encoded: &str) -> Result<String, RevttyError> {
     let key = PublicKey::from_openssh(encoded)
         .map_err(|error| RevttyError::runtime("parse persisted SSH public key", error))?;
@@ -1275,7 +1238,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
     use futures_util::{SinkExt, StreamExt};
     use reqwest_websocket::Message as ClientMessage;
     use russh::Preferred;
@@ -1290,7 +1252,7 @@ mod tests {
 
     use super::{
         AgentDecision, AgentHandle, OperatorSession, PendingSession, RelayState, RelayTimeouts,
-        authorized, record_agent_decision, router,
+        record_agent_decision, router, spend_challenge,
     };
     use crate::protocol::{
         AgentListResponse, AgentStatusResponse, CONTROL_PROTOCOL_VERSION, ControlMessage,
@@ -1371,7 +1333,7 @@ mod tests {
     #[tokio::test]
     async fn agent_decisions_are_scoped_and_rejection_cleans_pending() {
         let store = Store::open_in_memory().await.expect("open store");
-        let state = RelayState::new("secret".to_owned(), store);
+        let state = RelayState::new(store).expect("create relay state");
         let (socket_tx, _socket_rx) = oneshot::channel();
         let (decision_tx, mut decision_rx) = oneshot::channel();
 
@@ -1403,21 +1365,12 @@ mod tests {
         assert!(!state.pending.lock().await.contains_key("session"));
     }
 
-    #[test]
-    fn bearer_auth_requires_exact_token() {
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
-
-        assert!(authorized(&headers, "secret"));
-        assert!(!authorized(&headers, "other"));
-    }
-
     #[tokio::test]
     async fn persistent_enrollment_and_agent_auth_round_trip() {
         let store = Store::open_in_memory()
             .await
             .expect("open in-memory relay store");
-        let state = RelayState::new("secret".to_owned(), store.clone());
+        let state = RelayState::new(store.clone()).expect("create relay state");
         let app = router(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1494,7 +1447,7 @@ mod tests {
         let store = Store::open_in_memory()
             .await
             .expect("open in-memory relay store");
-        let state = RelayState::new("secret".to_owned(), store.clone());
+        let state = RelayState::new(store.clone()).expect("create relay state");
         let app = router(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1590,7 +1543,7 @@ mod tests {
         let store = Store::open_in_memory()
             .await
             .expect("open in-memory relay store");
-        let state = RelayState::new("secret".to_owned(), store.clone());
+        let state = RelayState::new(store.clone()).expect("create relay state");
         let app = router(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1863,7 +1816,7 @@ mod tests {
         let store = Store::open_in_memory()
             .await
             .expect("open in-memory relay store");
-        let state = RelayState::new("secret".to_owned(), store.clone());
+        let state = RelayState::new(store.clone()).expect("create relay state");
         let app = router(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2060,251 +2013,6 @@ mod tests {
         let _ = relay_server.await;
     }
 
-    #[tokio::test]
-    async fn reverse_probe_round_trip() {
-        let store = Store::open_in_memory()
-            .await
-            .expect("open in-memory relay store");
-        let state = RelayState::new("secret".to_owned(), store);
-        let app = router(state.clone());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test relay");
-        let address = listener.local_addr().expect("test relay address");
-
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test relay");
-        });
-
-        let relay = format!("ws://{address}");
-        let client = reqwest::Client::new();
-        let mut agent = connect_websocket(&client, &relay, "/v0/agent/demo", "secret")
-            .await
-            .expect("connect test agent");
-        agent
-            .send(test_hello("demo"))
-            .await
-            .expect("send agent hello");
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if state.agents.lock().await.contains_key("demo") {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("agent becomes visible");
-
-        let (mut agent_sender, mut agent_receiver) = agent.split();
-        let agent_client = client.clone();
-        let agent_relay = relay.clone();
-
-        let agent_task = tokio::spawn(async move {
-            while let Some(message) = agent_receiver.next().await {
-                match message.expect("agent control message") {
-                    ClientMessage::Text(text) => {
-                        let control: ControlMessage =
-                            serde_json::from_str(&text).expect("decode probe offer");
-
-                        if let ControlMessage::ProbeOffer { session_id, .. } = control {
-                            let path = format!("/v0/session/{session_id}");
-                            let mut session =
-                                connect_websocket(&agent_client, &agent_relay, &path, "secret")
-                                    .await
-                                    .expect("connect agent session");
-
-                            let result = ProbeResult {
-                                name: "demo".to_owned(),
-                                os: "test-os".to_owned(),
-                                arch: "test-arch".to_owned(),
-                                version: "test-version".to_owned(),
-                            };
-
-                            session
-                                .send(ClientMessage::Text(
-                                    serde_json::to_string(&result).expect("encode probe result"),
-                                ))
-                                .await
-                                .expect("send probe result");
-
-                            session
-                                .close(reqwest_websocket::CloseCode::Normal, None)
-                                .await
-                                .expect("close agent session");
-                            return;
-                        }
-                    }
-                    ClientMessage::Ping(data) => {
-                        agent_sender
-                            .send(ClientMessage::Pong(data))
-                            .await
-                            .expect("send pong");
-                    }
-                    _ => {}
-                }
-            }
-
-            panic!("agent control connection ended before probe offer");
-        });
-
-        let mut operator = connect_websocket(&client, &relay, "/v0/probe/demo", "secret")
-            .await
-            .expect("connect operator probe");
-
-        let message = tokio::time::timeout(Duration::from_secs(2), operator.next())
-            .await
-            .expect("probe result timeout")
-            .expect("operator websocket closed")
-            .expect("operator websocket error");
-
-        let ClientMessage::Text(text) = message else {
-            panic!("expected text probe result");
-        };
-
-        let result: ProbeResult = serde_json::from_str(&text).expect("decode probe result");
-        assert_eq!(result.name, "demo");
-        assert_eq!(result.os, "test-os");
-        assert_eq!(result.arch, "test-arch");
-        assert_eq!(result.version, "test-version");
-
-        agent_task.await.expect("agent test task");
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn ssh_authenticates_through_reverse_relay() {
-        let store = Store::open_in_memory()
-            .await
-            .expect("open in-memory relay store");
-        let state = RelayState::new("secret".to_owned(), store);
-        let app = router(state.clone());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test relay");
-        let address = listener.local_addr().expect("test relay address");
-
-        let relay_server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test relay");
-        });
-
-        let relay = format!("ws://{address}");
-        let http = reqwest::Client::new();
-
-        let server_key = ed25519_key();
-        let expected_server_key = server_key.public_key().clone();
-
-        let client_key = ed25519_key();
-        let authorized_client = client_key.public_key().clone();
-
-        let mut agent = connect_websocket(&http, &relay, "/v0/agent/demo", "secret")
-            .await
-            .expect("connect test agent");
-        agent
-            .send(test_hello("demo"))
-            .await
-            .expect("send agent hello");
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if state.agents.lock().await.contains_key("demo") {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("agent becomes visible");
-
-        let (_agent_sender, mut agent_receiver) = agent.split();
-        let agent_http = http.clone();
-        let agent_relay = relay.clone();
-
-        let agent_task = tokio::spawn(async move {
-            while let Some(message) = agent_receiver.next().await {
-                if let ClientMessage::Text(text) = message.expect("agent control message") {
-                    let control: ControlMessage =
-                        serde_json::from_str(&text).expect("decode session offer");
-
-                    if let ControlMessage::ProbeOffer { session_id, .. } = control {
-                        let path = format!("/v0/session/{session_id}");
-                        let websocket =
-                            connect_websocket(&agent_http, &agent_relay, &path, "secret")
-                                .await
-                                .expect("connect agent SSH session");
-
-                        let (server_stream, bridge_task) = websocket_byte_stream(websocket);
-                        let server_config = server::Config {
-                            keys: vec![server_key],
-                            preferred: ed25519_only(),
-                            ..Default::default()
-                        };
-
-                        let running = server::run_stream(
-                            Arc::new(server_config),
-                            server_stream,
-                            TestServer { authorized_client },
-                        )
-                        .await
-                        .expect("start SSH server through relay");
-
-                        let _ = running.await;
-                        bridge_task.abort();
-                        let _ = bridge_task.await;
-                        return;
-                    }
-                }
-            }
-
-            panic!("agent control connection ended before session offer");
-        });
-
-        let operator = connect_websocket(&http, &relay, "/v0/probe/demo", "secret")
-            .await
-            .expect("connect operator SSH session");
-        let (client_stream, client_bridge) = websocket_byte_stream(operator);
-
-        let client_config = client::Config {
-            preferred: ed25519_only(),
-            ..Default::default()
-        };
-
-        let mut session = client::connect_stream(
-            Arc::new(client_config),
-            client_stream,
-            TestClient {
-                expected_server_key,
-            },
-        )
-        .await
-        .expect("connect SSH client through reverse relay");
-
-        let auth = session
-            .authenticate_publickey(
-                "revtty",
-                PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
-            )
-            .await
-            .expect("authenticate operator key through relay");
-
-        assert!(
-            auth.success(),
-            "Ed25519 SSH auth through relay should succeed"
-        );
-
-        drop(session);
-        client_bridge.abort();
-        let _ = client_bridge.await;
-        agent_task.abort();
-        let _ = agent_task.await;
-        relay_server.abort();
-        let _ = relay_server.await;
-    }
-
     const FAST_RELAY_TIMEOUTS: RelayTimeouts = RelayTimeouts {
         agent_idle: Duration::from_millis(300),
         agent_hello: Duration::from_millis(300),
@@ -2323,8 +2031,9 @@ mod tests {
 
     async fn fast_relay(agent: &str) -> FastRelay {
         let store = Store::open_in_memory().await.expect("open relay store");
-        let state =
-            RelayState::new("secret".to_owned(), store.clone()).with_timeouts(FAST_RELAY_TIMEOUTS);
+        let state = RelayState::new(store.clone())
+            .expect("create relay state")
+            .with_timeouts(FAST_RELAY_TIMEOUTS);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test relay");
@@ -2520,5 +2229,280 @@ mod tests {
         assert!(relay.state.pending.lock().await.is_empty());
 
         relay.server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_v0_endpoints_are_gone() {
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test relay");
+        let address = listener.local_addr().expect("test relay address");
+        let app = router(RelayState::new(store).expect("create relay state"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test relay");
+        });
+
+        // The shared development token no longer opens anything.
+        for path in ["/v0/agent/demo", "/v0/probe/demo", "/v0/session/session"] {
+            let response = reqwest::Client::new()
+                .get(format!("http://{address}{path}"))
+                .bearer_auth("development-token")
+                .send()
+                .await
+                .expect("request legacy endpoint");
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+        }
+
+        server.abort();
+    }
+
+    /// A relay with production timeouts on a free local port, reachable over HTTP.
+    async fn http_relay(store: Store) -> (RelayState, String, tokio::task::JoinHandle<()>) {
+        let state = RelayState::new(store).expect("create relay state");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test relay");
+        let address = listener.local_addr().expect("test relay address");
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test relay");
+        });
+        (state, format!("http://{address}"), server)
+    }
+
+    async fn enroll(store: &Store, name: &str, operator_key: &str) {
+        let enrollment = store
+            .create_enrollment(name, operator_key, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        let host_key = ed25519_key().public_key().to_openssh().expect("host key");
+        store
+            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .await
+            .expect("consume enrollment");
+    }
+
+    async fn fetch_challenge(http: &reqwest::Client, url: String) -> String {
+        let response = http.post(url).send().await.expect("request challenge");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response
+            .json::<OperatorChallengeResponse>()
+            .await
+            .expect("decode challenge")
+            .challenge
+    }
+
+    fn sign(key: &PrivateKey, message: &str) -> String {
+        key.sign(
+            OPERATOR_AUTH_NAMESPACE,
+            RusshHashAlg::Sha256,
+            message.as_bytes(),
+        )
+        .expect("sign challenge")
+        .to_pem(ssh_key::LineEnding::LF)
+        .expect("encode signature")
+    }
+
+    async fn post_list(
+        http: &reqwest::Client,
+        base: &str,
+        key: &PrivateKey,
+        challenge: &str,
+    ) -> reqwest::Response {
+        http.post(format!("{base}/v1/operator/list"))
+            .json(&OperatorListRequest {
+                operator_key: key.public_key().to_openssh().expect("operator key"),
+                challenge: challenge.to_owned(),
+                signature: sign(key, &operator_list_auth_message(challenge)),
+            })
+            .send()
+            .await
+            .expect("request agent list")
+    }
+
+    async fn post_auth(
+        http: &reqwest::Client,
+        base: &str,
+        name: &str,
+        key: &PrivateKey,
+        challenge: &str,
+    ) -> reqwest::Response {
+        http.post(format!("{base}/v1/operator/auth/{name}"))
+            .json(&OperatorAuthRequest {
+                challenge: challenge.to_owned(),
+                signature: sign(key, &operator_auth_message(name, challenge)),
+            })
+            .send()
+            .await
+            .expect("authenticate operator")
+    }
+
+    #[tokio::test]
+    async fn challenge_flood_does_not_lock_out_operators() {
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let operator = ed25519_key();
+        enroll(
+            &store,
+            "flooded",
+            &operator.public_key().to_openssh().expect("operator key"),
+        )
+        .await;
+        let (_state, base, server) = http_relay(store).await;
+        let http = reqwest::Client::new();
+
+        // More unauthenticated challenge requests than the relay ever kept in memory.
+        for round in 0..5_000 {
+            let path = if round % 2 == 0 {
+                "/v1/operator/list/challenge"
+            } else {
+                "/v1/operator/challenge/flooded"
+            };
+            let response = http
+                .post(format!("{base}{path}"))
+                .send()
+                .await
+                .expect("flood challenge");
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "round {round}");
+        }
+
+        let challenge =
+            fetch_challenge(&http, format!("{base}/v1/operator/challenge/flooded")).await;
+        let auth = post_auth(&http, &base, "flooded", &operator, &challenge).await;
+        assert_eq!(auth.status(), reqwest::StatusCode::CREATED);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unenrolled_list_signatures_spend_nothing() {
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let (state, base, server) = http_relay(store).await;
+        let http = reqwest::Client::new();
+
+        for _ in 0..20 {
+            let stranger = ed25519_key();
+            let challenge =
+                fetch_challenge(&http, format!("{base}/v1/operator/list/challenge")).await;
+            let response = post_list(&http, &base, &stranger, &challenge).await;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let listed: AgentListResponse = response.json().await.expect("decode agent list");
+            assert!(listed.agents.is_empty());
+        }
+
+        assert!(
+            state.spent_challenges.lock().await.is_empty(),
+            "signatures by unenrolled keys used up single-use capacity"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn list_signed_before_an_enrollment_is_void_after_it() {
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let (_state, base, server) = http_relay(store.clone()).await;
+        let http = reqwest::Client::new();
+        let operator = ed25519_key();
+
+        let challenge = fetch_challenge(&http, format!("{base}/v1/operator/list/challenge")).await;
+        let empty = post_list(&http, &base, &operator, &challenge).await;
+        assert_eq!(empty.status(), reqwest::StatusCode::OK);
+
+        enroll(
+            &store,
+            "late-agent",
+            &operator.public_key().to_openssh().expect("operator key"),
+        )
+        .await;
+
+        // The same signed request, replayed after the enrollment.
+        let replay = post_list(&http, &base, &operator, &challenge).await;
+        assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let fresh = fetch_challenge(&http, format!("{base}/v1/operator/list/challenge")).await;
+        let listed: AgentListResponse = post_list(&http, &base, &operator, &fresh)
+            .await
+            .json()
+            .await
+            .expect("decode agent list");
+        assert_eq!(listed.agents.len(), 1);
+        assert_eq!(listed.agents[0].name, "late-agent");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn challenge_and_auth_do_not_reveal_agent_names() {
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let operator = ed25519_key();
+        enroll(
+            &store,
+            "real-agent",
+            &operator.public_key().to_openssh().expect("operator key"),
+        )
+        .await;
+        let (_state, base, server) = http_relay(store).await;
+        let http = reqwest::Client::new();
+        let stranger = ed25519_key();
+
+        for name in ["real-agent", "no-such-agent"] {
+            let challenge =
+                fetch_challenge(&http, format!("{base}/v1/operator/challenge/{name}")).await;
+            let auth = post_auth(&http, &base, name, &stranger, &challenge).await;
+            assert_eq!(auth.status(), reqwest::StatusCode::UNAUTHORIZED, "{name}");
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tampered_or_misused_challenges_are_rejected() {
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let operator = ed25519_key();
+        let operator_key = operator.public_key().to_openssh().expect("operator key");
+        enroll(&store, "agent-a", &operator_key).await;
+        enroll(&store, "agent-b", &operator_key).await;
+        let (_state, base, server) = http_relay(store).await;
+        let http = reqwest::Client::new();
+
+        let for_a = fetch_challenge(&http, format!("{base}/v1/operator/challenge/agent-a")).await;
+        let for_b = post_auth(&http, &base, "agent-b", &operator, &for_a).await;
+        assert_eq!(for_b.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let as_list = post_list(&http, &base, &operator, &for_a).await;
+        assert_eq!(as_list.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let mut tampered =
+            fetch_challenge(&http, format!("{base}/v1/operator/challenge/agent-a")).await;
+        let last = tampered.pop().expect("non-empty challenge");
+        tampered.push(if last == 'A' { 'B' } else { 'A' });
+        let forged = post_auth(&http, &base, "agent-a", &operator, &tampered).await;
+        assert_eq!(forged.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // The genuine challenge still works once, then never again.
+        let first = post_auth(&http, &base, "agent-a", &operator, &for_a).await;
+        assert_eq!(first.status(), reqwest::StatusCode::CREATED);
+        let replay = post_auth(&http, &base, "agent-a", &operator, &for_a).await;
+        assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn spent_challenge_cannot_be_reused_after_its_record_expires() {
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let state = RelayState::new(store).expect("create relay state");
+        let expires_at = std::time::Instant::now() + Duration::from_millis(50);
+
+        spend_challenge(&state, "rvc_challenge", expires_at)
+            .await
+            .expect("first use");
+
+        // A replay verified before the expiry that reaches this point only after it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            spend_challenge(&state, "rvc_challenge", expires_at).await,
+            Err(axum::http::StatusCode::UNAUTHORIZED),
+            "an expired challenge was spent a second time"
+        );
     }
 }

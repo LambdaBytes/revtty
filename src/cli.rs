@@ -29,6 +29,11 @@ pub enum Command {
         /// Relay base URL.
         #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
         relay: String,
+
+        /// Agent host key fingerprint (SHA256:...) to pin on first contact, as printed by
+        /// `revtty agent status` on the target.
+        #[arg(long)]
+        host_key: Option<String>,
     },
 
     /// Validate reverse connectivity to an online agent.
@@ -39,6 +44,11 @@ pub enum Command {
         /// Relay base URL. http(s) is converted to ws(s).
         #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
         relay: String,
+
+        /// Agent host key fingerprint (SHA256:...) to pin on first contact, as printed by
+        /// `revtty agent status` on the target.
+        #[arg(long)]
+        host_key: Option<String>,
     },
 
     /// Open an interactive remote terminal.
@@ -49,6 +59,11 @@ pub enum Command {
         /// Relay base URL. http(s) is converted to ws(s).
         #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
         relay: String,
+
+        /// Agent host key fingerprint (SHA256:...) to pin on first contact, as printed by
+        /// `revtty agent status` on the target.
+        #[arg(long)]
+        host_key: Option<String>,
     },
 
     /// Run local connectivity and configuration checks.
@@ -141,10 +156,6 @@ pub enum RelayCommand {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
 
-        /// Development-only shared token for the /v0 transport proof.
-        #[arg(long, env = "REVTTY_DEV_TOKEN")]
-        token: String,
-
         /// Relay SQLite database path used by /v1 endpoints.
         #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
         db: PathBuf,
@@ -220,8 +231,11 @@ mod tests {
 
     #[test]
     fn parses_relay_serve() {
-        let args =
-            Args::try_parse_from(["revtty", "relay", "serve", "--token", "development-token"]);
-        assert!(args.is_ok());
+        assert!(Args::try_parse_from(["revtty", "relay", "serve"]).is_ok());
+        // The development-only /v0 token is gone.
+        assert!(
+            Args::try_parse_from(["revtty", "relay", "serve", "--token", "development-token"])
+                .is_err()
+        );
     }
 }
