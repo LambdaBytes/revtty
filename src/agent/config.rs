@@ -20,6 +20,8 @@ const AGENT_CONFIG_TEMP_FILE: &str = ".agent.toml.tmp";
 /// Held while `agent.toml` is read, changed and written back. It is never renamed or
 /// removed, so every writer locks the same file.
 const AGENT_CONFIG_LOCK_FILE: &str = "agent.lock";
+/// Held by `agent run` for as long as it runs.
+const AGENT_RUN_LOCK_FILE: &str = "agent.run.lock";
 pub const DEFAULT_MAX_SESSIONS: usize = 4;
 pub const MAX_SESSIONS_LIMIT: usize = 64;
 
@@ -96,6 +98,10 @@ pub struct AgentConfig {
     /// The single operator key of configurations written before operator lists.
     #[serde(default, rename = "operator_key", skip_serializing)]
     legacy_operator_key: Option<String>,
+    /// The control credential a rotation in progress replaces `control_token` with, saved
+    /// before the relay hears of it so that an interrupted rotation can be finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_control_token: Option<String>,
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
 }
@@ -118,6 +124,7 @@ impl AgentConfig {
             operators: vec![operator_key],
             operators_revision: 1,
             legacy_operator_key: None,
+            pending_control_token: None,
             max_sessions,
         }
     }
@@ -130,8 +137,26 @@ impl AgentConfig {
         let path = Self::path(paths);
         let encoded = fs::read_to_string(&path)
             .map_err(|error| RevttyError::runtime("read agent configuration", error))?;
-        let mut config: Self = toml::from_str(&encoded)
-            .map_err(|error| RevttyError::runtime("parse agent configuration", error))?;
+        // Only where, never what: toml quotes the offending line and serde the offending value,
+        // either of which may be the control credential, and agents log these errors.
+        let mut config: Self = toml::from_str(&encoded).map_err(|error| {
+            let line = error
+                .span()
+                .and_then(|span| encoded.get(..span.start))
+                .map(|before| before.matches('\n').count() + 1);
+            RevttyError::message(match line {
+                Some(line) => format!(
+                    "agent configuration {} is invalid at line {line} (content not shown: \
+                     the file holds the control credential)",
+                    path.display()
+                ),
+                None => format!(
+                    "agent configuration {} is invalid (content not shown: the file holds the \
+                     control credential)",
+                    path.display()
+                ),
+            })
+        })?;
 
         if let Some(legacy) = config.legacy_operator_key.take()
             && config.operators.is_empty()
@@ -263,6 +288,24 @@ impl ConfigLock {
         ExclusiveLock::acquire(&paths.config_dir.join(AGENT_CONFIG_LOCK_FILE))
             .map(|lock| Self { _lock: lock })
             .map_err(|error| RevttyError::runtime("lock agent configuration", error))
+    }
+}
+
+/// Held by a running agent. `rotate-credential` needs the agent stopped, and a second agent on
+/// one configuration would fight the first over its relay connection.
+pub struct RunLock {
+    _lock: ExclusiveLock,
+}
+
+impl RunLock {
+    /// The lock, or `None` while an agent is running with this configuration.
+    pub fn try_acquire(paths: &Paths) -> Result<Option<Self>, RevttyError> {
+        crate::config::create_private_dir(&paths.config_dir)
+            .map_err(|error| RevttyError::runtime("create agent config directory", error))?;
+
+        ExclusiveLock::try_acquire(&paths.config_dir.join(AGENT_RUN_LOCK_FILE))
+            .map(|lock| lock.map(|lock| Self { _lock: lock }))
+            .map_err(|error| RevttyError::runtime("lock the agent's run state", error))
     }
 }
 
@@ -529,6 +572,37 @@ operator_key = "ssh-ed25519 AAAA"
         let loaded = AgentConfig::load(&paths).expect("load agent config");
         assert_eq!(loaded.operators.len(), writers + 1, "an update was lost");
         assert_eq!(loaded.operators_revision, writers as u64 + 1);
+
+        fs::remove_dir_all(root).expect("clean agent config test directory");
+    }
+
+    #[test]
+    fn parse_errors_do_not_quote_the_configuration() {
+        let (root, paths) = test_paths("agent-parse-error");
+        fs::create_dir_all(&paths.config_dir).expect("create config directory");
+
+        for (broken, line) in [
+            // A syntax error, which toml reports with the line it is on.
+            (
+                "relay = \"https://relay.example.com\"\ncontrol_token = \"rva_SECRET_MARKER\n",
+                "line 2",
+            ),
+            // A value of the wrong type, which serde reports with the value.
+            (
+                "relay = \"https://relay.example.com\"\nagent_id = \"agent-id\"\n\
+                 name = \"store-042\"\ncontrol_token = \"rva_other\"\n\
+                 max_sessions = \"rva_SECRET_MARKER\"\n",
+                "line 5",
+            ),
+        ] {
+            fs::write(AgentConfig::path(&paths), broken).expect("write broken config");
+            let error = AgentConfig::load(&paths)
+                .err()
+                .expect("broken configuration loaded");
+            let error = error.to_string();
+            assert!(!error.contains("SECRET_MARKER"), "{error}");
+            assert!(error.contains(line), "{error}");
+        }
 
         fs::remove_dir_all(root).expect("clean agent config test directory");
     }

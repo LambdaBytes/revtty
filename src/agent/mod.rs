@@ -7,6 +7,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use futures_util::{SinkExt, StreamExt};
@@ -16,16 +18,17 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use self::config::{AgentConfig, validate_max_sessions};
+use self::config::{AgentConfig, RunLock, validate_max_sessions};
 use self::ssh::OperatorAllowlist;
 use crate::config::Paths;
 use crate::identity::ensure_agent;
 
 use crate::error::RevttyError;
 use crate::protocol::{
-    CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse, ProbeResult,
-    SESSION_ERROR_PREFIX, SessionRejectReason,
+    AgentRotateRequest, CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse,
+    ProbeResult, SESSION_ERROR_PREFIX, SessionRejectReason,
 };
+use crate::token::SecretToken;
 use crate::transport::{check_relay_health, connect_websocket, http_url, valid_name};
 
 const RECONNECT_BASE_MILLIS: u64 = 1_000;
@@ -35,6 +38,9 @@ const RECONNECT_JITTER_PERCENT: u64 = 20;
 const SHELL_SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 /// Writing one frame to the relay; a write that cannot complete means the path is dead.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// One HTTP request of a credential rotation; a relay that does not answer leaves the
+/// rotation to be finished on a later attempt.
+const ROTATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the running agent rereads its operator list: a revoked operator's sessions are
 /// closed, and new ones refused, within this time.
 const OPERATORS_RELOAD_INTERVAL: Duration = Duration::from_secs(2);
@@ -178,7 +184,12 @@ pub async fn enroll(relay: &str, token: &str, max_sessions: usize) -> Result<(),
 
 pub async fn run() -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
-    let config = AgentConfig::load(&paths)?;
+    let Some(_running) = RunLock::try_acquire(&paths)? else {
+        return Err(RevttyError::message(
+            "another `revtty agent run` is using this configuration",
+        ));
+    };
+    let mut config = AgentConfig::load(&paths)?;
 
     if !valid_name(&config.name) {
         return Err(RevttyError::message(
@@ -199,16 +210,32 @@ pub async fn run() -> Result<(), RevttyError> {
     let shell_shutdown = ssh::ShellShutdown::new(shutdown_signal.subscribe(), &shell_guard);
 
     let stopped = loop {
-        let control = run_control_once(
-            &client,
-            &config,
-            &allowlist,
-            &mut backoff,
-            &session_slots,
-            &session_tasks,
-            &shell_shutdown,
-            CONTROL_TIMEOUTS,
-        );
+        let control = async {
+            // Until an interrupted rotation is finished, it is not known which credential
+            // the relay accepts.
+            if config.pending_control_token.is_some() {
+                finish_pending_rotation(&client, &paths)
+                    .await
+                    .map_err(|error| {
+                        RevttyError::message(format!(
+                            "finishing an interrupted credential rotation: {error}"
+                        ))
+                    })?;
+                config = AgentConfig::load(&paths)?;
+            }
+
+            run_control_once(
+                &client,
+                &config,
+                &allowlist,
+                &mut backoff,
+                &session_slots,
+                &session_tasks,
+                &shell_shutdown,
+                CONTROL_TIMEOUTS,
+            )
+            .await
+        };
 
         tokio::select! {
             result = control => {
@@ -279,12 +306,10 @@ fn watch_operators(paths: Paths, initial: OperatorAllowlist) -> watch::Receiver<
                 }
                 // The last valid list stays in force: replacing it with nothing would close
                 // every session, including the one an operator would use to repair the file.
-                // The cause is not logged, since a parse error quotes the file, which holds
-                // the control credential; `revtty agent operator list` shows it.
-                Err(_) if !unreadable => {
+                Err(error) if !unreadable => {
                     unreadable = true;
                     eprintln!(
-                        "cannot reload the operator list from agent.toml; keeping the previous one (run `revtty agent operator list` for the cause)"
+                        "cannot reload the operator list from agent.toml; keeping the previous one: {error}"
                     );
                 }
                 Err(_) => {}
@@ -726,6 +751,222 @@ pub fn status() -> Result<(), RevttyError> {
     Ok(())
 }
 
+pub async fn rotate_credential() -> Result<(), RevttyError> {
+    let paths = Paths::discover()?;
+    match rotate_control_credential(&reqwest::Client::new(), &paths).await? {
+        Rotation::Rotated => {
+            println!("credential rotated; the relay no longer accepts the previous one");
+            Ok(())
+        }
+        Rotation::Unsupported => Err(RevttyError::message(
+            "the relay does not support credential rotation; the credential is unchanged",
+        )),
+    }
+}
+
+enum Rotation {
+    Rotated,
+    Unsupported,
+}
+
+/// What became of a rotation an earlier run left unfinished.
+enum PendingRotation {
+    None,
+    Completed,
+    Abandoned { unsupported: bool },
+}
+
+/// How the relay answered a request authenticated with one agent credential.
+enum CredentialAnswer {
+    Accepted,
+    Rejected,
+    /// A relay that predates the endpoint.
+    Unsupported,
+}
+
+/// Replaces the agent's control credential with a new one it generates itself, so the relay
+/// only ever learns the hash of a credential the agent has already saved.
+async fn rotate_control_credential(
+    client: &reqwest::Client,
+    paths: &Paths,
+) -> Result<Rotation, RevttyError> {
+    let Some(_stopped) = RunLock::try_acquire(paths)? else {
+        return Err(RevttyError::message(
+            "the agent is running; stop it first (with systemd: systemctl stop \
+             revtty-agent@USER), rotate, then start it again",
+        ));
+    };
+
+    // A rotation that stopped halfway is finished, or abandoned, before another starts.
+    if let PendingRotation::Abandoned { unsupported: true } =
+        finish_pending_rotation(client, paths).await?
+    {
+        return Ok(Rotation::Unsupported);
+    }
+
+    let config = AgentConfig::load(paths)?;
+    // Confirming the current credential is a no-op on a relay that supports rotation, and a
+    // 404 on one that does not: nothing is written before it is known which.
+    match post_with_credential(
+        client,
+        &config.relay,
+        &format!("/v1/agent/{}/rotate/confirm", config.name),
+        &config.control_token,
+        None,
+    )
+    .await?
+    {
+        CredentialAnswer::Accepted => {}
+        CredentialAnswer::Unsupported => return Ok(Rotation::Unsupported),
+        CredentialAnswer::Rejected => {
+            return Err(RevttyError::message(
+                "the relay rejected this agent's credential; re-enroll the agent",
+            ));
+        }
+    }
+
+    let next = SecretToken::generate("rva")?;
+    // Saved before the relay hears of it: from here on, an interruption leaves it for
+    // `finish_pending_rotation`.
+    AgentConfig::update(paths, |stored| {
+        stored.pending_control_token = Some(next.expose().to_owned());
+        Ok(())
+    })?;
+
+    let request = AgentRotateRequest {
+        next_hash: URL_SAFE_NO_PAD.encode(next.hash()),
+    };
+    let begun = post_with_credential(
+        client,
+        &config.relay,
+        &format!("/v1/agent/{}/rotate", config.name),
+        &config.control_token,
+        Some(&request),
+    )
+    .await
+    .map_err(unfinished_rotation)?;
+
+    match begun {
+        CredentialAnswer::Accepted => {}
+        CredentialAnswer::Unsupported | CredentialAnswer::Rejected => {
+            AgentConfig::update(paths, |stored| {
+                if stored.pending_control_token.as_deref() == Some(next.expose()) {
+                    stored.pending_control_token = None;
+                }
+                Ok(())
+            })?;
+            return match begun {
+                CredentialAnswer::Unsupported => Ok(Rotation::Unsupported),
+                _ => Err(RevttyError::message(
+                    "the relay rejected this agent's credential; re-enroll the agent",
+                )),
+            };
+        }
+    }
+
+    match finish_pending_rotation(client, paths)
+        .await
+        .map_err(unfinished_rotation)?
+    {
+        PendingRotation::Completed => Ok(Rotation::Rotated),
+        _ => Err(RevttyError::message(
+            "the relay did not take the new credential; the current one still works",
+        )),
+    }
+}
+
+fn unfinished_rotation(error: RevttyError) -> RevttyError {
+    RevttyError::message(format!(
+        "{error}; the next `revtty agent run` or `revtty agent rotate-credential` finishes the \
+         rotation"
+    ))
+}
+
+/// Finishes or abandons a rotation that stopped before its end. The relay decides: once it
+/// confirmed the pending credential (also when only its answer was lost) it accepts that one,
+/// and the current one until then.
+async fn finish_pending_rotation(
+    client: &reqwest::Client,
+    paths: &Paths,
+) -> Result<PendingRotation, RevttyError> {
+    let config = AgentConfig::load(paths)?;
+    let Some(pending) = config.pending_control_token.clone() else {
+        return Ok(PendingRotation::None);
+    };
+
+    let confirmed = post_with_credential(
+        client,
+        &config.relay,
+        &format!("/v1/agent/{}/rotate/confirm", config.name),
+        &pending,
+        None,
+    )
+    .await?;
+    let outcome = match confirmed {
+        CredentialAnswer::Accepted => PendingRotation::Completed,
+        CredentialAnswer::Unsupported => PendingRotation::Abandoned { unsupported: true },
+        // The relay never took the pending credential, unless this agent was re-enrolled or
+        // removed since: then the current one is refused too.
+        CredentialAnswer::Rejected => match post_with_credential(
+            client,
+            &config.relay,
+            &format!("/v1/agent/{}/check", config.name),
+            &config.control_token,
+            None,
+        )
+        .await?
+        {
+            CredentialAnswer::Accepted => PendingRotation::Abandoned { unsupported: false },
+            _ => {
+                return Err(RevttyError::message(
+                    "the relay accepts neither this agent's credential nor the one it was \
+                     rotating to; re-enroll the agent",
+                ));
+            }
+        },
+    };
+
+    AgentConfig::update(paths, |stored| {
+        // Only the rotation this answer is about.
+        if stored.pending_control_token.as_deref() == Some(pending.as_str()) {
+            if matches!(outcome, PendingRotation::Completed) {
+                stored.control_token = pending.clone();
+            }
+            stored.pending_control_token = None;
+        }
+        Ok(())
+    })?;
+    Ok(outcome)
+}
+
+async fn post_with_credential(
+    client: &reqwest::Client,
+    relay: &str,
+    path: &str,
+    token: &str,
+    body: Option<&AgentRotateRequest>,
+) -> Result<CredentialAnswer, RevttyError> {
+    let mut request = client
+        .post(http_url(relay, path)?)
+        .bearer_auth(token)
+        .timeout(ROTATION_REQUEST_TIMEOUT);
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = request.send().await.map_err(|error| {
+        RevttyError::runtime("reach the relay", crate::error::with_sources(&error))
+    })?;
+
+    match response.status() {
+        status if status.is_success() => Ok(CredentialAnswer::Accepted),
+        reqwest::StatusCode::UNAUTHORIZED => Ok(CredentialAnswer::Rejected),
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED => {
+            Ok(CredentialAnswer::Unsupported)
+        }
+        status => Err(RevttyError::message(format!("the relay answered {status}"))),
+    }
+}
+
 pub fn operator_list() -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
     let config = AgentConfig::load(&paths)?;
@@ -798,6 +1039,13 @@ pub async fn doctor() -> Result<(), RevttyError> {
     crate::config::check_not_writable_by_others(&paths.config_dir)?;
     crate::config::check_not_writable_by_others(&paths.state_dir)?;
 
+    if config.pending_control_token.is_some() {
+        return Err(RevttyError::message(
+            "a credential rotation was interrupted; `revtty agent run` or `revtty agent \
+             rotate-credential` finishes it",
+        ));
+    }
+
     let client = reqwest::Client::new();
     check_relay_health(&client, &config.relay).await?;
     check_agent_credential(&client, &config).await?;
@@ -851,11 +1099,13 @@ mod tests {
     use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 
     use super::config::AgentConfig;
+    use super::config::RunLock;
     use super::ssh::OperatorAllowlist;
     use super::{
-        ControlTimeouts, OPERATORS_RELOAD_INTERVAL, RECONNECT_JITTER_PERCENT, ReconnectBackoff,
-        describe_undecodable, pty_test, reconnect_base_millis, reconnect_delay_millis,
-        run_control_once, ssh, watch_operators,
+        ControlTimeouts, OPERATORS_RELOAD_INTERVAL, PendingRotation, RECONNECT_JITTER_PERCENT,
+        ReconnectBackoff, Rotation, describe_undecodable, finish_pending_rotation, pty_test,
+        reconnect_base_millis, reconnect_delay_millis, rotate_control_credential, run_control_once,
+        ssh, watch_operators,
     };
     use crate::config::Paths;
     use crate::protocol::SESSION_ERROR_PREFIX;
@@ -1136,5 +1386,279 @@ mod tests {
         assert_eq!(allowlist.borrow().operators.len(), 2);
 
         std::fs::remove_dir_all(root).expect("clean watch test directory");
+    }
+
+    /// The relay side of credential rotation as the relay implements it, with knobs to lose
+    /// its answers after acting.
+    #[derive(Default)]
+    struct FakeRotation {
+        current: String,
+        next_hash: Option<String>,
+        lose_rotate_answer: bool,
+        lose_confirm_answer: bool,
+    }
+
+    type SharedRotation = Arc<std::sync::Mutex<FakeRotation>>;
+
+    fn bearer(headers: &axum::http::HeaderMap) -> String {
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    async fn rotation_relay(state: SharedRotation, supported: bool) -> String {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::post;
+        use base64::Engine as _;
+
+        let check = {
+            let state = Arc::clone(&state);
+            move |headers: HeaderMap| async move {
+                if bearer(&headers) == state.lock().expect("fake relay").current {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            }
+        };
+        let rotate = {
+            let state = Arc::clone(&state);
+            move |headers: HeaderMap,
+                  axum::Json(request): axum::Json<crate::protocol::AgentRotateRequest>| async move {
+                let mut state = state.lock().expect("fake relay");
+                if bearer(&headers) != state.current {
+                    return StatusCode::UNAUTHORIZED;
+                }
+                state.next_hash = Some(request.next_hash);
+                if state.lose_rotate_answer {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::NO_CONTENT
+                }
+            }
+        };
+        let confirm = {
+            let state = Arc::clone(&state);
+            move |headers: HeaderMap| async move {
+                let mut state = state.lock().expect("fake relay");
+                let token = bearer(&headers);
+                let hash = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(crate::token::hash_token(&token));
+                if state.next_hash.as_deref() == Some(hash.as_str()) {
+                    state.current = token;
+                    state.next_hash = None;
+                    if state.lose_confirm_answer {
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                    StatusCode::NO_CONTENT
+                } else if token == state.current {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            }
+        };
+
+        let mut app = axum::Router::new().route("/v1/agent/{name}/check", post(check));
+        if supported {
+            app = app
+                .route("/v1/agent/{name}/rotate", post(rotate))
+                .route("/v1/agent/{name}/rotate/confirm", post(confirm));
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake relay");
+        let address = listener.local_addr().expect("fake relay address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake relay");
+        });
+        format!("http://{address}")
+    }
+
+    /// An enrolled agent configuration whose relay is `relay`, and its relay-side state.
+    async fn rotating_agent(supported: bool) -> (std::path::PathBuf, Paths, SharedRotation) {
+        let root = std::env::temp_dir().join(format!("revtty-rotate-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        let state = SharedRotation::default();
+        state.lock().expect("fake relay").current = "rva_current".to_owned();
+        let relay = rotation_relay(Arc::clone(&state), supported).await;
+        AgentConfig::new(
+            relay,
+            "agent-id".to_owned(),
+            "rotating-agent".to_owned(),
+            "rva_current".to_owned(),
+            operator_key(),
+            4,
+        )
+        .save(&paths)
+        .expect("save agent config");
+        (root, paths, state)
+    }
+
+    #[tokio::test]
+    async fn rotation_switches_the_agent_to_a_credential_it_generated() {
+        let (root, paths, relay) = rotating_agent(true).await;
+
+        let rotated = rotate_control_credential(&reqwest::Client::new(), &paths)
+            .await
+            .expect("rotate credential");
+
+        assert!(matches!(rotated, Rotation::Rotated));
+        let config = AgentConfig::load(&paths).expect("load agent config");
+        assert_ne!(config.control_token, "rva_current");
+        assert!(config.pending_control_token.is_none());
+        assert_eq!(
+            relay.lock().expect("fake relay").current,
+            config.control_token
+        );
+        std::fs::remove_dir_all(root).expect("clean rotation test directory");
+    }
+
+    #[tokio::test]
+    async fn rotation_finishes_after_a_lost_answer() {
+        for lose_confirm in [false, true] {
+            let (root, paths, relay) = rotating_agent(true).await;
+            {
+                let mut relay = relay.lock().expect("fake relay");
+                relay.lose_rotate_answer = !lose_confirm;
+                relay.lose_confirm_answer = lose_confirm;
+            }
+            let client = reqwest::Client::new();
+
+            let interrupted = rotate_control_credential(&client, &paths).await;
+            let error = interrupted
+                .err()
+                .expect("rotation with a lost answer succeeded");
+            assert!(
+                error.to_string().contains("finishes the rotation"),
+                "{error}"
+            );
+            let config = AgentConfig::load(&paths).expect("load agent config");
+            assert_eq!(config.control_token, "rva_current");
+            let pending = config
+                .pending_control_token
+                .expect("pending credential kept");
+
+            // As the next `agent run` does before connecting.
+            {
+                let mut relay = relay.lock().expect("fake relay");
+                relay.lose_rotate_answer = false;
+                relay.lose_confirm_answer = false;
+            }
+            let finished = finish_pending_rotation(&client, &paths)
+                .await
+                .expect("finish rotation");
+            assert!(matches!(finished, PendingRotation::Completed));
+            let config = AgentConfig::load(&paths).expect("load agent config");
+            assert_eq!(config.control_token, pending, "lose_confirm={lose_confirm}");
+            assert!(config.pending_control_token.is_none());
+            assert_eq!(relay.lock().expect("fake relay").current, pending);
+            std::fs::remove_dir_all(root).expect("clean rotation test directory");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_rotation_the_relay_never_took_is_abandoned() {
+        let (root, paths, relay) = rotating_agent(true).await;
+        AgentConfig::update(&paths, |config| {
+            config.pending_control_token = Some("rva_never_sent".to_owned());
+            Ok(())
+        })
+        .expect("leave a pending credential");
+
+        let finished = finish_pending_rotation(&reqwest::Client::new(), &paths)
+            .await
+            .expect("finish rotation");
+
+        assert!(matches!(
+            finished,
+            PendingRotation::Abandoned { unsupported: false }
+        ));
+        let config = AgentConfig::load(&paths).expect("load agent config");
+        assert_eq!(config.control_token, "rva_current");
+        assert!(config.pending_control_token.is_none());
+        assert_eq!(relay.lock().expect("fake relay").current, "rva_current");
+        std::fs::remove_dir_all(root).expect("clean rotation test directory");
+    }
+
+    #[tokio::test]
+    async fn rotation_against_a_relay_without_it_changes_nothing() {
+        let (root, paths, _relay) = rotating_agent(false).await;
+        // A configuration written by hand, in the format before operator lists.
+        let config = AgentConfig::load(&paths).expect("load agent config");
+        let legacy = format!(
+            "# written by hand\nrelay = \"{}\"\nagent_id = \"agent-id\"\nname = \"rotating-agent\"\n\
+             control_token = \"rva_current\"\noperator_key = \"{}\"\n",
+            config.relay, config.operators[0]
+        );
+        std::fs::write(AgentConfig::path(&paths), &legacy).expect("write legacy config");
+        let before = std::fs::read_to_string(AgentConfig::path(&paths)).expect("read config");
+
+        let rotated = rotate_control_credential(&reqwest::Client::new(), &paths)
+            .await
+            .expect("rotate against an older relay");
+
+        assert!(matches!(rotated, Rotation::Unsupported));
+        assert_eq!(
+            std::fs::read_to_string(AgentConfig::path(&paths)).expect("read config"),
+            before
+        );
+        std::fs::remove_dir_all(root).expect("clean rotation test directory");
+    }
+
+    #[tokio::test]
+    async fn rotation_request_to_a_silent_relay_is_bounded() {
+        // Accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent relay");
+        let address = listener.local_addr().expect("silent relay address");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let started = tokio::time::Instant::now();
+        let answer = super::post_with_credential(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "/v1/agent/silent-agent/rotate/confirm",
+            "rva_pending",
+            None,
+        )
+        .await;
+
+        assert!(answer.is_err(), "a silent relay answered");
+        assert!(started.elapsed() < super::ROTATION_REQUEST_TIMEOUT + Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn rotation_waits_for_the_agent_to_stop() {
+        let (root, paths, relay) = rotating_agent(true).await;
+        let running = RunLock::try_acquire(&paths)
+            .expect("lock run state")
+            .expect("no agent running yet");
+
+        let refused = rotate_control_credential(&reqwest::Client::new(), &paths).await;
+
+        let error = refused.err().expect("rotated under a running agent");
+        assert!(
+            error.to_string().contains("the agent is running"),
+            "{error}"
+        );
+        assert_eq!(relay.lock().expect("fake relay").current, "rva_current");
+        assert!(
+            AgentConfig::load(&paths)
+                .expect("load agent config")
+                .pending_control_token
+                .is_none()
+        );
+        drop(running);
+        std::fs::remove_dir_all(root).expect("clean rotation test directory");
     }
 }

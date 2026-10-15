@@ -96,6 +96,12 @@ const SCHEMA_V5: &str = r#"
 ALTER TABLE enrollments ADD COLUMN replaces_agent_id TEXT;
 "#;
 
+/// A control credential rotation in progress: the hash of the credential the agent will use
+/// once it confirms the rotation with it.
+const SCHEMA_V6: &str = r#"
+ALTER TABLE agents ADD COLUMN next_control_hash BLOB;
+"#;
+
 /// Seeds `agent_operators` with each agent's enrolled key; fingerprints are computed here,
 /// which SQL cannot do.
 fn seed_agent_operators(transaction: &Transaction) -> HookResult {
@@ -167,6 +173,17 @@ pub struct Enrollment {
     pub expires_at: i64,
     /// The agent instance a `--replace` enrollment replaces once consumed.
     pub replaces_agent_id: Option<String>,
+}
+
+/// How the relay answered a rotation confirmation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RotationConfirmation {
+    /// The confirmed credential replaced the agent's control credential.
+    Promoted,
+    /// It already is the control credential: a repeated confirmation.
+    AlreadyCurrent,
+    /// It is neither the agent's pending nor its current credential.
+    Rejected,
 }
 
 /// What `remove_agent` deleted.
@@ -680,6 +697,69 @@ impl Store {
             .map_err(|error| RevttyError::runtime("check operator authorization", error))
     }
 
+    /// Records `next_hash` as the control credential agent `agent_name` is rotating to,
+    /// replacing any earlier unconfirmed one, when `control_token` is its current credential;
+    /// returns whether it was. Checked in the same statement: a request authenticated before
+    /// another rotation took effect cannot start one with a credential that is no longer valid.
+    pub async fn begin_rotation(
+        &self,
+        agent_name: &str,
+        control_token: &str,
+        next_hash: [u8; 32],
+    ) -> Result<bool, RevttyError> {
+        let name = agent_name.to_owned();
+        let current_hash = hash_token(control_token).to_vec();
+        let next_hash = next_hash.to_vec();
+
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE agents SET next_control_hash = ?1 WHERE name = ?2 AND control_hash = ?3",
+                    params![next_hash, name, current_hash],
+                )
+                .map(|updated| updated == 1)
+                .map_err(StoreError::from)
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("begin credential rotation", error))
+    }
+
+    /// Makes `token` the control credential of agent `agent_name` when it is the credential
+    /// the agent is rotating to. Confirming the current credential again changes nothing, so
+    /// an agent that lost the answer can repeat it.
+    pub async fn confirm_rotation(
+        &self,
+        agent_name: &str,
+        token: &str,
+    ) -> Result<RotationConfirmation, RevttyError> {
+        let name = agent_name.to_owned();
+        let hash = hash_token(token).to_vec();
+
+        self.conn
+            .call(move |conn| {
+                let transaction = conn.transaction()?;
+                let promoted = transaction.execute(
+                    "UPDATE agents SET control_hash = next_control_hash, next_control_hash = NULL
+                     WHERE name = ?1 AND next_control_hash = ?2",
+                    params![name, hash],
+                )?;
+                let confirmation = if promoted == 1 {
+                    RotationConfirmation::Promoted
+                } else if transaction
+                    .prepare("SELECT 1 FROM agents WHERE name = ?1 AND control_hash = ?2")?
+                    .exists(params![name, hash])?
+                {
+                    RotationConfirmation::AlreadyCurrent
+                } else {
+                    RotationConfirmation::Rejected
+                };
+                transaction.commit()?;
+                Ok::<_, StoreError>(confirmation)
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("confirm credential rotation", error))
+    }
+
     /// Records that agent instance `agent_id` was just seen; a replaced or removed instance
     /// updates nothing.
     pub async fn mark_seen(
@@ -939,6 +1019,7 @@ fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V3),
         M::up_with_hook(SCHEMA_V4, seed_agent_operators),
         M::up(SCHEMA_V5),
+        M::up(SCHEMA_V6),
     ])
 }
 
@@ -958,9 +1039,10 @@ mod tests {
     use tokio_rusqlite::rusqlite::{Connection as SqliteConnection, params};
 
     use super::{
-        OperatorsReportOutcome, ReportedOperator, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, Store,
-        migrations, operator_fingerprint,
+        OperatorsReportOutcome, ReportedOperator, RotationConfirmation, SCHEMA_V1, SCHEMA_V2,
+        SCHEMA_V3, Store, migrations, operator_fingerprint,
     };
+    use crate::token::SecretToken;
 
     const OPERATOR_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB operator";
@@ -1146,7 +1228,7 @@ mod tests {
         let store = Store::open(&path)
             .await
             .expect("open and migrate v3 database");
-        assert_eq!(store.schema_version().await.expect("schema version"), 5);
+        assert_eq!(store.schema_version().await.expect("schema version"), 6);
         let fingerprint = operator_fingerprint(OPERATOR_KEY).expect("fingerprint");
         let agent = store
             .get_agent("legacy")
@@ -1434,6 +1516,98 @@ mod tests {
                 .expect("remove again")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn rotation_switches_credentials_only_once_confirmed() {
+        let store = Store::open_in_memory().await.expect("open store");
+        let enrollment = store
+            .create_enrollment("store-042", OPERATOR_KEY, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        let credential = store
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None)
+            .await
+            .expect("consume enrollment");
+        let current = credential.control_token.expose();
+        let next = SecretToken::generate("rva").expect("next credential");
+        let authenticated = |token: String| {
+            let store = store.clone();
+            async move {
+                store
+                    .authenticate_agent("store-042", &token)
+                    .await
+                    .expect("authenticate")
+                    .is_some()
+            }
+        };
+
+        let stranger = SecretToken::generate("rva").expect("unrelated credential");
+        assert!(
+            !store
+                .begin_rotation("store-042", stranger.expose(), next.hash())
+                .await
+                .expect("begin with a wrong credential")
+        );
+        assert!(
+            store
+                .begin_rotation("store-042", current, next.hash())
+                .await
+                .expect("begin rotation")
+        );
+        // Until confirmed, the current credential works and the next one does not.
+        assert!(authenticated(current.to_owned()).await);
+        assert!(!authenticated(next.expose().to_owned()).await);
+
+        assert_eq!(
+            store
+                .confirm_rotation("store-042", stranger.expose())
+                .await
+                .expect("confirm unrelated"),
+            RotationConfirmation::Rejected
+        );
+        assert_eq!(
+            store
+                .confirm_rotation("store-042", next.expose())
+                .await
+                .expect("confirm"),
+            RotationConfirmation::Promoted
+        );
+        assert!(!authenticated(current.to_owned()).await);
+        assert!(authenticated(next.expose().to_owned()).await);
+
+        // An agent that lost the answer confirms again.
+        assert_eq!(
+            store
+                .confirm_rotation("store-042", next.expose())
+                .await
+                .expect("confirm again"),
+            RotationConfirmation::AlreadyCurrent
+        );
+        assert_eq!(
+            store
+                .confirm_rotation("store-042", current)
+                .await
+                .expect("confirm the old credential"),
+            RotationConfirmation::Rejected
+        );
+        // A request authenticated with the old credential before the promotion, and stalled
+        // since, cannot start another rotation.
+        let late = SecretToken::generate("rva").expect("late credential");
+        assert!(
+            !store
+                .begin_rotation("store-042", current, late.hash())
+                .await
+                .expect("begin with the replaced credential")
+        );
+        assert_eq!(
+            store
+                .confirm_rotation("store-042", late.expose())
+                .await
+                .expect("confirm the late credential"),
+            RotationConfirmation::Rejected
+        );
+        assert!(authenticated(next.expose().to_owned()).await);
     }
 
     #[tokio::test]

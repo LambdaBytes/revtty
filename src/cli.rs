@@ -125,6 +125,9 @@ pub enum AgentCommand {
     /// Run agent-specific diagnostics.
     Doctor,
 
+    /// Replace the agent's relay credential with a new one; the agent must be stopped.
+    RotateCredential,
+
     /// Manage the operators allowed to open shells on this agent.
     Operator {
         #[command(subcommand)]
@@ -297,6 +300,11 @@ mod tests {
             "operator.pub",
         ]);
         assert!(args.is_ok());
+    }
+
+    #[test]
+    fn parses_rotate_credential() {
+        assert!(Args::try_parse_from(["revtty", "agent", "rotate-credential"]).is_ok());
     }
 
     #[test]

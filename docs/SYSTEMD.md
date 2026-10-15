@@ -53,6 +53,20 @@ systemctl status "revtty-agent@$ACCOUNT.service"
 journalctl -u "revtty-agent@$ACCOUNT.service"
 ```
 
+## Operators and credential rotation
+
+Operator keys are managed as the same account, with the same paths: `revtty agent operator list`, `add` and `revoke`. The running agent applies a change within 2 seconds, without a restart.
+
+Rotating the agent's relay credential needs the agent stopped:
+
+```bash
+sudo systemctl stop "revtty-agent@$ACCOUNT.service"
+sudo -u "$ACCOUNT" env REVTTY_CONFIG_DIR="/var/lib/revtty/$ACCOUNT/config" REVTTY_STATE_DIR="/var/lib/revtty/$ACCOUNT/state" /usr/bin/revtty agent rotate-credential
+sudo systemctl start "revtty-agent@$ACCOUNT.service"
+```
+
+A rotation interrupted by a network failure or a power loss is finished by the agent's next start, or by running `rotate-credential` again.
+
 ## Lifecycle and permissions
 
 The unit:
