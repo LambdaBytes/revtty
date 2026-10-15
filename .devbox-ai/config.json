@@ -1,0 +1,166 @@
+{
+  "project_name": "revtty",
+  "workdir": ".",
+  "timeout_sec": 900,
+  "max_output_chars": 12000,
+  "allowed_commands": [
+    "git",
+    "bash",
+    "glab",
+    "rg",
+    "fd",
+    "fdfind",
+    "jq",
+    "yq",
+    "bat",
+    "batcat",
+    "tree",
+    "sed",
+    "awk",
+    "grep",
+    "python3",
+    "pytest",
+    "ruff",
+    "black",
+    "mypy",
+    "cargo",
+    "rustc",
+    "rustfmt",
+    "clippy-driver",
+    "rust-analyzer",
+    "node",
+    "npm",
+    "npx",
+    "corepack",
+    "pnpm",
+    "cmake",
+    "ninja",
+    "make",
+    "ctest",
+    "bear",
+    "cppcheck",
+    "clang-tidy",
+    "clang-format",
+    "include-what-you-use",
+    "shellcheck",
+    "shfmt",
+    "uname",
+    "uptime",
+    "df",
+    "free",
+    "lsof"
+  ],
+  "build": {
+    "rust-check": [
+      "bash",
+      "-lc",
+      "cargo check"
+    ],
+    "rust-build": [
+      "bash",
+      "-lc",
+      "cargo build"
+    ],
+    "rust-release": [
+      "bash",
+      "-lc",
+      "cargo build --release"
+    ],
+    "default": [
+      "bash",
+      "-lc",
+      "cargo check"
+    ]
+  },
+  "test": {
+    "rust": [
+      "bash",
+      "-lc",
+      "cargo test"
+    ],
+    "default": [
+      "bash",
+      "-lc",
+      "cargo test"
+    ]
+  },
+  "lint": [
+    [
+      "bash",
+      "-lc",
+      "if command -v ruff >/dev/null 2>&1; then ruff check --no-fix --no-fix-only .; else echo '[skip] ruff missing'; fi"
+    ],
+    [
+      "bash",
+      "-lc",
+      "set -o pipefail; if ! command -v shellcheck >/dev/null 2>&1; then echo '[skip] shellcheck missing'; elif command -v fd >/dev/null 2>&1; then fd -0 -e sh -e bash . | xargs -0 -r shellcheck; elif command -v fdfind >/dev/null 2>&1; then fdfind -0 -e sh -e bash . | xargs -0 -r shellcheck; else echo '[skip] fd missing'; fi"
+    ],
+    [
+      "bash",
+      "-lc",
+      "if command -v cargo >/dev/null 2>&1; then cargo fmt --all --check ; else echo '[skip] cargo missing'; fi"
+    ],
+    [
+      "bash",
+      "-lc",
+      "if command -v cargo >/dev/null 2>&1; then cargo clippy  --all-targets --all-features -- -D warnings; else echo '[skip] cargo missing'; fi"
+    ]
+  ],
+  "format": [
+    [
+      "bash",
+      "-lc",
+      "command -v ruff >/dev/null 2>&1 && ruff format . || true"
+    ],
+    [
+      "bash",
+      "-lc",
+      "command -v black >/dev/null 2>&1 && black . || true"
+    ],
+    [
+      "bash",
+      "-lc",
+      "command -v cargo >/dev/null 2>&1 && cargo fmt --all || true"
+    ]
+  ],
+  "run": {
+    "rust-run": [
+      "bash",
+      "-lc",
+      "cargo run  || true"
+    ],
+    "app": [
+      "bash",
+      "-lc",
+      "cargo run  || true"
+    ]
+  },
+  "resources": {
+    "style": [
+      "README.md",
+      "CONTRIBUTING.md",
+      ".clang-format",
+      "docs/style.md"
+    ],
+    "build": [
+      "Cargo.toml",
+      "player/Cargo.toml",
+      "package.json",
+      "server/package.json",
+      "pnpm-workspace.yaml",
+      "CMakeLists.txt",
+      "pyproject.toml",
+      "Makefile",
+      "meson.build",
+      "Dockerfile",
+      "docker-compose.yml",
+      "compose.yml",
+      "server/docker-compose.yml",
+      "infra/docker-compose.yml"
+    ],
+    "memory": [
+      ".devbox-ai/memory.md",
+      ".devbox-ai/memory.private.md"
+    ]
+  }
+}
