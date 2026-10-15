@@ -203,10 +203,15 @@ pub async fn serve(bind: &str, token: String, db: &FsPath) -> Result<(), RevttyE
         .await
         .map_err(|error| RevttyError::runtime("bind relay", error))?;
 
+    // The bound address, not the requested one: `--bind 127.0.0.1:0` picks a free port.
+    let address = listener
+        .local_addr()
+        .map_err(|error| RevttyError::runtime("read relay listen address", error))?;
+
     let store = Store::open(db).await?;
     let app = router(RelayState::new(token, store));
 
-    eprintln!("revtty relay transport proof listening on {bind}");
+    eprintln!("revtty relay transport proof listening on {address}");
 
     axum::serve(listener, app)
         .await

@@ -11,7 +11,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::Message;
 use ssh_key::{Algorithm, PublicKey};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use self::config::{AgentConfig, validate_max_sessions};
@@ -28,6 +28,8 @@ use crate::transport::{check_relay_health, connect_websocket, http_url, valid_na
 const RECONNECT_BASE_MILLIS: u64 = 1_000;
 const RECONNECT_CAP_MILLIS: u64 = 30_000;
 const RECONNECT_JITTER_PERCENT: u64 = 20;
+/// Bound on waiting for shell teardowns at shutdown; below systemd's `TimeoutStopSec=15s`.
+const SHELL_SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
 type SessionTasks = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
 
@@ -167,14 +169,18 @@ pub async fn run() -> Result<(), RevttyError> {
     let mut backoff = ReconnectBackoff::default();
     let session_slots = Arc::new(Semaphore::new(config.max_sessions));
     let session_tasks: SessionTasks = Arc::new(Mutex::new(HashMap::new()));
+    let (shutdown_signal, _) = watch::channel(false);
+    let (shell_guard, mut shell_guards) = mpsc::channel::<()>(1);
+    let shell_shutdown = ssh::ShellShutdown::new(shutdown_signal.subscribe(), &shell_guard);
 
-    loop {
+    let stopped = loop {
         let control = run_control_once(
             &client,
             &config,
             &mut backoff,
             &session_slots,
             &session_tasks,
+            &shell_shutdown,
         );
 
         tokio::select! {
@@ -183,10 +189,7 @@ pub async fn run() -> Result<(), RevttyError> {
                     eprintln!("control connection lost: {error}");
                 }
             }
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|error| RevttyError::runtime("wait for Ctrl-C", error))?;
-                return Ok(());
-            }
+            signal = tokio::signal::ctrl_c() => break signal,
         }
 
         let delay = backoff.next_delay();
@@ -194,12 +197,25 @@ pub async fn run() -> Result<(), RevttyError> {
 
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|error| RevttyError::runtime("wait for Ctrl-C", error))?;
-                return Ok(());
-            }
+            signal = tokio::signal::ctrl_c() => break signal,
         }
+    };
+
+    // Stop every shell and wait for the teardowns before returning lets the runtime shut
+    // down: supervisors still running at that point would be dropped mid-teardown.
+    shutdown_signal.send_replace(true);
+    drop(shell_guard);
+    if tokio::time::timeout(SHELL_SHUTDOWN_WAIT, shell_guards.recv())
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "shell teardown did not finish within {}s",
+            SHELL_SHUTDOWN_WAIT.as_secs()
+        );
     }
+
+    stopped.map_err(|error| RevttyError::runtime("wait for Ctrl-C", error))
 }
 
 async fn run_control_once(
@@ -208,6 +224,7 @@ async fn run_control_once(
     backoff: &mut ReconnectBackoff,
     session_slots: &Arc<Semaphore>,
     session_tasks: &SessionTasks,
+    shell_shutdown: &ssh::ShellShutdown,
 ) -> Result<(), RevttyError> {
     let relay = config.relay.as_str();
     let name = config.name.as_str();
@@ -319,6 +336,7 @@ async fn run_control_once(
                                 let relay = relay.to_owned();
                                 let operator_key = operator_key.to_owned();
                                 let task_session_id = session_id.clone();
+                                let shell_shutdown = shell_shutdown.clone();
 
                                 let task = tokio::spawn(async move {
                                     let _permit = permit;
@@ -328,6 +346,7 @@ async fn run_control_once(
                                         &tunnel_token,
                                         &task_session_id,
                                         &operator_key,
+                                        shell_shutdown,
                                     )
                                     .await
                                     {
