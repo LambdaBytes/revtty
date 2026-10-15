@@ -8,7 +8,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use reqwest_websocket::WebSocket;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{Algorithm, PrivateKey, PublicKey, PublicKeyOrCertificate};
-use russh::{ChannelMsg, Disconnect, Preferred, client};
+use russh::{Channel, ChannelMsg, Disconnect, Preferred, client};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -87,6 +87,54 @@ fn spawn_stdin_reader() -> mpsc::Receiver<io::Result<Vec<u8>>> {
     receiver
 }
 
+/// Opens the session channel and starts a PTY shell, waiting for the agent to confirm each
+/// step so a refusal is reported instead of leaving a silent terminal.
+async fn open_terminal_channel(
+    session: &client::Handle<ClientHandler>,
+    term: &str,
+    cols: u32,
+    rows: u32,
+) -> Result<Channel<client::Msg>, RevttyError> {
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(|error| RevttyError::runtime("open SSH terminal channel", error))?;
+
+    channel
+        .request_pty(true, term, cols, rows, 0, 0, &[])
+        .await
+        .map_err(|error| RevttyError::runtime("request remote PTY", error))?;
+    expect_channel_success(&mut channel, "allocate a remote PTY").await?;
+
+    channel
+        .request_shell(true)
+        .await
+        .map_err(|error| RevttyError::runtime("request remote shell", error))?;
+    expect_channel_success(&mut channel, "start a remote shell").await?;
+
+    Ok(channel)
+}
+
+async fn expect_channel_success(
+    channel: &mut Channel<client::Msg>,
+    action: &str,
+) -> Result<(), RevttyError> {
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Success) => return Ok(()),
+            Some(ChannelMsg::Failure) => {
+                return Err(RevttyError::message(format!("agent could not {action}")));
+            }
+            Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
+                return Err(RevttyError::message(format!(
+                    "agent closed the terminal before it could {action}"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 fn ed25519_only() -> Preferred {
     Preferred {
         key: Cow::Owned(vec![Algorithm::Ed25519]),
@@ -147,11 +195,13 @@ where
         .map_err(|_| RevttyError::message("SSH handshake with the agent timed out"))?
 }
 
+/// Runs an interactive terminal session; returns the remote exit status, or `None` when the
+/// session ended without one (for example because the agent went away).
 pub async fn connect_terminal(
     websocket: WebSocket,
     operator_key_path: &Path,
     encoded_host_key: &str,
-) -> Result<u32, RevttyError> {
+) -> Result<Option<u32>, RevttyError> {
     let operator_key = PrivateKey::read_openssh_file(operator_key_path)
         .map_err(|error| RevttyError::runtime("read operator SSH private key", error))?;
     let expected_server_key = PublicKey::from_openssh(encoded_host_key)
@@ -175,22 +225,10 @@ pub async fn connect_terminal(
         )
         .await?;
 
-        let mut channel = session
-            .channel_open_session()
-            .await
-            .map_err(|error| RevttyError::runtime("open SSH terminal channel", error))?;
-
         let (cols, rows) = size().unwrap_or((80, 24));
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
-
-        channel
-            .request_pty(false, &term, u32::from(cols), u32::from(rows), 0, 0, &[])
-            .await
-            .map_err(|error| RevttyError::runtime("request remote PTY", error))?;
-        channel
-            .request_shell(false)
-            .await
-            .map_err(|error| RevttyError::runtime("request remote shell", error))?;
+        let mut channel =
+            open_terminal_channel(&session, &term, u32::from(cols), u32::from(rows)).await?;
 
         let mut resize =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
@@ -265,7 +303,7 @@ pub async fn connect_terminal(
             .disconnect(Disconnect::ByApplication, "", "English")
             .await;
 
-        Ok(exit_status.unwrap_or(0))
+        Ok(exit_status)
     }
     .await;
 
@@ -292,7 +330,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{ClientHandler, client_config, ed25519_only, open_session};
+    use super::{ClientHandler, client_config, ed25519_only, open_session, open_terminal_channel};
     use crate::transport::SshTimeouts;
     use crate::transport::test_support::{ControlledStream, StreamControl};
 
@@ -300,6 +338,47 @@ mod tests {
 
     impl server::Handler for HandshakeOnlyServer {
         type Error = russh::Error;
+    }
+
+    /// Accepts the operator and a session channel but refuses to allocate a PTY.
+    struct PtyRefusingServer;
+
+    impl server::Handler for PtyRefusingServer {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            _public_key: &PublicKey,
+        ) -> Result<server::Auth, Self::Error> {
+            Ok(server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<server::Msg>,
+            reply: server::ChannelOpenHandle,
+            _session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn pty_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _term: &str,
+            _col_width: u32,
+            _row_height: u32,
+            _pix_width: u32,
+            _pix_height: u32,
+            _modes: &[(russh::Pty, u32)],
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_failure(channel)?;
+            Ok(())
+        }
     }
 
     /// Accepts any operator key; stands in for the agent where only liveness matters.
@@ -446,5 +525,53 @@ mod tests {
             matches!(opened, Ok(Err(_))),
             "SSH handshake against a silent agent was not bounded"
         );
+    }
+
+    #[tokio::test]
+    async fn refused_pty_is_reported_instead_of_hanging() {
+        let host_key = ed25519_key();
+        let expected_server_key = host_key.public_key().clone();
+        let server_config = server::Config {
+            keys: vec![host_key],
+            preferred: ed25519_only(),
+            ..Default::default()
+        };
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            if let Ok(running) =
+                server::run_stream(Arc::new(server_config), server_stream, PtyRefusingServer).await
+            {
+                let _ = running.await;
+            }
+        });
+
+        let session = open_session(
+            client_stream,
+            client_config(FAST_TIMEOUTS),
+            expected_server_key,
+            ed25519_key(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("open operator session");
+
+        let opened = tokio::time::timeout(
+            Duration::from_secs(2),
+            open_terminal_channel(&session, "xterm", 80, 24),
+        )
+        .await
+        .expect("PTY refusal was not reported");
+        let Err(error) = opened else {
+            panic!("terminal opened although the PTY was refused");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("could not allocate a remote PTY"),
+            "unexpected error: {error}"
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 }

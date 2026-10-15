@@ -11,14 +11,19 @@ mod storage;
 mod token;
 mod transport;
 
+use std::process::ExitCode;
+
 use clap::Parser;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let args = cli::Args::parse();
 
-    if let Err(error) = app::run(args).await {
-        eprintln!("error: {error}");
-        std::process::exit(1);
+    match app::run(args).await {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
