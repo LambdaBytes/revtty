@@ -27,7 +27,7 @@ use crate::protocol::{
     OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, SESSION_ERROR_PREFIX,
     SessionRejectReason, operator_auth_message, operator_list_auth_message,
 };
-use crate::storage::Store;
+use crate::storage::{OperatorsReportOutcome, ReportedOperator, Store};
 use crate::token::{SecretToken, hash_token};
 use crate::transport::valid_name;
 
@@ -373,6 +373,9 @@ impl ChallengeSigner {
 
 struct OperatorSession {
     agent_name: String,
+    /// The enrolled agent instance it was issued for; a re-enrolled agent of the same name
+    /// is another instance.
+    agent_id: String,
     /// SHA-256 fingerprint of the operator key whose signature opened this session.
     operator_fingerprint: String,
     expires_at: Instant,
@@ -411,7 +414,6 @@ pub async fn create_enrollment(
     let operator_key = operator_key
         .to_openssh()
         .map_err(|error| RevttyError::runtime("encode operator public key", error))?;
-
     let store = Store::open(db).await?;
     let enrollment = store
         .create_enrollment(name, &operator_key, Duration::from_secs(ttl_secs))
@@ -435,9 +437,8 @@ pub async fn list_agents(db: &FsPath) -> Result<(), RevttyError> {
 
     for agent in agents {
         let host_fingerprint = public_key_fingerprint(&agent.host_key)?;
-        let operator_fingerprint = public_key_fingerprint(&agent.operator_key)?;
         println!(
-            "{}\tid={}\tcreated={}\tlast_seen={}\tversion={}\thost={}\toperator={}",
+            "{}\tid={}\tcreated={}\tlast_seen={}\tversion={}\thost={}\toperators={}",
             agent.name,
             agent.id,
             agent.created_at,
@@ -446,7 +447,7 @@ pub async fn list_agents(db: &FsPath) -> Result<(), RevttyError> {
                 .map_or_else(|| "-".to_owned(), |value| value.to_string()),
             agent.version.as_deref().unwrap_or("-"),
             host_fingerprint,
-            operator_fingerprint
+            agent.operators.join(",")
         );
     }
 
@@ -645,6 +646,18 @@ async fn operator_auth(
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
+    let signature = match SshSig::from_pem(request.signature.as_bytes()) {
+        Ok(signature) => signature,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    // The signature names its key; it counts only if that key is one of the agent's
+    // operators, and only once it verifies.
+    let operator_key = PublicKey::from(signature.public_key().clone());
+    if operator_key.algorithm() != Algorithm::Ed25519 {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let operator_fingerprint = operator_key.fingerprint(HashAlg::Sha256).to_string();
+
     let agent = match state.store.get_agent(&name).await {
         Ok(Some(agent)) => agent,
         // Same answer as a bad signature: agent names stay private.
@@ -654,15 +667,10 @@ async fn operator_auth(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    if !agent.operators.contains(&operator_fingerprint) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
 
-    let operator_key = match PublicKey::from_openssh(&agent.operator_key) {
-        Ok(key) if key.algorithm() == Algorithm::Ed25519 => key,
-        _ => return StatusCode::UNAUTHORIZED.into_response(),
-    };
-    let signature = match SshSig::from_pem(request.signature.as_bytes()) {
-        Ok(signature) => signature,
-        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-    };
     let message = operator_auth_message(&name, &request.challenge);
 
     if operator_key
@@ -676,7 +684,6 @@ async fn operator_auth(
         return status.into_response();
     }
 
-    let operator_fingerprint = operator_key.fingerprint(HashAlg::Sha256).to_string();
     let session_token = match SecretToken::generate("rvo") {
         Ok(token) => token,
         Err(error) => {
@@ -696,6 +703,7 @@ async fn operator_auth(
         session_token.hash(),
         OperatorSession {
             agent_name: name,
+            agent_id: agent.id,
             operator_fingerprint,
             expires_at: now + OPERATOR_SESSION_TTL,
         },
@@ -762,15 +770,7 @@ async fn operator_list(
 
     let mut visible = Vec::new();
     for agent in agents {
-        let enrolled_key = match PublicKey::from_openssh(&agent.operator_key) {
-            Ok(key) => key,
-            Err(error) => {
-                eprintln!("stored operator key for {} is invalid: {error}", agent.name);
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-
-        if enrolled_key.fingerprint(HashAlg::Sha256).to_string() != operator_fingerprint {
+        if !agent.operators.contains(&operator_fingerprint) {
             continue;
         }
 
@@ -901,7 +901,8 @@ async fn persistent_operator_upgrade(
         .into_response()
 }
 
-/// Spends the operator credential in `headers`, which is valid once and only for `agent_name`.
+/// Spends the operator credential in `headers`, which is valid once and only for `agent_name`,
+/// and only while the operator is still one of that agent instance's operators.
 async fn consume_operator_session(
     state: &RelayState,
     agent_name: &str,
@@ -914,7 +915,22 @@ async fn consume_operator_session(
         sessions.remove(&hash_token(token))
     }?;
 
-    (session.agent_name == agent_name && session.expires_at > Instant::now()).then_some(session)
+    if session.agent_name != agent_name || session.expires_at <= Instant::now() {
+        return None;
+    }
+
+    match state
+        .store
+        .operator_authorized(&session.agent_id, &session.operator_fingerprint)
+        .await
+    {
+        Ok(true) => Some(session),
+        Ok(false) => None,
+        Err(error) => {
+            eprintln!("operator session check failed: {error}");
+            None
+        }
+    }
 }
 
 async fn persistent_agent_upgrade(
@@ -931,14 +947,14 @@ async fn persistent_agent_upgrade(
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    match state.store.authenticate_agent(&name, token).await {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::UNAUTHORIZED.into_response(),
+    let agent_id = match state.store.authenticate_agent(&name, token).await {
+        Ok(Some(agent_id)) => agent_id,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => {
             eprintln!("agent authentication failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    }
+    };
 
     if let Err(error) = state.store.mark_seen(&name, None).await {
         eprintln!("failed to update agent presence: {error}");
@@ -947,7 +963,7 @@ async fn persistent_agent_upgrade(
 
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_agent(socket, state, name))
+        .on_upgrade(move |socket| handle_agent(socket, state, name, agent_id))
         .into_response()
 }
 
@@ -967,8 +983,8 @@ async fn agent_credential_check(
     };
 
     match state.store.authenticate_agent(&name, token).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::UNAUTHORIZED.into_response(),
+        Ok(Some(_)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => {
             eprintln!("agent credential check failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -1010,7 +1026,7 @@ async fn persistent_session_upgrade(
         .into_response()
 }
 
-async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
+async fn handle_agent(socket: WebSocket, state: RelayState, name: String, agent_id: String) {
     let timeouts = state.timeouts;
     let (mut sender, mut receiver) = socket.split();
 
@@ -1026,7 +1042,22 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
     let (control_tx, mut control_rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
 
     {
+        // Claimed in the database and registered in memory under one lock: two connections
+        // of the same agent cannot end up current in one place and replaced in the other.
+        // From the claim on, the reports of any connection this one replaces are refused.
         let mut agents = state.agents.lock().await;
+        match state
+            .store
+            .claim_control_connection(&agent_id, &connection_id.to_string())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                eprintln!("failed to register agent {name}: {error}");
+                return;
+            }
+        }
         agents.insert(
             name.clone(),
             AgentHandle {
@@ -1147,6 +1178,24 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String) {
                                     )
                                     .await;
                                 }
+                                ControlMessage::OperatorsReport {
+                                    version,
+                                    revision,
+                                    operators,
+                                } if version == CONTROL_PROTOCOL_VERSION => {
+                                    let keep = record_operators_report(
+                                        &state,
+                                        &name,
+                                        &agent_id,
+                                        connection_id,
+                                        revision,
+                                        &operators,
+                                    )
+                                    .await;
+                                    if !keep {
+                                        break;
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -1215,6 +1264,69 @@ async fn receive_agent_hello(
     .await;
     let _ = tokio::time::timeout(timeouts.control_send, sender.close()).await;
     None
+}
+
+/// Stores an agent's operator list when it comes from the agent's current control connection,
+/// returning whether that connection may stay open. A list that is empty or holds an unusable
+/// key is ignored whole: the relay never narrows or widens what the agent reported. A list
+/// that cannot be stored closes the connection: the agent sends its list again after it
+/// reconnects, and never otherwise.
+async fn record_operators_report(
+    state: &RelayState,
+    name: &str,
+    agent_id: &str,
+    connection_id: Uuid,
+    revision: u64,
+    operators: &[String],
+) -> bool {
+    if i64::try_from(revision).is_err() {
+        eprintln!("agent {name} reported an out-of-range operator list revision; report ignored");
+        return true;
+    }
+
+    let mut reported = Vec::with_capacity(operators.len());
+    for encoded in operators {
+        match PublicKey::from_openssh(encoded) {
+            Ok(key) if key.algorithm() == Algorithm::Ed25519 => reported.push(ReportedOperator {
+                fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+                public_key: encoded.clone(),
+            }),
+            _ => {
+                eprintln!("agent {name} reported an unusable operator key; report ignored");
+                return true;
+            }
+        }
+    }
+    if reported.is_empty() {
+        eprintln!("agent {name} reported no operators; report ignored");
+        return true;
+    }
+
+    match state
+        .store
+        .apply_operators_report(agent_id, &connection_id.to_string(), revision, reported)
+        .await
+    {
+        Ok(OperatorsReportOutcome::Applied { changed: true }) => {
+            eprintln!(
+                "agent {name} operators updated to revision {revision} ({} operators)",
+                operators.len()
+            );
+            true
+        }
+        Ok(OperatorsReportOutcome::Applied { changed: false }) => true,
+        Ok(OperatorsReportOutcome::NotCurrent) => {
+            eprintln!("agent {name} reported operators on a replaced connection; closing it");
+            false
+        }
+        Err(error) => {
+            eprintln!(
+                "failed to store operators of agent {name}: {error}; closing its control \
+                 connection so that it reports them again"
+            );
+            false
+        }
+    }
 }
 
 async fn record_agent_decision(
@@ -1529,7 +1641,7 @@ mod tests {
 
     use super::{
         AgentDecision, AgentHandle, OperatorSession, PendingSession, RelayState, RelayTimeouts,
-        record_agent_decision, router, spend_challenge,
+        record_agent_decision, record_operators_report, router, spend_challenge,
     };
     use crate::protocol::{
         AgentListResponse, AgentStatusResponse, CONTROL_PROTOCOL_VERSION, ControlMessage,
@@ -2303,6 +2415,8 @@ mod tests {
         state: RelayState,
         url: String,
         control_token: String,
+        agent_id: String,
+        operator_fingerprint: String,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -2338,6 +2452,9 @@ mod tests {
             state,
             url: format!("ws://{address}"),
             control_token: credential.control_token.expose().to_owned(),
+            agent_id: credential.id,
+            operator_fingerprint: crate::storage::operator_fingerprint(&operator_key)
+                .expect("operator fingerprint"),
             server,
         }
     }
@@ -2478,7 +2595,8 @@ mod tests {
             session_token.hash(),
             OperatorSession {
                 agent_name: "stuck-agent".to_owned(),
-                operator_fingerprint: "SHA256:stuck-operator".to_owned(),
+                agent_id: relay.agent_id.clone(),
+                operator_fingerprint: relay.operator_fingerprint.clone(),
                 expires_at: std::time::Instant::now() + Duration::from_secs(30),
             },
         );
@@ -2508,7 +2626,7 @@ mod tests {
 
         let session = audited_outcome(&relay.state, "agent_unresponsive").await;
         assert_eq!(session.kind, "shell");
-        assert_eq!(session.operator_fingerprint, "SHA256:stuck-operator");
+        assert_eq!(session.operator_fingerprint, relay.operator_fingerprint);
 
         relay.server.abort();
     }
@@ -2830,7 +2948,8 @@ mod tests {
             session_token.hash(),
             OperatorSession {
                 agent_name: "busy-agent".to_owned(),
-                operator_fingerprint: "SHA256:busy-operator".to_owned(),
+                agent_id: relay.agent_id.clone(),
+                operator_fingerprint: relay.operator_fingerprint.clone(),
                 expires_at: std::time::Instant::now() + Duration::from_secs(30),
             },
         );
@@ -2854,7 +2973,7 @@ mod tests {
         let session = audited_outcome(&relay.state, "rejected:busy").await;
         assert_eq!(session.agent_name, "busy-agent");
         assert_eq!(session.kind, "probe");
-        assert_eq!(session.operator_fingerprint, "SHA256:busy-operator");
+        assert_eq!(session.operator_fingerprint, relay.operator_fingerprint);
         assert!(session.ended_at.is_some());
 
         agent_task.abort();
@@ -2890,6 +3009,349 @@ mod tests {
             relay.state.agents.lock().await.is_empty(),
             "a credential check registered the agent"
         );
+        relay.server.abort();
+    }
+
+    fn operators_report(revision: u64, operators: &[&str]) -> ClientMessage {
+        ClientMessage::Text(
+            serde_json::to_string(&ControlMessage::OperatorsReport {
+                version: CONTROL_PROTOCOL_VERSION,
+                revision,
+                operators: operators.iter().map(|key| (*key).to_owned()).collect(),
+            })
+            .expect("encode operators report"),
+        )
+    }
+
+    /// Waits until the stored authorization of `fingerprint` on `agent_id` is `expected`.
+    async fn wait_authorized(store: &Store, agent_id: &str, fingerprint: &str, expected: bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while store
+            .operator_authorized(agent_id, fingerprint)
+            .await
+            .expect("check operator")
+            != expected
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "operator {fingerprint} authorized != {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn auth_status(
+        http: &reqwest::Client,
+        base: &str,
+        name: &str,
+        key: &PrivateKey,
+    ) -> reqwest::Response {
+        let challenge = fetch_challenge(http, format!("{base}/v1/operator/challenge/{name}")).await;
+        post_auth(http, base, name, key, &challenge).await
+    }
+
+    async fn listed_names(http: &reqwest::Client, base: &str, key: &PrivateKey) -> Vec<String> {
+        let challenge = fetch_challenge(http, format!("{base}/v1/operator/list/challenge")).await;
+        let response = post_list(http, base, key, &challenge).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response
+            .json::<AgentListResponse>()
+            .await
+            .expect("decode agent list")
+            .agents
+            .into_iter()
+            .map(|agent| agent.name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn operators_report_decides_who_gets_session_credentials() {
+        const NAME: &str = "lifecycle-agent";
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let first = ed25519_key();
+        let second = ed25519_key();
+        let first_key = first.public_key().to_openssh().expect("first key");
+        let second_key = second.public_key().to_openssh().expect("second key");
+        let second_fingerprint =
+            crate::storage::operator_fingerprint(&second_key).expect("second fingerprint");
+        let enrollment = store
+            .create_enrollment(NAME, &first_key, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        let host_key = ed25519_key().public_key().to_openssh().expect("host key");
+        let credential = store
+            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .await
+            .expect("consume enrollment");
+        let (state, base, server) = http_relay(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        // Until the agent says otherwise, only the enrolled operator is accepted.
+        assert_eq!(
+            auth_status(&http, &base, NAME, &second).await.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert!(listed_names(&http, &base, &second).await.is_empty());
+
+        let mut agent = connect_websocket(
+            &http,
+            &base,
+            &format!("/v1/agent/{NAME}"),
+            credential.control_token.expose(),
+        )
+        .await
+        .expect("connect agent");
+        agent.send(test_hello(NAME)).await.expect("send hello");
+        assert!(wait_registered(&state, NAME, true).await);
+
+        agent
+            .send(operators_report(2, &[&first_key, &second_key]))
+            .await
+            .expect("report added operator");
+        wait_authorized(&store, &credential.id, &second_fingerprint, true).await;
+        assert_eq!(listed_names(&http, &base, &second).await, vec![NAME]);
+        let issued = auth_status(&http, &base, NAME, &second).await;
+        assert_eq!(issued.status(), reqwest::StatusCode::CREATED);
+        let issued: OperatorAuthResponse = issued.json().await.expect("decode auth response");
+
+        // Revoked before it was used: the credential no longer opens anything.
+        agent
+            .send(operators_report(3, &[&first_key]))
+            .await
+            .expect("report revoked operator");
+        wait_authorized(&store, &credential.id, &second_fingerprint, false).await;
+        let status = http
+            .get(format!("{base}/v1/status/{NAME}"))
+            .bearer_auth(&issued.session_token)
+            .send()
+            .await
+            .expect("use revoked operator credential");
+        assert_eq!(status.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            auth_status(&http, &base, NAME, &second).await.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert!(listed_names(&http, &base, &second).await.is_empty());
+
+        // Once another control connection is the agent's current one, the earlier one is
+        // closed and cannot change the operators any more.
+        let mut current = connect_websocket(
+            &http,
+            &base,
+            &format!("/v1/agent/{NAME}"),
+            credential.control_token.expose(),
+        )
+        .await
+        .expect("connect agent again");
+        current.send(test_hello(NAME)).await.expect("send hello");
+        current
+            .send(operators_report(3, &[&first_key]))
+            .await
+            .expect("report from the current connection");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        agent
+            .send(operators_report(4, &[&first_key, &second_key]))
+            .await
+            .expect("report from the replaced connection");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline {
+            assert!(
+                !store
+                    .operator_authorized(&credential.id, &second_fingerprint)
+                    .await
+                    .expect("check operator"),
+                "a replaced control connection changed the operators"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        server.abort();
+    }
+
+    /// Waits until the relay closes `agent`'s control connection.
+    async fn wait_closed_by_relay(
+        agent: &mut reqwest_websocket::WebSocket,
+        within: Duration,
+    ) -> bool {
+        tokio::time::timeout(within, async {
+            loop {
+                match agent.next().await {
+                    Some(Ok(ClientMessage::Close { .. })) | Some(Err(_)) | None => return,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn operators_report_on_a_replaced_connection_closes_it() {
+        const NAME: &str = "superseded-agent";
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let operator = ed25519_key()
+            .public_key()
+            .to_openssh()
+            .expect("operator key");
+        let enrollment = store
+            .create_enrollment(NAME, &operator, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        let host_key = ed25519_key().public_key().to_openssh().expect("host key");
+        let credential = store
+            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .await
+            .expect("consume enrollment");
+        // Production timeouts: the agent is not dropped for idling during the test.
+        let (state, base, server) = http_relay(store.clone()).await;
+        let mut agent = connect_websocket(
+            &reqwest::Client::new(),
+            &base,
+            &format!("/v1/agent/{NAME}"),
+            credential.control_token.expose(),
+        )
+        .await
+        .expect("connect agent");
+        agent.send(test_hello(NAME)).await.expect("send hello");
+        assert!(wait_registered(&state, NAME, true).await);
+
+        // Another connection of the agent has claimed its place.
+        assert!(
+            store
+                .claim_control_connection(&credential.id, "another-connection")
+                .await
+                .expect("claim control connection")
+        );
+        agent
+            .send(operators_report(2, &[&operator]))
+            .await
+            .expect("send report");
+
+        assert!(
+            wait_closed_by_relay(&mut agent, Duration::from_secs(3)).await,
+            "relay kept a replaced control connection open"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn operators_report_that_cannot_be_stored_closes_the_control_connection() {
+        const NAME: &str = "blocked-agent";
+        let path =
+            std::env::temp_dir().join(format!("revtty-blocked-{}.db", Uuid::new_v4().simple()));
+        let store = Store::open(&path).await.expect("open relay store");
+        let operator = ed25519_key()
+            .public_key()
+            .to_openssh()
+            .expect("operator key");
+        let enrollment = store
+            .create_enrollment(NAME, &operator, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        let host_key = ed25519_key().public_key().to_openssh().expect("host key");
+        let credential = store
+            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .await
+            .expect("consume enrollment");
+        let (state, base, server) = http_relay(store).await;
+
+        let mut agent = connect_websocket(
+            &reqwest::Client::new(),
+            &base,
+            &format!("/v1/agent/{NAME}"),
+            credential.control_token.expose(),
+        )
+        .await
+        .expect("connect agent");
+        agent.send(test_hello(NAME)).await.expect("send hello");
+        assert!(wait_registered(&state, NAME, true).await);
+
+        // Another writer holds the database longer than the relay's busy timeout.
+        let blocker = tokio_rusqlite::rusqlite::Connection::open(&path).expect("open database");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("lock database");
+        let added = ed25519_key().public_key().to_openssh().expect("added key");
+        agent
+            .send(operators_report(2, &[&operator, &added]))
+            .await
+            .expect("send report");
+
+        // Closed, the agent reconnects and reports its list again; left open, the list would
+        // never be sent again.
+        let closed = wait_closed_by_relay(&mut agent, Duration::from_secs(10)).await;
+        blocker.execute_batch("ROLLBACK;").expect("unlock database");
+        assert!(
+            closed,
+            "relay dropped an operators report and kept the connection"
+        );
+
+        server.abort();
+        drop(state);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn operators_report_in_flight_from_a_replaced_connection_is_ignored() {
+        let relay = fast_relay("moving-agent").await;
+        let added = ed25519_key().public_key().to_openssh().expect("added key");
+        let added_fingerprint = crate::storage::operator_fingerprint(&added).expect("fingerprint");
+
+        // The replaced connection registered first, the current one after it.
+        let replaced = Uuid::new_v4();
+        let current = Uuid::new_v4();
+        for connection in [replaced, current] {
+            assert!(
+                relay
+                    .state
+                    .store
+                    .claim_control_connection(&relay.agent_id, &connection.to_string())
+                    .await
+                    .expect("claim control connection")
+            );
+        }
+
+        // A report the replaced connection had already received when the new one registered.
+        record_operators_report(
+            &relay.state,
+            "moving-agent",
+            &relay.agent_id,
+            replaced,
+            5,
+            std::slice::from_ref(&added),
+        )
+        .await;
+        assert!(
+            !relay
+                .state
+                .store
+                .operator_authorized(&relay.agent_id, &added_fingerprint)
+                .await
+                .expect("check operator"),
+            "a replaced connection's report was stored"
+        );
+
+        record_operators_report(
+            &relay.state,
+            "moving-agent",
+            &relay.agent_id,
+            current,
+            5,
+            &[added],
+        )
+        .await;
+        assert!(
+            relay
+                .state
+                .store
+                .operator_authorized(&relay.agent_id, &added_fingerprint)
+                .await
+                .expect("check operator"),
+            "the current connection's report was not stored"
+        );
+
         relay.server.abort();
     }
 
@@ -2980,7 +3442,8 @@ mod tests {
             session_token.hash(),
             OperatorSession {
                 agent_name: "tunnel-agent".to_owned(),
-                operator_fingerprint: "SHA256:tunnel-operator".to_owned(),
+                agent_id: relay.agent_id.clone(),
+                operator_fingerprint: relay.operator_fingerprint.clone(),
                 expires_at: std::time::Instant::now() + Duration::from_secs(30),
             },
         );

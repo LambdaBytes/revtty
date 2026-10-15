@@ -37,11 +37,13 @@ Design principles, scope and roadmap: [docs/BRIEF.md](docs/BRIEF.md), [docs/V1_S
 **Security**
 
 - Persistent Ed25519 identities for the operator (`revtty init`) and every agent.
-- Agents join with a single-use, expiring enrollment token bound to one agent name and one operator key.
+- Agents join with a single-use, expiring enrollment token bound to one agent name and its first operator key.
 - Operators authenticate with OpenSSH signatures (SSHSIG) over single-use challenges and receive a 30-second, single-use session credential. Each data tunnel gets its own one-time credential, and the agent's long-lived control credential is refused on the data path.
-- `list` only shows agents enrolled for the signing key. Challenge requests do not reveal which agents exist, and they keep no relay state: unauthenticated requests cannot use up what operators need to authenticate.
+- `list` only shows agents that authorize the signing key. Challenge requests do not reveal which agents exist, and they keep no relay state: unauthenticated requests cannot use up what operators need to authenticate.
 - The agent's host key is pinned per relay and agent in revtty's own `known_hosts`. The first pin needs the operator's confirmation of the fingerprint printed on the target, so the relay cannot introduce a host key; a changed key is a hard failure.
-- The agent authenticates the operator's key again inside SSH. Only Ed25519 keys are accepted.
+- The agent authenticates the operator's key again inside SSH, against its own operator list in `agent.toml`. Only Ed25519 keys are accepted.
+- Operators are managed on the target with `revtty agent operator list|add|revoke`, locally or from an operator's `revtty connect` shell. The running agent applies a change within 2 seconds: a revoked operator's open sessions are closed and new ones refused. The last operator cannot be revoked.
+- The relay learns the agent's operator list from the agent, and issues session credentials only to those operators; it cannot add one, because the agent's own list decides SSH access.
 
 **Reliability**
 
@@ -125,6 +127,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | `agent enroll --relay URL --token TOKEN [--max-sessions N]` | target | Consume an enrollment token and store the agent configuration. |
 | `agent run` | target | Run the persistent agent. |
 | `agent status`, `agent doctor`, `agent pty-test` | target | Local configuration, full diagnostics, local PTY check. |
+| `agent operator list`, `agent operator add KEYFILE`, `agent operator revoke FINGERPRINT` | target | Show, authorize or revoke operator keys. |
 | `relay init`, `relay serve [--bind ADDR]` | relay | Create or migrate the database; serve the relay. |
 | `relay enroll NAME --operator-key FILE [--ttl SECS]` | relay | Single-use enrollment token (default lifetime 600 s). |
 | `relay agents`, `relay sessions [--limit N]`, `relay doctor` | relay | Enrolled agents, session audit, diagnostics. |
@@ -136,7 +139,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | Role | Files | Location |
 |---|---|---|
 | operator | `id_ed25519`, `id_ed25519.pub`, `known_hosts` | config directory |
-| agent | `agent.toml` (holds the control credential) | config directory |
+| agent | `agent.toml` (holds the control credential and the operator list), `agent.lock` | config directory |
 | agent | `agent_ed25519`, `agent_ed25519.pub` (host key) | state directory |
 | relay | SQLite database | `--db` |
 
@@ -146,7 +149,7 @@ On Linux the defaults are `~/.config/revtty` and `~/.local/share/revtty`; `REVTT
 
 - **Pre-v1**: the protocol and database schema may still change between versions. Database migrations run automatically and only forward.
 - **Not yet validated** across a real NAT/CGNAT boundary or under real network loss; local tests cover relay restarts and silent peers.
-- **One operator key per agent**, fixed at enrollment. There are no commands yet to add or revoke operators, rotate credentials, or re-enroll or remove an agent.
+- **No roles**: every authorized operator of an agent can manage its operators. There are no commands yet to rotate the agent's credential, or to re-enroll or remove an agent.
 - **One relay process**: agent presence lives in its memory; there is no clustering or high availability.
 - **Not yet**: rate limiting, packages or signed release artifacts, a launchd service for macOS agents, Windows support.
 - **Audit is best effort**: records are written asynchronously and dropped with a warning if the queue fills up.
