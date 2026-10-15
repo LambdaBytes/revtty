@@ -41,7 +41,7 @@ pub struct HostKeyCheck {
 }
 
 pub fn ensure_agent(paths: &Paths) -> Result<AgentIdentity, RevttyError> {
-    fs::create_dir_all(&paths.state_dir)
+    crate::config::create_private_dir(&paths.state_dir)
         .map_err(|error| RevttyError::runtime("create agent state directory", error))?;
 
     let private_key_path = paths.state_dir.join(AGENT_KEY_FILE);
@@ -78,7 +78,7 @@ pub fn ensure_agent(paths: &Paths) -> Result<AgentIdentity, RevttyError> {
 }
 
 pub fn ensure_operator(paths: &Paths) -> Result<OperatorIdentity, RevttyError> {
-    fs::create_dir_all(&paths.config_dir)
+    crate::config::create_private_dir(&paths.config_dir)
         .map_err(|error| RevttyError::runtime("create operator config directory", error))?;
 
     let private_key_path = paths.config_dir.join(OPERATOR_KEY_FILE);
@@ -187,7 +187,7 @@ pub fn pin_agent_host_key(
         return Ok(());
     }
 
-    fs::create_dir_all(&paths.config_dir)
+    crate::config::create_private_dir(&paths.config_dir)
         .map_err(|error| RevttyError::runtime("create operator config directory", error))?;
 
     let public_text = parse_agent_host_key(encoded_key)?

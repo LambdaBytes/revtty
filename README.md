@@ -40,7 +40,7 @@ The repository has moved beyond the scaffold. The authenticated M1 path now incl
 - signed operator `list` scoped to machines authorized for that operator key;
 - authenticated operator `status` with online/offline, last-seen and version metadata;
 - short-lived, single-use operator session credentials;
-- OpenSSH-style agent host-key pinning;
+- OpenSSH-style agent host-key pinning, with the operator confirming the fingerprint on first contact;
 - a separate one-time credential for each agent data tunnel;
 - SSH carried end-to-end through an opaque WebSocket relay;
 - a real interactive PTY shell;
@@ -50,11 +50,18 @@ The repository has moved beyond the scaffold. The authenticated M1 path now incl
 - configurable per-agent concurrent session limits with live capacity shown by `list` / `status`;
 - explicit rejection of incompatible session-offer protocol versions;
 - operator-visible pre-SSH errors for busy agents and rendezvous timeouts;
-- operator, agent and relay doctor checks for identity/configuration, relay reachability and relay storage;
+- operator, agent and relay doctor checks for configuration, relay reachability (with TLS causes), signed authentication, agent credentials, file permissions and relay schema;
+- SSH keepalives and inactivity bounds on both ends: idle sessions stay open, sessions on a dead path end and release their capacity slot;
+- relay expiry of silent agent control channels, and agent reconnection when the relay goes silent;
+- agent registration only after a valid `Hello`, with an explicit rejection of other protocol versions;
+- stateless HMAC operator challenges bound to their scope and expiry; single use is recorded only for enrolled operators, and `list` challenges are bound to the enrollment epoch;
+- non-blocking PTY I/O with one supervisor per shell: no input is injected on disconnect, shells are reaped (SIGHUP, then SIGKILL), every PTY descriptor is released, and the agent finishes these teardowns before it exits;
+- persistent session audit metadata (`relay sessions`);
+- `connect` exits with the remote shell's status, or 255 when none arrived;
 - a systemd template that runs the agent as an explicit OS account with restart-on-failure and journald logging;
 - Linux and macOS CI for format, Clippy, tests and release builds.
 
-The relay still carries the legacy `/v0` transport-proof endpoints. `REVTTY_DEV_TOKEN` is currently required by `relay serve` for those endpoints; the persistent `/v1` path uses enrollment, agent, operator and per-session credentials instead.
+The relay accepts only enrolled identities and scoped credentials: enrollment, agent control, operator session and per-session tunnel credentials.
 
 ## Authenticated local flow
 
@@ -76,7 +83,6 @@ cargo run -- relay enroll store-042 \
 Start the relay:
 
 ```bash
-export REVTTY_DEV_TOKEN='replace-with-a-long-random-development-token'
 cargo run -- relay serve --db revtty.db
 ```
 
@@ -90,16 +96,23 @@ cargo run -- agent enroll \
 cargo run -- agent run
 ```
 
+`agent enroll` prints the agent's host key fingerprint (`host`); `agent status` shows it again.
+
 From the operator machine:
 
 ```bash
 cargo run -- list --relay http://127.0.0.1:8787
-cargo run -- status store-042 --relay http://127.0.0.1:8787
+cargo run -- status store-042 --relay http://127.0.0.1:8787 \
+  --host-key <agent-host-fingerprint>
 cargo run -- probe store-042 --relay http://127.0.0.1:8787
 cargo run -- connect store-042 --relay http://127.0.0.1:8787
 ```
 
-`list` proves possession of the operator key and returns only machines enrolled for that key. `status` uses target-scoped SSHSIG authentication. `connect` authenticates the operator, verifies the pinned agent host key, opens a one-time rendezvous and starts an interactive SSH PTY.
+The first contact pins the agent's host key, so it needs the fingerprint printed on the target (`--host-key`) or a confirmation at the interactive prompt; the relay cannot introduce a host key on its own.
+
+`list` proves possession of the operator key and returns only machines enrolled for that key. `status` uses target-scoped SSHSIG authentication. `connect` authenticates the operator, verifies the pinned agent host key, opens a one-time rendezvous, starts an interactive SSH PTY and exits with the remote shell's status.
+
+On the relay host, `cargo run -- relay sessions --db revtty.db` lists the audited sessions, and `doctor`, `agent doctor` and `relay doctor` check each role.
 
 See [docs/PROTOTYPE.md](docs/PROTOTYPE.md) for validation details and the remaining real-NAT gate.
 
@@ -107,10 +120,9 @@ See [docs/PROTOTYPE.md](docs/PROTOTYPE.md) for validation details and the remain
 
 The first shell works, but M1 is not complete. Notable remaining work includes:
 
-- deeper doctor coverage for TLS/authentication/filesystem-permission failures;
-- persistent session audit metadata;
 - real NAT/CGNAT validation of the full authenticated `connect` path;
-- recovery/fault tests around relay restart and network loss.
+- recovery validation under real network loss and NAT mapping changes (local tests cover relay restarts and silent peers);
+- a macOS CI run on the current tree.
 
 Later v1 milestones add macOS service parity, multi-operator management, `exec`, SFTP/copy, local forwarding and the optional web console.
 

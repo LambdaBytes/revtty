@@ -18,7 +18,9 @@ use tokio::task::JoinHandle;
 use crate::config::Paths;
 use crate::error::RevttyError;
 use crate::identity::ensure_agent;
-use crate::transport::{SSH_TIMEOUTS, SshTimeouts, connect_websocket, websocket_byte_stream};
+use crate::transport::{
+    SSH_TIMEOUTS, SshTimeouts, connect_websocket, finish_byte_stream, websocket_byte_stream,
+};
 
 const PTY_IO_CHUNK: usize = 16 * 1024;
 
@@ -713,8 +715,7 @@ pub async fn serve(
     }
     .await;
 
-    bridge_task.abort();
-    let _ = bridge_task.await;
+    finish_byte_stream(bridge_task).await;
     result
 }
 

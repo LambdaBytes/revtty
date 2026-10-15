@@ -33,7 +33,36 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - Absolute `REVTTY_CONFIG_DIR` and `REVTTY_STATE_DIR` overrides for service/container deployments.
 - Product, security, stack, scope, protocol and roadmap documentation.
 
+- Persistent session audit metadata (operator fingerprint, target, kind, timestamps, outcome) and `relay sessions`.
+- Doctor checks: TLS causes for relay failures, signed operator authentication, agent credential validation through a read-only relay endpoint, file and directory permissions, relay schema version.
+- `--host-key` for `status`, `probe` and `connect` to approve a first host-key pin non-interactively.
+- End-to-end tests that drive the real binary through a PTY.
+- Versioned `Cargo.lock`.
+
 ### Changed
 
 - The persistent `/v1` path now uses enrolled identities and scoped credentials instead of the development shared token.
 - Protocol and prototype documentation now describe the implemented M1 state rather than the original scaffold.
+- A first agent host-key pin requires the operator's confirmation; the relay can no longer introduce host keys.
+- Operator challenges are stateless HMAC tokens; `list` challenges are bound to an enrollment epoch (relay schema v2).
+- The relay registers an agent only after a valid `Hello` and drops agents whose control channel goes silent.
+- SSH sessions use explicit keepalives and inactivity bounds on both ends.
+- `connect` exits with the remote shell's status, or 255 when the session ended without one.
+- revtty creates its configuration and state directories private to the user.
+
+### Removed
+
+- The `/v0` transport-proof endpoints, `relay serve --token` and `REVTTY_DEV_TOKEN`.
+
+### Fixed
+
+- `connect` failed with "Unknown server key" for identities created by `init` and `agent enroll`: key comments were compared together with the key material.
+- An agent shell session could hang, keep its capacity slot and ignore disconnects when the remote process stopped reading input.
+- Disconnecting injected a newline and EOF into the foreground program; shells ignoring SIGHUP and silent background jobs kept PTYs, threads and processes alive.
+- Idle SSH sessions were closed after 10 minutes.
+- Agents that vanished without closing their connection stayed online.
+- The operator client waited for a key press before exiting after a session.
+- Unauthenticated challenge requests could lock every operator out and revealed which agents exist.
+- Hashed revtty `known_hosts` entries were skipped, falling back to a first pin.
+- Rewriting an existing world-readable `agent.toml` kept its permissions.
+- PTY or shell failures left a silent terminal; unknown control messages dropped the agent's connection.

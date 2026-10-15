@@ -2,17 +2,19 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
-use reqwest_websocket::{Message, Upgrade, WebSocket};
+use reqwest_websocket::{CloseCode, Message, Upgrade, WebSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::task::JoinHandle;
 
-use crate::error::RevttyError;
+use crate::error::{RevttyError, with_sources};
 use crate::protocol::SESSION_ERROR_PREFIX;
 
 pub const DEFAULT_TRANSPORT: &str = "wss";
 
 const STREAM_BUFFER_SIZE: usize = 256 * 1024;
 const STREAM_CHUNK_SIZE: usize = 16 * 1024;
+/// Time the bridge gets to send its close frame once the SSH side is done with the stream.
+const BRIDGE_CLOSE_WAIT: Duration = Duration::from_secs(2);
 
 /// SSH liveness policy shared by the operator client and the agent server.
 #[derive(Clone, Copy, Debug)]
@@ -79,6 +81,14 @@ pub fn websocket_byte_stream(
                         .map_err(|error| RevttyError::runtime("read session stream", error))?;
 
                     if read == 0 {
+                        // The SSH side is done with the stream: close the tunnel cleanly so the
+                        // relay can tell a finished session from a lost connection.
+                        let _ = websocket_sender
+                            .send(Message::Close {
+                                code: CloseCode::Normal,
+                                reason: String::new(),
+                            })
+                            .await;
                         break;
                     }
 
@@ -96,6 +106,18 @@ pub fn websocket_byte_stream(
     (application, task)
 }
 
+/// Waits briefly for the bridge to close the tunnel after the SSH session released the
+/// stream, then stops it.
+pub async fn finish_byte_stream(mut bridge: JoinHandle<Result<(), RevttyError>>) {
+    if tokio::time::timeout(BRIDGE_CLOSE_WAIT, &mut bridge)
+        .await
+        .is_err()
+    {
+        bridge.abort();
+        let _ = bridge.await;
+    }
+}
+
 fn session_error_detail(text: &str) -> Option<&str> {
     text.strip_prefix(SESSION_ERROR_PREFIX)
         .filter(|detail| !detail.is_empty())
@@ -107,7 +129,7 @@ pub async fn check_relay_health(client: &Client, relay: &str) -> Result<(), Revt
         .get(url)
         .send()
         .await
-        .map_err(|error| RevttyError::runtime("relay health check", error))?;
+        .map_err(|error| RevttyError::runtime("relay health check", with_sources(&error)))?;
     let status = response.status();
 
     if !status.is_success() {

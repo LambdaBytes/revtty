@@ -358,6 +358,10 @@ pub async fn probe(target: &str, relay: &str, host_key: Option<&str>) -> Result<
                 println!("os       {}", result.os);
                 println!("arch     {}", result.arch);
                 println!("revtty   {}", result.version);
+                // Close the tunnel cleanly: the relay audits how sessions end.
+                let _ = websocket
+                    .close(reqwest_websocket::CloseCode::Normal, None)
+                    .await;
                 return Ok(());
             }
             Ok(Message::Close { .. }) => break,
@@ -405,13 +409,43 @@ pub async fn doctor(relay: &str) -> Result<(), RevttyError> {
     let identity = crate::identity::ensure_operator(&paths)?;
     let client = reqwest::Client::new();
 
+    // Whoever can change these can swap the operator key or the pinned agent host keys.
+    crate::config::check_not_writable_by_others(&paths.config_dir)?;
+    let known_hosts = paths.config_dir.join("known_hosts");
+    if known_hosts.exists() {
+        crate::config::check_not_writable_by_others(&known_hosts)?;
+    }
+
     check_relay_health(&client, relay).await?;
+
+    // A signed list proves the relay accepts this operator key end to end.
+    let private_key = PrivateKey::read_openssh_file(&identity.private_key_path)
+        .map_err(|error| RevttyError::runtime("read operator private key", error))?;
+    let operator_key = private_key
+        .public_key()
+        .to_openssh()
+        .map_err(|error| RevttyError::runtime("encode operator public key", error))?;
+    let response = request_agent_list(&client, &private_key, &operator_key, relay).await?;
+    if !response.status().is_success() {
+        return Err(RevttyError::message(format!(
+            "relay rejected the signed operator list ({})",
+            response.status()
+        )));
+    }
+    let listed: AgentListResponse = response
+        .json()
+        .await
+        .map_err(|error| RevttyError::runtime("decode agent list", error))?;
 
     println!("revtty     {}", env!("CARGO_PKG_VERSION"));
     println!("protocol   v{}", crate::protocol::CONTROL_PROTOCOL_VERSION);
     println!("transport  {}", crate::transport::DEFAULT_TRANSPORT);
     println!("identity   {}", identity.fingerprint);
     println!("relay      {relay} reachable");
+    println!(
+        "auth       ok ({} agents enrolled for this key)",
+        listed.agents.len()
+    );
     println!("config     {}", paths.config_dir.display());
     println!("state      {}", paths.state_dir.display());
     Ok(())

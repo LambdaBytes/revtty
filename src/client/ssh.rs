@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::error::RevttyError;
-use crate::transport::{SSH_TIMEOUTS, SshTimeouts, websocket_byte_stream};
+use crate::transport::{SSH_TIMEOUTS, SshTimeouts, finish_byte_stream, websocket_byte_stream};
 
 const STDIN_CHUNK: usize = 4096;
 const STDIN_QUEUE_DEPTH: usize = 16;
@@ -315,8 +315,7 @@ pub async fn connect_terminal(
         };
     }
 
-    bridge_task.abort();
-    let _ = bridge_task.await;
+    finish_byte_stream(bridge_task).await;
     result
 }
 

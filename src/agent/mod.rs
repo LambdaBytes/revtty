@@ -653,8 +653,15 @@ pub async fn doctor() -> Result<(), RevttyError> {
         }
     }
 
+    // Whoever can change these files can impersonate the agent or take its shells.
+    crate::config::check_private_file(&AgentConfig::path(&paths))?;
+    crate::config::check_private_file(&identity.private_key_path)?;
+    crate::config::check_not_writable_by_others(&paths.config_dir)?;
+    crate::config::check_not_writable_by_others(&paths.state_dir)?;
+
     let client = reqwest::Client::new();
     check_relay_health(&client, &config.relay).await?;
+    check_agent_credential(&client, &config).await?;
 
     println!("agent      configured");
     println!("name       {}", config.name);
@@ -662,8 +669,34 @@ pub async fn doctor() -> Result<(), RevttyError> {
     println!("protocol   v{}", crate::protocol::CONTROL_PROTOCOL_VERSION);
     println!("sessions   {}", config.max_sessions);
     println!("relay      {} reachable", config.relay);
+    println!("credential accepted by the relay");
     println!("config     {}", AgentConfig::path(&paths).display());
     Ok(())
+}
+
+async fn check_agent_credential(
+    client: &reqwest::Client,
+    config: &AgentConfig,
+) -> Result<(), RevttyError> {
+    let url = http_url(&config.relay, &format!("/v1/agent/{}/check", config.name))?;
+    let response = client
+        .post(url)
+        .bearer_auth(&config.control_token)
+        .send()
+        .await
+        .map_err(|error| {
+            RevttyError::runtime("check agent credential", crate::error::with_sources(&error))
+        })?;
+
+    match response.status() {
+        status if status.is_success() => Ok(()),
+        reqwest::StatusCode::UNAUTHORIZED => Err(RevttyError::message(
+            "the relay rejected this agent's credential; re-enroll the agent",
+        )),
+        status => Err(RevttyError::message(format!(
+            "agent credential check failed ({status})"
+        ))),
+    }
 }
 
 #[cfg(test)]

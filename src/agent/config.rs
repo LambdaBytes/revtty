@@ -56,7 +56,7 @@ impl AgentConfig {
 
     pub fn save(&self, paths: &Paths) -> Result<(), RevttyError> {
         validate_max_sessions(self.max_sessions)?;
-        fs::create_dir_all(&paths.config_dir)
+        crate::config::create_private_dir(&paths.config_dir)
             .map_err(|error| RevttyError::runtime("create agent config directory", error))?;
 
         let path = Self::path(paths);
