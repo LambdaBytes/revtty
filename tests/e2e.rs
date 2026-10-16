@@ -600,10 +600,11 @@ fn first_contact_requires_host_key_confirmation() {
     let _agent_process = start_agent(&root, &agent);
     let known_hosts = operator.config.join("known_hosts");
 
-    // Without a terminal and without --host-key, nothing the relay says gets pinned.
+    // Without a terminal and without --host-key, nothing the relay says gets pinned, nor is
+    // its fingerprint offered for copying: it must come from the target.
     let refused = operator.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
     assert!(
-        refused.contains("not pinned yet") && refused.contains(&host_key),
+        refused.contains("not pinned yet") && !refused.contains(&host_key),
         "unexpected refusal:\n{refused}"
     );
     assert!(
@@ -620,7 +621,7 @@ fn first_contact_requires_host_key_confirmation() {
         "SHA256:not-the-agent",
     ]);
     assert!(
-        mismatched.contains("nothing was pinned"),
+        mismatched.contains("nothing was pinned") && !mismatched.contains(&host_key),
         "unexpected mismatch report:\n{mismatched}"
     );
     assert!(!known_hosts.exists(), "a mismatched host key was pinned");
@@ -639,8 +640,92 @@ fn first_contact_requires_host_key_confirmation() {
     );
     assert!(known_hosts.exists());
 
-    // Once pinned, no confirmation is needed.
+    // Once pinned, no confirmation is needed; a --host-key is still checked against the key
+    // presented, since the operator obtained it independently.
     operator.run(&["probe", AGENT_NAME, "--relay", &url]);
+    let contradicted = operator.run_failing(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        "SHA256:not-the-agent",
+    ]);
+    assert!(
+        contradicted.contains("does not match --host-key"),
+        "a contradicting --host-key was ignored:\n{contradicted}"
+    );
+}
+
+#[test]
+fn interactive_confirmation_needs_the_fingerprint_from_the_target() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let agent_process = start_agent(&root, &agent);
+    let logs = [&relay, &agent_process];
+    let known_hosts = operator.config.join("known_hosts");
+
+    for answer in ["yes", "SHA256:not-the-agent"] {
+        let mut terminal = Terminal::connect(&operator, &url, None);
+        terminal.wait_for(
+            "enter the host key fingerprint",
+            Duration::from_secs(20),
+            &logs,
+        );
+        assert!(
+            !terminal.text().contains(&host_key),
+            "prompt offered the relay's fingerprint:\n{}",
+            terminal.text()
+        );
+        terminal.send(&format!("{answer}\r"));
+        terminal.wait_for("nothing was pinned", Duration::from_secs(20), &logs);
+        let status = terminal
+            .wait_exit(Duration::from_secs(5))
+            .expect("revtty connect exits after a refused confirmation");
+        assert_ne!(status.exit_code(), 0, "{answer:?} was accepted");
+        assert!(!known_hosts.exists(), "{answer:?} pinned the host key");
+    }
+}
+
+#[test]
+fn a_host_key_swapped_during_interactive_confirmation_is_refused() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let agent_process = start_agent(&root, &agent);
+    let logs = [&relay, &agent_process];
+
+    let mut terminal = Terminal::connect(&operator, &url, None);
+    terminal.wait_for(
+        "enter the host key fingerprint",
+        Duration::from_secs(20),
+        &logs,
+    );
+
+    // While the operator compares fingerprints, the relay starts presenting another key: the
+    // credential renewed after the confirmation must be for the key confirmed, whatever the
+    // pin file says by then.
+    let other_key =
+        ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .expect("other host key")
+            .public_key()
+            .to_openssh()
+            .expect("encode other host key");
+    let db = tokio_rusqlite::rusqlite::Connection::open(root.path("relay.db"))
+        .expect("open relay database");
+    db.busy_timeout(Duration::from_secs(5))
+        .expect("wait for the relay's writes");
+    db.execute(
+        "UPDATE agents SET host_key = ?1 WHERE name = ?2",
+        tokio_rusqlite::rusqlite::params![other_key, AGENT_NAME],
+    )
+    .expect("swap the presented host key");
+
+    terminal.send(&format!("{host_key}\r"));
+    terminal.wait_for("after it was confirmed", Duration::from_secs(20), &logs);
 }
 
 #[test]
@@ -654,19 +739,14 @@ fn slow_interactive_host_key_confirmation_still_connects() {
     let mut terminal = Terminal::connect(&operator, &url, None);
     let logs = [&relay, &agent_process];
     terminal.wait_for(
-        "Type yes or the fingerprint",
+        "enter the host key fingerprint",
         Duration::from_secs(20),
         &logs,
-    );
-    assert!(
-        terminal.text().contains(&host_key),
-        "prompt did not show the agent fingerprint:\n{}",
-        terminal.text()
     );
 
     // Longer than the 30 s operator credential obtained before the prompt.
     std::thread::sleep(Duration::from_secs(32));
-    terminal.send("yes\r");
+    terminal.send(&format!("{host_key}\r"));
 
     terminal.wait_ready(Duration::from_secs(20), &logs);
     terminal.send("echo REVTTY_E2E_$((6*7)); exit 7\r");
@@ -1038,7 +1118,9 @@ fn reinstalled_agent_is_reenrolled_in_place_and_then_removed() {
     // The pin is the old machine's: a hard failure that says how to recover.
     let mismatch = operator.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
     assert!(
-        mismatch.contains("HOST KEY MISMATCH") && mismatch.contains("revtty forget"),
+        mismatch.contains("HOST KEY MISMATCH")
+            && mismatch.contains("revtty forget")
+            && !mismatch.contains(&new_host_key),
         "{mismatch}"
     );
     let forgotten = operator.run(&["forget", AGENT_NAME, "--relay", &url]);

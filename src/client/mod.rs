@@ -234,16 +234,38 @@ async fn authenticate_operator(
     let mut auth = request_operator_session(&client, &private_key, target, relay).await?;
 
     let check = crate::identity::check_agent_host_key(&paths, relay, target, &auth.host_key)?;
+    // Checked even against a pin: the operator obtained it independently, and it names the
+    // key this connection must reach.
+    if let Some(expected) = expected_host_key
+        && expected != check.fingerprint
+    {
+        return Err(RevttyError::message(format!(
+            "the host key the relay presented for {target} does not match --host-key \
+             {expected}; nothing was pinned"
+        )));
+    }
     if !check.pinned {
-        let approval = approve_host_key(target, relay, &check.fingerprint, expected_host_key)?;
+        let approval = approve_host_key(
+            target,
+            relay,
+            &check.fingerprint,
+            expected_host_key.is_some(),
+        )?;
         crate::identity::pin_agent_host_key(&paths, relay, target, &auth.host_key)?;
         eprintln!("pinned host key {}", check.fingerprint);
 
         if let HostKeyApproval::Interactive = approval {
             // The operator credential is short-lived and single-use; request a new one and
-            // make sure the relay still presents the key that was just approved.
+            // make sure the relay still presents the key that was just approved: compared with
+            // that key itself, not through the pin, which another process may have removed.
+            let approved = auth.host_key.clone();
             auth = request_operator_session(&client, &private_key, target, relay).await?;
-            crate::identity::check_agent_host_key(&paths, relay, target, &auth.host_key)?;
+            if !crate::identity::same_agent_host_key(&approved, &auth.host_key)? {
+                return Err(RevttyError::message(format!(
+                    "the relay presented another host key for {target} after it was confirmed; \
+                     the session was not opened"
+                )));
+            }
         }
     }
 
@@ -254,49 +276,43 @@ async fn authenticate_operator(
     })
 }
 
-/// The relay only relays the agent's host key, so a first pin is approved by the operator,
-/// who compares the fingerprint with the one the target prints (`revtty agent status`).
+/// The relay only relays the agent's host key, so a first pin needs the fingerprint from the
+/// target itself (`revtty agent status`): given with --host-key, already compared, or typed
+/// at the terminal. The fingerprint the relay presented is never shown, so that it cannot be
+/// copied back in place of the target's.
 fn approve_host_key(
     target: &str,
     relay: &str,
     fingerprint: &str,
-    expected: Option<&str>,
+    flagged: bool,
 ) -> Result<HostKeyApproval, RevttyError> {
-    if let Some(expected) = expected {
-        if expected == fingerprint {
-            return Ok(HostKeyApproval::Flag);
-        }
-
-        return Err(RevttyError::message(format!(
-            "host key of {target} is {fingerprint}, not the expected {expected}; nothing was pinned"
-        )));
+    if flagged {
+        return Ok(HostKeyApproval::Flag);
     }
 
     if !std::io::stdin().is_terminal() {
         return Err(RevttyError::message(format!(
-            "host key of {target} is not pinned yet (fingerprint {fingerprint}); compare it with \
-             `revtty agent status` on the target and pass --host-key {fingerprint}"
+            "host key of {target} is not pinned yet; pass --host-key with the fingerprint \
+             `revtty agent status` shows on the target"
         )));
     }
 
     eprint!(
         "The host key of {target} via {relay} is not pinned yet.\n\
-         Fingerprint: {fingerprint}\n\
-         Compare it with `revtty agent status` on the target.\n\
-         Type yes or the fingerprint to pin it: "
+         Run `revtty agent status` on the target and enter the host key fingerprint it shows: "
     );
 
     let mut answer = String::new();
     std::io::stdin()
         .read_line(&mut answer)
         .map_err(|error| RevttyError::runtime("read host key confirmation", error))?;
-    let answer = answer.trim();
 
-    if answer == "yes" || answer == fingerprint {
+    if answer.trim() == fingerprint {
         Ok(HostKeyApproval::Interactive)
     } else {
         Err(RevttyError::message(
-            "host key not confirmed; nothing was pinned",
+            "the fingerprint entered does not match the host key the relay presented; nothing \
+             was pinned",
         ))
     }
 }

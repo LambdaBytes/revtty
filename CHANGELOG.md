@@ -63,6 +63,9 @@ The format follows Keep a Changelog principles and the project intends to use Se
 
 ### Fixed
 
+- Pinning an agent host key wrote the key's comment, which comes from the relay: a comment with a line break added a pin for another machine to `known_hosts`. Only the key material is written now.
+- First contact no longer accepts `yes` nor shows the relay-presented fingerprint, in the prompt or in errors, including HOST KEY MISMATCH: the operator gives the fingerprint the target shows. `--host-key` is checked against the presented key even when a pin exists, and the credential renewed after an interactive confirmation must be for the key confirmed.
+- A `@revoked` line in `known_hosts` was ignored when a pin for the same machine came first.
 - `connect` failed with "Unknown server key" for identities created by `init` and `agent enroll`: key comments were compared together with the key material.
 - An agent shell session could hang, keep its capacity slot and ignore disconnects when the remote process stopped reading input.
 - Disconnecting injected a newline and EOF into the foreground program; shells ignoring SIGHUP and silent background jobs kept PTYs, threads and processes alive.
