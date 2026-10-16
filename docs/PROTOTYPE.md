@@ -120,7 +120,7 @@ cargo run -- status store-042 --relay http://127.0.0.1:8787 \
   --host-key <agent-host-fingerprint>
 ```
 
-The first contact with an agent pins its host key: pass the fingerprint the target printed, or confirm it at the interactive prompt. Later commands verify against the pin and fail hard if the key changes.
+The first contact with an agent pins its host key: pass the fingerprint the target printed, or type it at the interactive prompt, which does not show the relay's. Later commands verify against the pin and fail hard if the key changes.
 
 `list` returns only machines authorized for the current operator key. `status` reports the persisted identity, online/offline state, last-seen timestamp and agent version.
 

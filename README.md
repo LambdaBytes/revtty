@@ -98,7 +98,7 @@ revtty probe store-042 --relay http://127.0.0.1:8787 --host-key <agent-host-fing
 revtty connect store-042 --relay http://127.0.0.1:8787
 ```
 
-The first `status`, `probe` or `connect` to an agent pins its host key: pass the fingerprint with `--host-key`, or answer the interactive prompt with `yes` (or the fingerprint) after comparing it with the target's. Later commands verify against the pin.
+The first `status`, `probe` or `connect` to an agent pins its host key once the operator gives the fingerprint that `revtty agent status` (or `agent enroll`) shows on the target: with `--host-key`, or typed at the interactive prompt. revtty never shows the fingerprint the relay presents before it is pinned, so that it cannot be copied in place of the target's. Later commands verify against the pin, and a `--host-key` given later is still checked against the key presented.
 
 On the relay host, `revtty relay sessions --db revtty.db` shows the audited sessions.
 

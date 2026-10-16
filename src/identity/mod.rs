@@ -147,15 +147,20 @@ pub fn check_agent_host_key(
             )));
         }
 
+        // A marker decides wherever it is in the file: a pin on an earlier line must not
+        // outrank a later @revoked, and any other marker cannot be judged, so fail closed.
+        if entries
+            .iter()
+            .any(|entry| entry_matches_alias(entry, &alias) && entry.marker().is_some())
+        {
+            return Err(RevttyError::message(format!(
+                "host key for {agent_name} is marked revoked"
+            )));
+        }
+
         for entry in entries {
             if !entry_matches_alias(&entry, &alias) {
                 continue;
-            }
-
-            if entry.marker().is_some() {
-                return Err(RevttyError::message(format!(
-                    "host key for {agent_name} is marked revoked"
-                )));
             }
 
             if entry.public_key().key_data() == public_key.key_data() {
@@ -165,12 +170,14 @@ pub fn check_agent_host_key(
                 });
             }
 
+            // The key received is not shown: its fingerprint is the relay's word, and an
+            // operator recovering from a reinstall must take the new one from the machine.
             return Err(RevttyError::message(format!(
-                "HOST KEY MISMATCH for {agent_name}: pinned {}, received {}. If the machine \
-                 was reinstalled and re-enrolled, check the new fingerprint on it \
-                 (`revtty agent status`) and run `revtty forget {agent_name} --relay {relay}`",
-                entry.public_key().fingerprint(HashAlg::Sha256),
-                fingerprint
+                "HOST KEY MISMATCH for {agent_name}: the relay presented a key other than the \
+                 pinned {}. If the machine was reinstalled and re-enrolled, run `revtty forget \
+                 {agent_name} --relay {relay}` and connect with the --host-key that \
+                 `revtty agent status` shows on it",
+                entry.public_key().fingerprint(HashAlg::Sha256)
             )));
         }
     }
@@ -196,7 +203,11 @@ pub fn pin_agent_host_key(
         return Ok(());
     }
 
-    let public_text = parse_agent_host_key(encoded_key)?
+    // Only the key material: the comment is the relay's text, and one that breaks the line
+    // would add a pin of its own, for any other machine.
+    let mut public_key = parse_agent_host_key(encoded_key)?;
+    public_key.set_comment("");
+    let public_text = public_key
         .to_openssh()
         .map_err(|error| RevttyError::runtime("encode enrolled agent host key", error))?;
     let line = format!("{} {public_text}", known_host_alias(relay, agent_name));
@@ -306,6 +317,11 @@ fn parse_agent_host_key(encoded_key: &str) -> Result<PublicKey, RevttyError> {
     Ok(public_key)
 }
 
+/// Whether two encodings of an agent host key carry the same key material.
+pub fn same_agent_host_key(first: &str, second: &str) -> Result<bool, RevttyError> {
+    Ok(parse_agent_host_key(first)?.key_data() == parse_agent_host_key(second)?.key_data())
+}
+
 fn known_host_alias(relay: &str, agent_name: &str) -> String {
     let relay = canonical_relay_identity(relay);
     let digest = Sha256::digest(relay.as_bytes());
@@ -387,7 +403,10 @@ mod tests {
 
     use std::io::Write;
 
-    use super::{check_agent_host_key, ensure_operator, forget_agent_host_key, pin_agent_host_key};
+    use super::{
+        check_agent_host_key, ensure_operator, forget_agent_host_key, known_host_alias,
+        pin_agent_host_key,
+    };
     use crate::config::Paths;
 
     fn host_key() -> String {
@@ -396,6 +415,68 @@ mod tests {
             .public_key()
             .to_openssh()
             .expect("agent public key")
+    }
+
+    #[test]
+    fn a_key_comment_cannot_pin_another_machine() {
+        let root = std::env::temp_dir().join(format!("revtty-pin-comment-{}", Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        let relay = "https://relay.example.com";
+        let attacker_key = host_key();
+        // A genuine key, whose fingerprint the operator confirms, carrying a comment that
+        // continues on a line of its own with a pin for another machine.
+        let presented = format!(
+            "{} innocuous\n{} {attacker_key}",
+            host_key(),
+            known_host_alias(relay, "store-043")
+        );
+
+        pin_agent_host_key(&paths, relay, "store-042", &presented).expect("pin presented key");
+
+        let pins = std::fs::read_to_string(paths.config_dir.join("known_hosts"))
+            .expect("read known_hosts");
+        assert_eq!(pins.lines().count(), 1, "{pins}");
+        assert!(
+            check_agent_host_key(&paths, relay, "store-042", &presented)
+                .expect("check pinned key")
+                .pinned
+        );
+        assert!(
+            !check_agent_host_key(&paths, relay, "store-043", &attacker_key)
+                .expect("check the other machine")
+                .pinned,
+            "{pins}"
+        );
+
+        fs::remove_dir_all(root).expect("clean pin comment test directory");
+    }
+
+    #[test]
+    fn a_revoked_key_stays_revoked_whatever_the_line_order() {
+        let root = std::env::temp_dir().join(format!("revtty-revoked-{}", Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        let relay = "https://relay.example.com";
+        let key = host_key();
+        pin_agent_host_key(&paths, relay, "store-042", &key).expect("pin host key");
+        let path = paths.config_dir.join("known_hosts");
+        let pin = fs::read_to_string(&path).expect("read known_hosts");
+        let pin = pin.trim_end();
+
+        for content in [
+            format!("{pin}\n@revoked {pin}\n"),
+            format!("@revoked {pin}\n{pin}\n"),
+        ] {
+            fs::write(&path, &content).expect("write known_hosts");
+            let checked = check_agent_host_key(&paths, relay, "store-042", &key);
+            assert!(
+                checked
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().contains("revoked")),
+                "{content}"
+            );
+        }
+
+        fs::remove_dir_all(root).expect("clean revoked test directory");
     }
 
     #[test]
