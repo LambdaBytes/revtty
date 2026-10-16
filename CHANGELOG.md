@@ -40,6 +40,7 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - Versioned `Cargo.lock`.
 - `agent rotate-credential` replaces the agent's relay credential with one the agent generates, in two steps (`/v1/agent/{name}/rotate` and `/rotate/confirm`, relay schema v6) that an interrupted rotation can finish later; `agent run` refuses to start twice on one configuration.
 - `relay enroll --replace` re-enrolls a reinstalled machine in place of the old agent instance, `relay remove` retires an agent, and the relay closes the control connection and every session of an agent instance that is no longer enrolled within 5 seconds (relay schema v5). `forget` clears an operator's pin of the old host key.
+- Pairing codes: `revtty pair NAME --token TOKEN` wraps an enrollment token with a secret the relay never receives, for `agent enroll --pairing-code`. The agent refuses an operator or name the code was not made for, and proves its host key, which the operator's first contact pins without confirmation (relay schema v7). A machine enrolled again with a new code replaces its pin.
 - Operator lists on the agent: `agent operator list|add|revoke`. A running agent rereads its list every 2 seconds, closes the open sessions of a revoked operator and reports the list to the relay (`operators_report`), which issues session credentials only to those operators (relay schema v4).
 
 ### Changed
@@ -55,6 +56,7 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - `agent.toml` holds `operators` and `operators_revision` instead of `operator_key` (older files still load) and is replaced atomically under a lock.
 - `relay agents` shows each agent's `operators=` fingerprints; operator session credentials are checked against the agent's current operators when used.
 - `relay enroll` refuses a name that is already enrolled unless `--replace` is given.
+- `agent enroll` prints the operator's fingerprint and whether a pairing code verified it, and refuses a pairing code given as `--token`. `forget` also discards a pairing pending for the machine.
 - Operator and agent commands refuse a plain `http://` or `ws://` relay URL unless its host is `localhost`, `127.0.0.0/8` or `[::1]`, and do not follow a relay's redirect to one, since enrollment, control and session credentials would cross the network unencrypted. An agent enrolled with such a URL stops at `agent run`; change `relay` in its `agent.toml` to the `https://` URL.
 
 ### Removed

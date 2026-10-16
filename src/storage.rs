@@ -102,6 +102,12 @@ const SCHEMA_V6: &str = r#"
 ALTER TABLE agents ADD COLUMN next_control_hash BLOB;
 "#;
 
+/// The proof of its host key an agent enrolled with a pairing code sent: the relay hands it
+/// to operators, who verify it with the pairing secret the relay never sees.
+const SCHEMA_V7: &str = r#"
+ALTER TABLE agents ADD COLUMN host_key_proof TEXT;
+"#;
+
 /// Seeds `agent_operators` with each agent's enrolled key; fingerprints are computed here,
 /// which SQL cannot do.
 fn seed_agent_operators(transaction: &Transaction) -> HookResult {
@@ -217,6 +223,8 @@ pub struct AgentRecord {
     pub id: String,
     pub name: String,
     pub host_key: String,
+    /// The agent's pairing proof of `host_key`, when it was enrolled with a pairing code.
+    pub host_key_proof: Option<String>,
     /// Fingerprints of the operators the agent last reported, sorted.
     pub operators: Vec<String>,
     pub created_at: i64,
@@ -240,7 +248,7 @@ pub enum OperatorsReportOutcome {
 }
 
 const AGENT_COLUMNS: &str = "SELECT a.id, a.name, a.host_key, a.created_at, a.last_seen, a.version,
-            COALESCE(group_concat(o.fingerprint, ','), '')
+            COALESCE(group_concat(o.fingerprint, ','), ''), a.host_key_proof
      FROM agents a
      LEFT JOIN agent_operators o ON o.agent_id = a.id";
 
@@ -260,6 +268,7 @@ fn agent_record(
         id: row.get(0)?,
         name: row.get(1)?,
         host_key: row.get(2)?,
+        host_key_proof: row.get(7)?,
         operators,
         created_at: row.get(3)?,
         last_seen: row.get(4)?,
@@ -390,6 +399,7 @@ impl Store {
         &self,
         enrollment_token: &str,
         host_key: &str,
+        host_key_proof: Option<&str>,
         version: Option<&str>,
     ) -> Result<AgentCredential, RevttyError> {
         let enrollment_hash = hash_token(enrollment_token).to_vec();
@@ -398,6 +408,7 @@ impl Store {
         let control_hash = control_token.hash().to_vec();
         let now = unix_now()?;
         let host_key = host_key.to_owned();
+        let host_key_proof = host_key_proof.map(str::to_owned);
         let version = version.map(str::to_owned);
         let inserted_id = agent_id.clone();
 
@@ -454,8 +465,9 @@ impl Store {
 
                 transaction.execute(
                     "INSERT INTO agents
-                     (id, name, control_hash, host_key, operator_key, created_at, last_seen, version)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
+                     (id, name, control_hash, host_key, operator_key, created_at, last_seen, version,
+                      host_key_proof)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)",
                     params![
                         inserted_id,
                         agent_name,
@@ -463,7 +475,8 @@ impl Store {
                         host_key,
                         operator_key,
                         now,
-                        version
+                        version,
+                        host_key_proof
                     ],
                 )?;
                 transaction.execute(
@@ -1020,6 +1033,7 @@ fn migrations() -> Migrations<'static> {
         M::up_with_hook(SCHEMA_V4, seed_agent_operators),
         M::up(SCHEMA_V5),
         M::up(SCHEMA_V6),
+        M::up(SCHEMA_V7),
     ])
 }
 
@@ -1063,7 +1077,7 @@ mod tests {
             .expect("create enrollment");
 
         let credential = store
-            .consume_enrollment(enrollment.token.expose(), HOST_KEY, Some("0.1.0"))
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None, Some("0.1.0"))
             .await
             .expect("consume enrollment");
 
@@ -1085,7 +1099,7 @@ mod tests {
         );
 
         let second = store
-            .consume_enrollment(enrollment.token.expose(), HOST_KEY, Some("0.1.0"))
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None, Some("0.1.0"))
             .await;
         assert!(second.is_err());
 
@@ -1110,7 +1124,7 @@ mod tests {
             .expect("create enrollment");
 
         let credential = store
-            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None)
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None, None)
             .await
             .expect("consume enrollment");
 
@@ -1137,7 +1151,7 @@ mod tests {
                 .await
                 .expect("create enrollment");
             store
-                .consume_enrollment(enrollment.token.expose(), HOST_KEY, None)
+                .consume_enrollment(enrollment.token.expose(), HOST_KEY, None, None)
                 .await
                 .expect("consume enrollment");
 
@@ -1156,7 +1170,7 @@ mod tests {
             .expect("create enrollment");
         assert!(
             store
-                .consume_enrollment("rve_not-a-token", HOST_KEY, None)
+                .consume_enrollment("rve_not-a-token", HOST_KEY, None, None)
                 .await
                 .is_err()
         );
@@ -1228,7 +1242,7 @@ mod tests {
         let store = Store::open(&path)
             .await
             .expect("open and migrate v3 database");
-        assert_eq!(store.schema_version().await.expect("schema version"), 6);
+        assert_eq!(store.schema_version().await.expect("schema version"), 7);
         let fingerprint = operator_fingerprint(OPERATOR_KEY).expect("fingerprint");
         let agent = store
             .get_agent("legacy")
@@ -1246,6 +1260,93 @@ mod tests {
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn v6_database_migrates_with_agents_intact() {
+        let path = std::env::temp_dir().join(format!(
+            "revtty-migrate-v6-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        {
+            let mut conn = SqliteConnection::open(&path).expect("create v6 database");
+            migrations()
+                .to_version(&mut conn, 6)
+                .expect("migrate to schema v6");
+            conn.execute(
+                "INSERT INTO agents
+                 (id, name, control_hash, host_key, operator_key, created_at, last_seen, version)
+                 VALUES ('agent-id', 'legacy', x'00', ?1, ?2, 1, 1, '0.1.0')",
+                params![HOST_KEY, OPERATOR_KEY],
+            )
+            .expect("insert v6 agent");
+            conn.execute(
+                "INSERT INTO agent_operators (agent_id, fingerprint, public_key)
+                 VALUES ('agent-id', ?1, ?2)",
+                params![
+                    operator_fingerprint(OPERATOR_KEY).expect("fingerprint"),
+                    OPERATOR_KEY
+                ],
+            )
+            .expect("insert v6 operator");
+        }
+
+        let store = Store::open(&path)
+            .await
+            .expect("open and migrate v6 database");
+        assert_eq!(store.schema_version().await.expect("schema version"), 7);
+        let agent = store
+            .get_agent("legacy")
+            .await
+            .expect("get migrated agent")
+            .expect("migrated agent exists");
+        assert_eq!(agent.host_key, HOST_KEY);
+        assert_eq!(agent.host_key_proof, None);
+        assert_eq!(
+            agent.operators,
+            vec![operator_fingerprint(OPERATOR_KEY).expect("fingerprint")]
+        );
+
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_key_proof_belongs_to_the_instance_enrolled_with_it() {
+        let store = Store::open_in_memory().await.expect("open store");
+        let enrollment = store
+            .create_enrollment("store-042", OPERATOR_KEY, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        store
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, Some("proof-one"), None)
+            .await
+            .expect("consume enrollment");
+        let proof = || async {
+            store
+                .get_agent("store-042")
+                .await
+                .expect("get agent")
+                .expect("agent exists")
+                .host_key_proof
+        };
+        assert_eq!(proof().await.as_deref(), Some("proof-one"));
+
+        // A replacement brings its own proof, or none: never the old instance's.
+        for next in [None, Some("proof-two")] {
+            let replacement = store
+                .create_replacement_enrollment("store-042", OPERATOR_KEY, Duration::from_secs(60))
+                .await
+                .expect("create replacement enrollment");
+            store
+                .consume_enrollment(replacement.token.expose(), HOST_KEY, next, None)
+                .await
+                .expect("consume replacement enrollment");
+            assert_eq!(proof().await.as_deref(), next);
         }
     }
 
@@ -1268,7 +1369,7 @@ mod tests {
             .await
             .expect("create enrollment");
         let credential = store
-            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None)
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None, None)
             .await
             .expect("consume enrollment");
         let id = credential.id.as_str();
@@ -1368,7 +1469,7 @@ mod tests {
             .await
             .expect("create enrollment");
         let original = store
-            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None)
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None, None)
             .await
             .expect("consume enrollment");
 
@@ -1402,7 +1503,7 @@ mod tests {
 
         let epoch = store.enrollment_epoch().await.expect("epoch");
         let replaced = store
-            .consume_enrollment(first.token.expose(), HOST_KEY, None)
+            .consume_enrollment(first.token.expose(), HOST_KEY, None, None)
             .await
             .expect("consume replacement");
         assert_ne!(replaced.id, original.id);
@@ -1436,7 +1537,7 @@ mod tests {
         // The second replacement was created for the instance that is gone.
         assert!(
             store
-                .consume_enrollment(second.token.expose(), HOST_KEY, None)
+                .consume_enrollment(second.token.expose(), HOST_KEY, None, None)
                 .await
                 .is_err()
         );
@@ -1459,7 +1560,7 @@ mod tests {
             .await
             .expect("create enrollment");
         let credential = store
-            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None)
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None, None)
             .await
             .expect("consume enrollment");
         let pending = store
@@ -1503,7 +1604,7 @@ mod tests {
         );
         assert!(
             store
-                .consume_enrollment(pending.token.expose(), HOST_KEY, None)
+                .consume_enrollment(pending.token.expose(), HOST_KEY, None, None)
                 .await
                 .is_err(),
             "an enrollment issued before the removal brought the agent back"
@@ -1526,7 +1627,7 @@ mod tests {
             .await
             .expect("create enrollment");
         let credential = store
-            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None)
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None, None)
             .await
             .expect("consume enrollment");
         let current = credential.control_token.expose();

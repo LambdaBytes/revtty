@@ -13,6 +13,7 @@ use ssh_key::{Algorithm, HashAlg, KnownHosts, LineEnding, PrivateKey, PublicKey}
 
 use crate::config::Paths;
 use crate::error::RevttyError;
+use crate::pairing::PairingSecret;
 
 const OPERATOR_KEY_FILE: &str = "id_ed25519";
 const OPERATOR_PUBLIC_KEY_FILE: &str = "id_ed25519.pub";
@@ -22,6 +23,11 @@ const KNOWN_HOSTS_FILE: &str = "known_hosts";
 /// Held by every writer of `known_hosts`: `forget` rewrites the file and would otherwise drop
 /// a pin appended meanwhile.
 const KNOWN_HOSTS_LOCK_FILE: &str = "known_hosts.lock";
+const KNOWN_HOSTS_TEMP_FILE: &str = ".known_hosts.tmp";
+/// Secrets of the pairings made with `revtty pair` and not used yet, one per agent; written
+/// under the known_hosts lock, since each decides a pin.
+const PAIRINGS_FILE: &str = "pairings";
+const PAIRINGS_TEMP_FILE: &str = ".pairings.tmp";
 
 pub struct AgentIdentity {
     pub private_key_path: PathBuf,
@@ -41,6 +47,32 @@ pub struct HostKeyCheck {
     pub fingerprint: String,
     /// Whether this key is already pinned for the agent on this relay.
     pub pinned: bool,
+}
+
+/// How a host key the relay presented is trusted (`trust_agent_host_key`).
+pub enum HostKeyTrust {
+    /// It is the pinned key.
+    Pinned,
+    /// Pinned now: the agent proved it with the pairing code made for it.
+    Paired { fingerprint: String },
+    /// Neither pinned nor proven: pinning it needs the operator's confirmation.
+    Unknown { fingerprint: String },
+}
+
+/// What `forget_agent_host_key` removed.
+pub struct Forgotten {
+    /// Pins of the agent's host key.
+    pub pins: usize,
+    /// Whether a pairing was pending for the agent.
+    pub pairing: bool,
+}
+
+/// What the pins say about a host key.
+enum PinState {
+    Pinned,
+    Unpinned,
+    /// Another key is pinned for the agent: its fingerprint.
+    Mismatch(String),
 }
 
 pub fn ensure_agent(paths: &Paths) -> Result<AgentIdentity, RevttyError> {
@@ -119,7 +151,8 @@ pub fn ensure_operator(paths: &Paths) -> Result<OperatorIdentity, RevttyError> {
 
 /// Checks the relay-supplied host key of an agent against the operator's pin without ever
 /// creating one: the relay is not trusted to introduce host keys, so a first pin needs the
-/// operator's confirmation (`pin_agent_host_key`).
+/// operator's confirmation (`pin_agent_host_key`) or the agent's pairing proof
+/// (`trust_agent_host_key`).
 pub fn check_agent_host_key(
     paths: &Paths,
     relay: &str,
@@ -127,68 +160,87 @@ pub fn check_agent_host_key(
     encoded_key: &str,
 ) -> Result<HostKeyCheck, RevttyError> {
     let public_key = parse_agent_host_key(encoded_key)?;
-    let path = paths.config_dir.join(KNOWN_HOSTS_FILE);
-    let alias = known_host_alias(relay, agent_name);
     let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+    let alias = known_host_alias(relay, agent_name);
 
-    if path.exists() {
-        let entries = KnownHosts::read_file(&path)
-            .map_err(|error| RevttyError::runtime("read revtty known_hosts", error))?;
-
-        // A hashed name could be this agent, anywhere in the file; skipping it could accept a
-        // key the hashed entry contradicts or fall back to a first pin, so fail closed.
-        if entries
-            .iter()
-            .any(|entry| matches!(entry.host_patterns(), HostPatterns::HashedName { .. }))
-        {
-            return Err(RevttyError::message(format!(
-                "{} contains hashed host names, which revtty cannot match; restore the unhashed file",
-                path.display()
-            )));
+    let pinned = match pin_state(paths, &alias, agent_name, &public_key)? {
+        PinState::Pinned => true,
+        PinState::Unpinned => false,
+        PinState::Mismatch(pinned) => {
+            return Err(host_key_mismatch(relay, agent_name, &pinned, false));
         }
-
-        // A marker decides wherever it is in the file: a pin on an earlier line must not
-        // outrank a later @revoked, and any other marker cannot be judged, so fail closed.
-        if entries
-            .iter()
-            .any(|entry| entry_matches_alias(entry, &alias) && entry.marker().is_some())
-        {
-            return Err(RevttyError::message(format!(
-                "host key for {agent_name} is marked revoked"
-            )));
-        }
-
-        for entry in entries {
-            if !entry_matches_alias(&entry, &alias) {
-                continue;
-            }
-
-            if entry.public_key().key_data() == public_key.key_data() {
-                return Ok(HostKeyCheck {
-                    fingerprint,
-                    pinned: true,
-                });
-            }
-
-            // The key received is not shown: its fingerprint is the relay's word, and an
-            // operator recovering from a reinstall must take the new one from the machine.
-            return Err(RevttyError::message(format!(
-                "HOST KEY MISMATCH for {agent_name}: the relay presented a key other than the \
-                 pinned {}. If the machine was reinstalled and re-enrolled, run `revtty forget \
-                 {agent_name} --relay {relay}` and connect with the --host-key that \
-                 `revtty agent status` shows on it",
-                entry.public_key().fingerprint(HashAlg::Sha256)
-            )));
-        }
-    }
-
+    };
     Ok(HostKeyCheck {
         fingerprint,
-        pinned: false,
+        pinned,
     })
 }
 
-/// Pins a host key the operator confirmed; a no-op when it is already pinned.
+/// Trusts the host key the relay presented when it is the pinned one, or when the agent
+/// proved it with the pairing pending for it: then the key is pinned, in place of an earlier
+/// pin (a machine reinstalled and paired again), and the pairing is used up. Without a
+/// pairing, a key other than the pinned one is a hard failure; with one, so is a missing or
+/// wrong proof, and then no file is touched.
+pub fn trust_agent_host_key(
+    paths: &Paths,
+    relay: &str,
+    agent_name: &str,
+    encoded_key: &str,
+    proof: Option<&str>,
+) -> Result<HostKeyTrust, RevttyError> {
+    let public_key = parse_agent_host_key(encoded_key)?;
+    let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+    let alias = known_host_alias(relay, agent_name);
+    crate::config::create_private_dir(&paths.config_dir)
+        .map_err(|error| RevttyError::runtime("create operator config directory", error))?;
+    // The pairing is read, used and removed under the lock its writers hold.
+    let _lock = lock_known_hosts(paths)?;
+
+    let state = pin_state(paths, &alias, agent_name, &public_key)?;
+    if let PinState::Pinned = state {
+        return Ok(HostKeyTrust::Pinned);
+    }
+    let Some(secret) = pairings_without(paths, &alias)?.1 else {
+        return match state {
+            PinState::Mismatch(pinned) => Err(host_key_mismatch(relay, agent_name, &pinned, false)),
+            _ => Ok(HostKeyTrust::Unknown { fingerprint }),
+        };
+    };
+
+    let proven = match proof {
+        Some(proof) => secret.host_key_proof_matches(&fingerprint, proof)?,
+        None => false,
+    };
+    if !proven {
+        return Err(match state {
+            PinState::Mismatch(pinned) => host_key_mismatch(relay, agent_name, &pinned, true),
+            _ => RevttyError::message(format!(
+                "the relay did not prove the host key of {agent_name} with the pairing code made \
+                 for it; nothing was pinned. If the relay predates pairing codes, pass --host-key \
+                 with the fingerprint `revtty agent status` shows on the target"
+            )),
+        });
+    }
+
+    let (mut pins, _) = pins_without(paths, &alias, agent_name)?;
+    pins.push_str(&pin_line(&alias, public_key)?);
+    pins.push('\n');
+    // Used up before the pin is written: an interruption in between leaves neither, never a
+    // secret that could still prove a key.
+    remove_pairing(paths, &alias)?;
+    replace_private_file(
+        paths,
+        KNOWN_HOSTS_TEMP_FILE,
+        KNOWN_HOSTS_FILE,
+        pins.as_bytes(),
+        "revtty known_hosts",
+    )?;
+    Ok(HostKeyTrust::Paired { fingerprint })
+}
+
+/// Pins a host key the operator confirmed, with --host-key or at the prompt, and voids any
+/// pairing pending for the agent even when the key was pinned already: a proof the relay held
+/// back cannot override an explicit approval later.
 pub fn pin_agent_host_key(
     paths: &Paths,
     relay: &str,
@@ -199,21 +251,21 @@ pub fn pin_agent_host_key(
         .map_err(|error| RevttyError::runtime("create operator config directory", error))?;
     let _lock = lock_known_hosts(paths)?;
 
-    if check_agent_host_key(paths, relay, agent_name, encoded_key)?.pinned {
+    let public_key = parse_agent_host_key(encoded_key)?;
+    let alias = known_host_alias(relay, agent_name);
+    let pinned = match pin_state(paths, &alias, agent_name, &public_key)? {
+        PinState::Pinned => true,
+        PinState::Unpinned => false,
+        PinState::Mismatch(pinned) => {
+            return Err(host_key_mismatch(relay, agent_name, &pinned, false));
+        }
+    };
+    remove_pairing(paths, &alias)?;
+    if pinned {
         return Ok(());
     }
 
-    // Only the key material: the comment is the relay's text, and one that breaks the line
-    // would add a pin of its own, for any other machine.
-    let mut public_key = parse_agent_host_key(encoded_key)?;
-    public_key.set_comment("");
-    let public_text = public_key
-        .to_openssh()
-        .map_err(|error| RevttyError::runtime("encode enrolled agent host key", error))?;
-    let line = format!("{} {public_text}", known_host_alias(relay, agent_name));
-    let _: KnownHostEntry = KnownHostEntry::from_str(&line)
-        .map_err(|error| RevttyError::runtime("validate known_hosts entry", error))?;
-
+    let line = pin_line(&alias, public_key)?;
     let mut options = OpenOptions::new();
     options.create(true).append(true);
 
@@ -231,35 +283,167 @@ pub fn pin_agent_host_key(
         .map_err(|error| RevttyError::runtime("sync revtty known_hosts", error))
 }
 
-/// Removes the host key pinned for `agent_name` on `relay`, returning how many entries went;
-/// every other line of the file is kept as it was.
+/// Removes the host key pinned for `agent_name` on `relay` and the pairing pending for it;
+/// every other line of both files is kept as it was.
 pub fn forget_agent_host_key(
     paths: &Paths,
     relay: &str,
     agent_name: &str,
-) -> Result<usize, RevttyError> {
-    let path = paths.config_dir.join(KNOWN_HOSTS_FILE);
-    if !path.exists() {
-        return Ok(0);
+) -> Result<Forgotten, RevttyError> {
+    if !paths.config_dir.exists() {
+        return Ok(Forgotten {
+            pins: 0,
+            pairing: false,
+        });
     }
     let _lock = lock_known_hosts(paths)?;
-    let content = fs::read_to_string(&path)
-        .map_err(|error| RevttyError::runtime("read revtty known_hosts", error))?;
 
     let alias = known_host_alias(relay, agent_name);
-    let mut forgotten = 0;
+    let (kept, pins) = pins_without(paths, &alias, agent_name)?;
+    let pairing = remove_pairing(paths, &alias)?;
+    if pins > 0 {
+        replace_private_file(
+            paths,
+            KNOWN_HOSTS_TEMP_FILE,
+            KNOWN_HOSTS_FILE,
+            kept.as_bytes(),
+            "revtty known_hosts",
+        )?;
+    }
+    Ok(Forgotten { pins, pairing })
+}
+
+/// Keeps the secret of the pairing made for `agent_name` on `relay` (`revtty pair`), in place
+/// of any earlier one for that agent, whose proofs then no longer verify.
+pub fn save_pairing(
+    paths: &Paths,
+    relay: &str,
+    agent_name: &str,
+    secret: &PairingSecret,
+) -> Result<(), RevttyError> {
+    crate::config::create_private_dir(&paths.config_dir)
+        .map_err(|error| RevttyError::runtime("create operator config directory", error))?;
+    let _lock = lock_known_hosts(paths)?;
+
+    let alias = known_host_alias(relay, agent_name);
+    let (mut pairings, _) = pairings_without(paths, &alias)?;
+    pairings.push_str(&format!("{alias} {}\n", secret.expose()));
+    replace_private_file(
+        paths,
+        PAIRINGS_TEMP_FILE,
+        PAIRINGS_FILE,
+        pairings.as_bytes(),
+        "revtty pairings",
+    )
+}
+
+/// What the pins say about a host key. Hashed names and markers fail closed.
+fn pin_state(
+    paths: &Paths,
+    alias: &str,
+    agent_name: &str,
+    public_key: &PublicKey,
+) -> Result<PinState, RevttyError> {
+    let path = paths.config_dir.join(KNOWN_HOSTS_FILE);
+    if !path.exists() {
+        return Ok(PinState::Unpinned);
+    }
+    let entries = KnownHosts::read_file(&path)
+        .map_err(|error| RevttyError::runtime("read revtty known_hosts", error))?;
+
+    // A hashed name could be this agent, anywhere in the file; skipping it could accept a
+    // key the hashed entry contradicts or fall back to a first pin, so fail closed.
+    if entries
+        .iter()
+        .any(|entry| matches!(entry.host_patterns(), HostPatterns::HashedName { .. }))
+    {
+        return Err(RevttyError::message(format!(
+            "{} contains hashed host names, which revtty cannot match; restore the unhashed file",
+            path.display()
+        )));
+    }
+
+    // A marker decides wherever it is in the file: a pin on an earlier line must not
+    // outrank a later @revoked, and any other marker cannot be judged, so fail closed.
+    if entries
+        .iter()
+        .any(|entry| entry_matches_alias(entry, alias) && entry.marker().is_some())
+    {
+        return Err(RevttyError::message(format!(
+            "host key for {agent_name} is marked revoked"
+        )));
+    }
+
+    for entry in entries {
+        if !entry_matches_alias(&entry, alias) {
+            continue;
+        }
+        if entry.public_key().key_data() == public_key.key_data() {
+            return Ok(PinState::Pinned);
+        }
+        return Ok(PinState::Mismatch(
+            entry.public_key().fingerprint(HashAlg::Sha256).to_string(),
+        ));
+    }
+    Ok(PinState::Unpinned)
+}
+
+/// The key received is not shown: its fingerprint is the relay's word, and an operator
+/// recovering from a reinstall must take the new one from the machine.
+fn host_key_mismatch(relay: &str, agent_name: &str, pinned: &str, paired: bool) -> RevttyError {
+    RevttyError::message(format!(
+        "HOST KEY MISMATCH for {agent_name}: the relay presented a key other than the pinned \
+         {pinned}{}. If the machine was reinstalled and re-enrolled, run `revtty forget \
+         {agent_name} --relay {relay}` and connect with the --host-key that `revtty agent \
+         status` shows on it",
+        if paired {
+            ", and did not prove it with the pairing code pending for it"
+        } else {
+            ""
+        }
+    ))
+}
+
+/// The `known_hosts` line pinning `public_key` for `alias`. Only the key material: the
+/// comment is the relay's text, and one that breaks the line would add a pin of its own, for
+/// any other machine.
+fn pin_line(alias: &str, mut public_key: PublicKey) -> Result<String, RevttyError> {
+    public_key.set_comment("");
+    let public_text = public_key
+        .to_openssh()
+        .map_err(|error| RevttyError::runtime("encode enrolled agent host key", error))?;
+    let line = format!("{alias} {public_text}");
+    let _: KnownHostEntry = KnownHostEntry::from_str(&line)
+        .map_err(|error| RevttyError::runtime("validate known_hosts entry", error))?;
+    Ok(line)
+}
+
+/// The pins without those of `alias`, and how many those were. Lines revtty did not write
+/// for it are refused: removing them would undo more than its pin.
+fn pins_without(
+    paths: &Paths,
+    alias: &str,
+    agent_name: &str,
+) -> Result<(String, usize), RevttyError> {
+    let path = paths.config_dir.join(KNOWN_HOSTS_FILE);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(RevttyError::runtime("read revtty known_hosts", error)),
+    };
+
+    let mut removed = 0;
     let mut kept = String::with_capacity(content.len());
     for line in content.lines() {
         let Some(entry) = KnownHostEntry::from_str(line)
             .ok()
-            .filter(|entry| entry_matches_alias(entry, &alias))
+            .filter(|entry| entry_matches_alias(entry, alias))
         else {
             kept.push_str(line);
             kept.push('\n');
             continue;
         };
 
-        // Lines revtty did not write: removing them would undo more than this pin.
         if entry.marker().is_some() {
             return Err(RevttyError::message(format!(
                 "the host key pinned for {agent_name} is marked in {}; edit that line by hand",
@@ -272,31 +456,92 @@ pub fn forget_agent_host_key(
                 path.display()
             )));
         }
-        forgotten += 1;
+        removed += 1;
     }
-    if forgotten == 0 {
-        return Ok(0);
-    }
+    Ok((kept, removed))
+}
 
-    // Replaced whole, so that a crash leaves the old pins or the new ones.
-    let temp = paths.config_dir.join(".known_hosts.tmp");
+/// The pairings other than that of `alias`, and its secret. Lines are `<alias> <secret>`;
+/// they are never quoted in errors.
+fn pairings_without(
+    paths: &Paths,
+    alias: &str,
+) -> Result<(String, Option<PairingSecret>), RevttyError> {
+    let path = paths.config_dir.join(PAIRINGS_FILE);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((String::new(), None));
+        }
+        Err(error) => return Err(RevttyError::runtime("read revtty pairings", error)),
+    };
+
+    let mut kept = String::with_capacity(content.len());
+    let mut secret = None;
+    for line in content.lines() {
+        let Some(parsed) = line.split_once(' ').and_then(|(line_alias, encoded)| {
+            Some((line_alias, PairingSecret::parse(encoded).ok()?))
+        }) else {
+            return Err(RevttyError::message(format!(
+                "{} is damaged; remove it and run `revtty pair` again for the pending enrollments",
+                path.display()
+            )));
+        };
+        if parsed.0 == alias {
+            secret = Some(parsed.1);
+        } else {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    Ok((kept, secret))
+}
+
+/// Removes the pairing pending for `alias`; returns whether there was one.
+fn remove_pairing(paths: &Paths, alias: &str) -> Result<bool, RevttyError> {
+    let (kept, secret) = pairings_without(paths, alias)?;
+    if secret.is_none() {
+        return Ok(false);
+    }
+    replace_private_file(
+        paths,
+        PAIRINGS_TEMP_FILE,
+        PAIRINGS_FILE,
+        kept.as_bytes(),
+        "revtty pairings",
+    )?;
+    Ok(true)
+}
+
+/// Replaces `name` in the operator config directory whole and private to the user, so that a
+/// crash leaves the old content or the new one; the replacement is on disk once this returns.
+fn replace_private_file(
+    paths: &Paths,
+    temp_name: &str,
+    name: &str,
+    content: &[u8],
+    what: &str,
+) -> Result<(), RevttyError> {
+    let temp = paths.config_dir.join(temp_name);
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options
         .open(&temp)
-        .map_err(|error| RevttyError::runtime("open revtty known_hosts", error))?;
+        .map_err(|error| RevttyError::runtime(&format!("open {what}"), error))?;
+    // The creation mode does not apply to a temporary file left behind.
     #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|error| RevttyError::runtime("secure revtty known_hosts", error))?;
-    file.write_all(kept.as_bytes())
+        .map_err(|error| RevttyError::runtime(&format!("secure {what}"), error))?;
+    file.write_all(content)
         .and_then(|()| file.sync_all())
-        .map_err(|error| RevttyError::runtime("write revtty known_hosts", error))?;
-    fs::rename(&temp, &path)
-        .map_err(|error| RevttyError::runtime("replace revtty known_hosts", error))?;
-
-    Ok(forgotten)
+        .map_err(|error| RevttyError::runtime(&format!("write {what}"), error))?;
+    fs::rename(&temp, paths.config_dir.join(name))
+        .map_err(|error| RevttyError::runtime(&format!("replace {what}"), error))?;
+    fs::File::open(&paths.config_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| RevttyError::runtime(&format!("sync {what} directory"), error))
 }
 
 fn lock_known_hosts(paths: &Paths) -> Result<crate::config::ExclusiveLock, RevttyError> {
@@ -404,10 +649,11 @@ mod tests {
     use std::io::Write;
 
     use super::{
-        check_agent_host_key, ensure_operator, forget_agent_host_key, known_host_alias,
-        pin_agent_host_key,
+        HostKeyTrust, check_agent_host_key, ensure_operator, forget_agent_host_key,
+        known_host_alias, pairings_without, pin_agent_host_key, save_pairing, trust_agent_host_key,
     };
     use crate::config::Paths;
+    use crate::pairing::PairingSecret;
 
     fn host_key() -> String {
         PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
@@ -501,7 +747,8 @@ mod tests {
 
         assert_eq!(
             forget_agent_host_key(&paths, "wss://relay.example.com/", "store-042")
-                .expect("forget pin"),
+                .expect("forget pin")
+                .pins,
             1
         );
         // The reinstalled machine's new key can now be confirmed and pinned.
@@ -521,7 +768,9 @@ mod tests {
                 .pinned
         );
         assert_eq!(
-            forget_agent_host_key(&paths, relay, "store-042").expect("forget again"),
+            forget_agent_host_key(&paths, relay, "store-042")
+                .expect("forget again")
+                .pins,
             0
         );
 
@@ -799,5 +1048,433 @@ mod tests {
         }
 
         fs::remove_dir_all(root).expect("clean identity test directory");
+    }
+
+    const RELAY: &str = "https://relay.example.com";
+
+    fn temp_paths(label: &str) -> (std::path::PathBuf, Paths) {
+        let root = std::env::temp_dir().join(format!("revtty-{label}-{}", Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        (root, paths)
+    }
+
+    fn fingerprint(key: &str) -> String {
+        ssh_key::PublicKey::from_openssh(key)
+            .expect("parse host key")
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string()
+    }
+
+    fn pair(paths: &Paths, name: &str) -> PairingSecret {
+        let secret = PairingSecret::generate().expect("pairing secret");
+        save_pairing(paths, RELAY, name, &secret).expect("save pairing");
+        // A copy, as the agent gets it through the code.
+        PairingSecret::parse(secret.expose()).expect("copy secret")
+    }
+
+    fn proof(secret: &PairingSecret, key: &str) -> String {
+        secret
+            .host_key_proof(&fingerprint(key))
+            .expect("host key proof")
+    }
+
+    fn pending(paths: &Paths, name: &str) -> Option<String> {
+        pairings_without(paths, &known_host_alias(RELAY, name))
+            .expect("read pairings")
+            .1
+            .map(|secret| secret.expose().to_owned())
+    }
+
+    fn read(path: std::path::PathBuf) -> Option<Vec<u8>> {
+        fs::read(path).ok()
+    }
+
+    #[test]
+    fn a_pairing_proof_pins_the_paired_key_once() {
+        let (root, paths) = temp_paths("paired");
+        let (key, other_key) = (host_key(), host_key());
+        let secret = pair(&paths, "store-042");
+        let other_secret = pair(&paths, "store-043");
+
+        // Each pairing proves only its own agent's key: the secret is looked up by name.
+        let crossed = trust_agent_host_key(
+            &paths,
+            RELAY,
+            "store-043",
+            &key,
+            Some(&proof(&secret, &key)),
+        );
+        assert!(
+            crossed.is_err(),
+            "store-043 trusted a proof made for store-042"
+        );
+        assert_eq!(
+            pending(&paths, "store-043").as_deref(),
+            Some(other_secret.expose())
+        );
+
+        let trusted = trust_agent_host_key(
+            &paths,
+            RELAY,
+            "store-042",
+            &key,
+            Some(&proof(&secret, &key)),
+        )
+        .expect("trust proven key");
+        assert!(
+            matches!(&trusted, HostKeyTrust::Paired { fingerprint: shown } if *shown == fingerprint(&key))
+        );
+        assert!(
+            check_agent_host_key(&paths, RELAY, "store-042", &key)
+                .expect("check pin")
+                .pinned
+        );
+        assert!(
+            pending(&paths, "store-042").is_none(),
+            "pairing not used up"
+        );
+        assert!(
+            pending(&paths, "store-043").is_some(),
+            "another agent's pairing went"
+        );
+
+        // Used up: the same proof is now only the pinned key's, and proves no other key.
+        assert!(matches!(
+            trust_agent_host_key(
+                &paths,
+                RELAY,
+                "store-042",
+                &key,
+                Some(&proof(&secret, &key))
+            )
+            .expect("trust pinned key"),
+            HostKeyTrust::Pinned
+        ));
+        assert!(
+            trust_agent_host_key(
+                &paths,
+                RELAY,
+                "store-042",
+                &other_key,
+                Some(&proof(&secret, &other_key))
+            )
+            .is_err_and(|error| error.to_string().contains("HOST KEY MISMATCH"))
+        );
+
+        fs::remove_dir_all(root).expect("clean pairing test directory");
+    }
+
+    #[test]
+    fn a_missing_or_wrong_proof_changes_no_file() {
+        let (root, paths) = temp_paths("unproven");
+        let (pinned_key, presented_key) = (host_key(), host_key());
+        let stranger = PairingSecret::generate().expect("unrelated secret");
+        let known_hosts = || read(paths.config_dir.join("known_hosts"));
+        let pairings = || read(paths.config_dir.join("pairings"));
+
+        // Not pinned yet: a relay that sends no proof, or a wrong one, pins nothing.
+        pair(&paths, "store-042");
+        let before = (known_hosts(), pairings());
+        for proof in [None, Some(proof(&stranger, &presented_key))] {
+            let refused =
+                trust_agent_host_key(&paths, RELAY, "store-042", &presented_key, proof.as_deref());
+            assert!(
+                refused.is_err_and(|error| error.to_string().contains("--host-key")),
+                "{proof:?}"
+            );
+            assert_eq!((known_hosts(), pairings()), before, "{proof:?}");
+        }
+
+        // Pinned: another key without a valid proof is a mismatch, and the pin stays.
+        pin_agent_host_key(&paths, RELAY, "store-042", &pinned_key).expect("pin");
+        pair(&paths, "store-042");
+        let before = (known_hosts(), pairings());
+        for proof in [None, Some(proof(&stranger, &presented_key))] {
+            let refused =
+                trust_agent_host_key(&paths, RELAY, "store-042", &presented_key, proof.as_deref());
+            assert!(
+                refused.as_ref().is_err_and(|error| {
+                    let text = error.to_string();
+                    text.contains("HOST KEY MISMATCH")
+                        && !text.contains(&fingerprint(&presented_key))
+                }),
+                "{proof:?}: {:?}",
+                refused.err().map(|error| error.to_string())
+            );
+            assert_eq!((known_hosts(), pairings()), before, "{proof:?}");
+
+            // The pinned key itself is still trusted, and the pending pairing kept for a
+            // reinstall to come.
+            assert!(matches!(
+                trust_agent_host_key(&paths, RELAY, "store-042", &pinned_key, proof.as_deref())
+                    .expect("trust pinned key"),
+                HostKeyTrust::Pinned
+            ));
+            assert_eq!((known_hosts(), pairings()), before, "{proof:?}");
+        }
+
+        fs::remove_dir_all(root).expect("clean pairing test directory");
+    }
+
+    #[test]
+    fn a_machine_paired_again_replaces_its_pin() {
+        let (root, paths) = temp_paths("repaired");
+        let (old_key, new_key, neighbour_key) = (host_key(), host_key(), host_key());
+        pin_agent_host_key(&paths, RELAY, "store-042", &old_key).expect("pin");
+        pin_agent_host_key(&paths, RELAY, "store-043", &neighbour_key).expect("pin");
+        let secret = pair(&paths, "store-042");
+
+        let trusted = trust_agent_host_key(
+            &paths,
+            RELAY,
+            "store-042",
+            &new_key,
+            Some(&proof(&secret, &new_key)),
+        )
+        .expect("trust the reinstalled machine's key");
+
+        assert!(matches!(trusted, HostKeyTrust::Paired { .. }));
+        let pins = fs::read_to_string(paths.config_dir.join("known_hosts")).expect("read pins");
+        assert_eq!(pins.lines().count(), 2, "{pins}");
+        assert!(
+            check_agent_host_key(&paths, RELAY, "store-042", &new_key)
+                .expect("check new key")
+                .pinned
+        );
+        assert!(
+            check_agent_host_key(&paths, RELAY, "store-043", &neighbour_key)
+                .expect("check neighbour")
+                .pinned
+        );
+        assert!(pending(&paths, "store-042").is_none());
+
+        fs::remove_dir_all(root).expect("clean pairing test directory");
+    }
+
+    #[test]
+    fn a_new_pairing_voids_the_previous_one() {
+        let (root, paths) = temp_paths("repaired-twice");
+        let key = host_key();
+        let first = pair(&paths, "store-042");
+        let second = pair(&paths, "store-042");
+
+        let stale =
+            trust_agent_host_key(&paths, RELAY, "store-042", &key, Some(&proof(&first, &key)));
+        assert!(
+            stale.is_err(),
+            "a proof under the replaced secret pinned the key"
+        );
+        assert_eq!(
+            pending(&paths, "store-042").as_deref(),
+            Some(second.expose())
+        );
+
+        assert!(matches!(
+            trust_agent_host_key(
+                &paths,
+                RELAY,
+                "store-042",
+                &key,
+                Some(&proof(&second, &key))
+            )
+            .expect("trust under the current secret"),
+            HostKeyTrust::Paired { .. }
+        ));
+
+        fs::remove_dir_all(root).expect("clean pairing test directory");
+    }
+
+    #[test]
+    fn explicit_approvals_and_forget_void_a_pending_pairing() {
+        let (root, paths) = temp_paths("voided");
+        let (approved_key, replayed_key) = (host_key(), host_key());
+
+        // A first pin approved by hand: a proof the relay held back cannot replace it.
+        let secret = pair(&paths, "store-042");
+        let held_back = proof(&secret, &replayed_key);
+        pin_agent_host_key(&paths, RELAY, "store-042", &approved_key).expect("approve");
+        assert!(pending(&paths, "store-042").is_none());
+        assert!(
+            trust_agent_host_key(&paths, RELAY, "store-042", &replayed_key, Some(&held_back))
+                .is_err_and(|error| error.to_string().contains("HOST KEY MISMATCH"))
+        );
+
+        // The pinned key reaffirmed (--host-key matching the pin) voids a pairing made since.
+        let secret = pair(&paths, "store-042");
+        let held_back = proof(&secret, &replayed_key);
+        pin_agent_host_key(&paths, RELAY, "store-042", &approved_key).expect("reaffirm");
+        assert!(pending(&paths, "store-042").is_none());
+        assert!(
+            trust_agent_host_key(&paths, RELAY, "store-042", &replayed_key, Some(&held_back))
+                .is_err_and(|error| error.to_string().contains("HOST KEY MISMATCH"))
+        );
+        assert!(
+            check_agent_host_key(&paths, RELAY, "store-042", &approved_key)
+                .expect("check approved key")
+                .pinned
+        );
+
+        // `forget` takes a pending pairing with the pin.
+        let secret = pair(&paths, "store-042");
+        let forgotten = forget_agent_host_key(&paths, RELAY, "store-042").expect("forget");
+        assert_eq!((forgotten.pins, forgotten.pairing), (1, true));
+        assert!(matches!(
+            trust_agent_host_key(
+                &paths,
+                RELAY,
+                "store-042",
+                &replayed_key,
+                Some(&proof(&secret, &replayed_key))
+            )
+            .expect("trust after forget"),
+            HostKeyTrust::Unknown { .. }
+        ));
+
+        fs::remove_dir_all(root).expect("clean pairing test directory");
+    }
+
+    #[test]
+    fn an_interrupted_pairing_leaves_neither_secret_nor_new_pin() {
+        let (root, paths) = temp_paths("interrupted");
+        let (old_key, new_key, first_key) = (host_key(), host_key(), host_key());
+        pin_agent_host_key(&paths, RELAY, "store-042", &old_key).expect("pin");
+        let replacing = pair(&paths, "store-042");
+        let first = pair(&paths, "store-043");
+        // The pins cannot be rewritten: the write fails once the pairing is used up.
+        let blocker = paths.config_dir.join(".known_hosts.tmp");
+        fs::create_dir(&blocker).expect("block the pins rewrite");
+
+        for (name, key, secret) in [
+            ("store-042", &new_key, &replacing),
+            ("store-043", &first_key, &first),
+        ] {
+            let interrupted =
+                trust_agent_host_key(&paths, RELAY, name, key, Some(&proof(secret, key)));
+            assert!(interrupted.is_err(), "{name}");
+            assert!(
+                pending(&paths, name).is_none(),
+                "{name}: the secret survived"
+            );
+        }
+        fs::remove_dir(&blocker).expect("unblock");
+
+        // As if the pairings never existed: the old pin holds, the other agent is unknown.
+        assert!(
+            trust_agent_host_key(
+                &paths,
+                RELAY,
+                "store-042",
+                &new_key,
+                Some(&proof(&replacing, &new_key))
+            )
+            .is_err_and(|error| error.to_string().contains("HOST KEY MISMATCH"))
+        );
+        assert!(
+            check_agent_host_key(&paths, RELAY, "store-042", &old_key)
+                .expect("check old pin")
+                .pinned
+        );
+        assert!(matches!(
+            trust_agent_host_key(
+                &paths,
+                RELAY,
+                "store-043",
+                &first_key,
+                Some(&proof(&first, &first_key))
+            )
+            .expect("trust after the interruption"),
+            HostKeyTrust::Unknown { .. }
+        ));
+
+        fs::remove_dir_all(root).expect("clean pairing test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pairings_stay_private() {
+        let (root, paths) = temp_paths("pairings-mode");
+        fs::create_dir_all(&paths.config_dir).expect("create config directory");
+        // A temporary file another process left readable is made private before use.
+        let temp = paths.config_dir.join(".pairings.tmp");
+        fs::write(&temp, "").expect("leave a temporary file");
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o644)).expect("make it readable");
+        let mode = || {
+            fs::metadata(paths.config_dir.join("pairings"))
+                .expect("pairings metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        let secret = pair(&paths, "store-042");
+        pair(&paths, "store-043");
+        assert_eq!(mode(), 0o600);
+        let key = host_key();
+        trust_agent_host_key(
+            &paths,
+            RELAY,
+            "store-042",
+            &key,
+            Some(&proof(&secret, &key)),
+        )
+        .expect("use a pairing");
+        assert_eq!(mode(), 0o600);
+
+        fs::remove_dir_all(root).expect("clean pairing test directory");
+    }
+
+    #[test]
+    fn pairing_while_pinning_loses_nothing() {
+        // Every write is synced to disk: enough rounds to interleave, few enough to stay fast.
+        const ROUNDS: usize = 20;
+        let (root, paths) = temp_paths("pairing-race");
+        let paired = (0..ROUNDS)
+            .map(|index| {
+                let name = format!("paired-{index}");
+                let secret = pair(&paths, &name);
+                (name, secret)
+            })
+            .collect::<Vec<_>>();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let pairer_paths = paths.clone();
+        let pairer_start = std::sync::Arc::clone(&start);
+        let pairer = std::thread::spawn(move || {
+            pairer_start.wait();
+            (0..ROUNDS)
+                .map(|index| {
+                    let name = format!("new-{index}");
+                    let secret = PairingSecret::generate().expect("pairing secret");
+                    save_pairing(&pairer_paths, RELAY, &name, &secret).expect("save pairing");
+                    (name, secret.expose().to_owned())
+                })
+                .collect::<Vec<_>>()
+        });
+        start.wait();
+        for (name, secret) in &paired {
+            let key = host_key();
+            trust_agent_host_key(&paths, RELAY, name, &key, Some(&proof(secret, &key)))
+                .expect("use a pairing");
+        }
+        let created = pairer.join().expect("pairer thread");
+
+        for (name, secret) in created {
+            assert_eq!(
+                pending(&paths, &name).as_deref(),
+                Some(secret.as_str()),
+                "{name}"
+            );
+        }
+        let pins = fs::read_to_string(paths.config_dir.join("known_hosts")).expect("read pins");
+        assert_eq!(
+            pins.lines().count(),
+            ROUNDS,
+            "a pin written meanwhile was lost"
+        );
+        for (name, _) in &paired {
+            assert!(pending(&paths, name).is_none(), "{name}");
+        }
+
+        fs::remove_dir_all(root).expect("clean pairing test directory");
     }
 }

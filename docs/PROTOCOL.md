@@ -128,6 +128,20 @@ The operator and agent rendezvous credentials are therefore distinct.
 
 `revtty list` uses a separate one-time SSHSIG inventory challenge. The client signs the canonical `scope=list` message and sends its Ed25519 public key with the signature. The relay verifies possession of that key and returns only enrolled agents whose reported operators include its SHA-256 SSH fingerprint. The inventory challenge is removed when used, including failed/replayed attempts.
 
+## Pairing codes
+
+A pairing code lets the relay take part in enrollment without being able to choose the agent's first operator or the host key that operator pins.
+
+1. The relay administrator creates the enrollment as usual (`relay enroll NAME --operator-key FILE`) and hands the token to that operator.
+2. Without contacting anything, the operator runs `revtty pair NAME --token TOKEN --relay URL`: it generates a secret S, 32 random bytes written `rvk_` plus their base64url, keeps it in its `pairings` file under the key of `(relay, NAME)`, and prints the code `rvp1.TOKEN.S.TAG`, where `TAG = HMAC-SHA256(S, "revtty pairing operator v1\0" ‖ NAME ‖ "\0" ‖ operator fingerprint)`.
+3. On the target, `agent enroll --pairing-code CODE` sends `POST /v1/enroll` with only TOKEN and `host_key_proof = HMAC-SHA256(S, "revtty pairing host-key v1\0" ‖ host key fingerprint)`. Before saving anything it checks TAG against the `name` and the fingerprint of `operator_key` in the answer.
+4. The relay checks only that the proof is base64url of 32 bytes, stores it with the agent instance (`agents.host_key_proof`, schema v7) and returns it in the operator authentication answer as `host_key_proof`.
+5. At the first `status`, `probe` or `connect`, when the presented key is not the pinned one and a pairing is pending for `(relay, NAME)`, the client pins the key only if the proof verifies under S, replacing a previous pin, and removes the pairing first. Otherwise, and when no proof comes, it pins nothing and changes no file.
+
+Fingerprints are OpenSSH SHA-256 fingerprints as printed (`SHA256:` and unpadded base64); MACs are unpadded base64url. S is used once: pinning with it, a new `pair` for the same agent, an explicit approval (`--host-key` or the prompt, even of the key already pinned) and `forget` all remove it, so a proof the relay held back cannot override a decision the operator made later.
+
+Both fields are optional and left out when absent. A relay that predates them ignores the request field and sends no proof, which the client reports and answers by asking for `--host-key`; a client that predates them ignores the answer field and asks for the fingerprint as before. A revtty that predates `--pairing-code` refuses the flag, but one given the code as `--token` would send S to the relay.
+
 ## Agent credential rotation
 
 The agent replaces its control credential in two HTTP steps, while it is stopped:
@@ -190,6 +204,7 @@ SSH performs agent host authentication and operator public-key authentication in
 - A pending agent side is paired at most once.
 - Operator and agent rendezvous credentials are distinct.
 - The relay keeps an agent's operator list only as the agent reported it on its current control connection; SSH access is decided by the agent's own list.
+- A pairing secret never reaches the relay; with a pairing code the agent keeps no operator the code was not made for, and the operator pins no host key the agent did not prove.
 - Operator session credentials, control connections and sessions belong to one enrolled agent instance; when it is removed or re-enrolled, the relay closes them within its removal sweep (5 s), data tunnels included.
 - The relay can route terminal data without understanding the SSH payload.
 - Secret-bearing control types do not derive debug formatting.

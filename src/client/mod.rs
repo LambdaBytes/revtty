@@ -9,6 +9,8 @@ use ssh_key::{HashAlg, LineEnding, PrivateKey};
 
 use crate::config::Paths;
 use crate::error::RevttyError;
+use crate::identity::HostKeyTrust;
+use crate::pairing::{PairingCode, PairingSecret};
 use crate::protocol::{
     AgentListResponse, AgentStatusResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
     OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, ProbeResult,
@@ -34,6 +36,47 @@ pub fn init() -> Result<(), RevttyError> {
     Ok(())
 }
 
+/// Makes the pairing code for enrolling `target` with `token`, and keeps its secret for the
+/// first contact with the target. Nothing is sent anywhere.
+pub fn pair(target: &str, token: &str, relay: &str) -> Result<(), RevttyError> {
+    if !valid_name(target) {
+        return Err(RevttyError::message("invalid machine name"));
+    }
+    // The URL the target enrolls with: refused now if it would be refused there.
+    http_url(relay, "/v1/enroll")?;
+
+    let paths = Paths::discover()?;
+    let identity = crate::identity::ensure_operator(&paths)?;
+    // The enrollment exists, so it was made for an existing key: a code for a key created now
+    // would only make the target refuse its enrollment, once the relay has used it up.
+    if identity.created {
+        return Err(RevttyError::message(format!(
+            "there was no operator identity here, so the enrollment cannot be for it; one was \
+             created now ({}). Run `revtty pair` where the operator key the enrollment names is, \
+             or have {target} enrolled again for this one",
+            identity.public_key_path.display()
+        )));
+    }
+    let code = PairingCode::new(
+        token,
+        PairingSecret::generate()?,
+        target,
+        &identity.fingerprint,
+    )?;
+    crate::identity::save_pairing(&paths, relay, target, code.secret())?;
+
+    let code = code.encode();
+    println!("target     {target}");
+    println!("relay      {relay}");
+    println!("code       {code}");
+    println!(
+        "On the target, enroll with the code, never as --token (an older revtty that does not \
+         know --pairing-code would send its secret to the relay):"
+    );
+    println!("revtty agent enroll --relay {relay} --pairing-code {code}");
+    Ok(())
+}
+
 pub fn forget(target: &str, relay: &str) -> Result<(), RevttyError> {
     if !valid_name(target) {
         return Err(RevttyError::message("invalid machine name"));
@@ -41,7 +84,10 @@ pub fn forget(target: &str, relay: &str) -> Result<(), RevttyError> {
 
     let paths = Paths::discover()?;
     let forgotten = crate::identity::forget_agent_host_key(&paths, relay, target)?;
-    if forgotten == 0 {
+    if forgotten.pairing {
+        println!("discarded  pairing code for {target} on {relay}");
+    }
+    if forgotten.pins == 0 {
         println!("no host key pinned for {target} on {relay}");
     } else {
         println!("forgotten  host key of {target} on {relay}");
@@ -206,14 +252,6 @@ struct AuthenticatedOperator {
     auth: OperatorAuthResponse,
 }
 
-/// How the operator approved a host key that was not pinned yet.
-enum HostKeyApproval {
-    /// `--host-key` named the fingerprint: no time passed.
-    Flag,
-    /// Answered at the terminal, which may outlast the operator credential.
-    Interactive,
-}
-
 async fn authenticate_operator(
     target: &str,
     relay: &str,
@@ -233,38 +271,50 @@ async fn authenticate_operator(
     let client = relay_client()?;
     let mut auth = request_operator_session(&client, &private_key, target, relay).await?;
 
-    let check = crate::identity::check_agent_host_key(&paths, relay, target, &auth.host_key)?;
-    // Checked even against a pin: the operator obtained it independently, and it names the
-    // key this connection must reach.
-    if let Some(expected) = expected_host_key
-        && expected != check.fingerprint
-    {
-        return Err(RevttyError::message(format!(
-            "the host key the relay presented for {target} does not match --host-key \
-             {expected}; nothing was pinned"
-        )));
-    }
-    if !check.pinned {
-        let approval = approve_host_key(
-            target,
-            relay,
-            &check.fingerprint,
-            expected_host_key.is_some(),
-        )?;
+    if let Some(expected) = expected_host_key {
+        let check = crate::identity::check_agent_host_key(&paths, relay, target, &auth.host_key)?;
+        // Checked even against a pin: the operator obtained it independently, and it names
+        // the key this connection must reach.
+        if expected != check.fingerprint {
+            return Err(RevttyError::message(format!(
+                "the host key the relay presented for {target} does not match --host-key \
+                 {expected}; nothing was pinned"
+            )));
+        }
+        // No time passed since the credential was issued, so it is still for this key.
         crate::identity::pin_agent_host_key(&paths, relay, target, &auth.host_key)?;
-        eprintln!("pinned host key {}", check.fingerprint);
+        if !check.pinned {
+            eprintln!("pinned host key {}", check.fingerprint);
+        }
+    } else {
+        match crate::identity::trust_agent_host_key(
+            &paths,
+            relay,
+            target,
+            &auth.host_key,
+            auth.host_key_proof.as_deref(),
+        )? {
+            HostKeyTrust::Pinned => {}
+            HostKeyTrust::Paired { fingerprint } => {
+                eprintln!("pinned host key {fingerprint}, verified by pairing code");
+            }
+            HostKeyTrust::Unknown { fingerprint } => {
+                confirm_host_key(target, relay, &fingerprint)?;
+                crate::identity::pin_agent_host_key(&paths, relay, target, &auth.host_key)?;
+                eprintln!("pinned host key {fingerprint}");
 
-        if let HostKeyApproval::Interactive = approval {
-            // The operator credential is short-lived and single-use; request a new one and
-            // make sure the relay still presents the key that was just approved: compared with
-            // that key itself, not through the pin, which another process may have removed.
-            let approved = auth.host_key.clone();
-            auth = request_operator_session(&client, &private_key, target, relay).await?;
-            if !crate::identity::same_agent_host_key(&approved, &auth.host_key)? {
-                return Err(RevttyError::message(format!(
-                    "the relay presented another host key for {target} after it was confirmed; \
-                     the session was not opened"
-                )));
+                // The operator credential is short-lived and single-use, and answering may
+                // outlast it; request a new one and make sure the relay still presents the key
+                // that was just approved: compared with that key itself, not through the pin,
+                // which another process may have removed.
+                let approved = auth.host_key.clone();
+                auth = request_operator_session(&client, &private_key, target, relay).await?;
+                if !crate::identity::same_agent_host_key(&approved, &auth.host_key)? {
+                    return Err(RevttyError::message(format!(
+                        "the relay presented another host key for {target} after it was \
+                         confirmed; the session was not opened"
+                    )));
+                }
             }
         }
     }
@@ -276,20 +326,11 @@ async fn authenticate_operator(
     })
 }
 
-/// The relay only relays the agent's host key, so a first pin needs the fingerprint from the
-/// target itself (`revtty agent status`): given with --host-key, already compared, or typed
-/// at the terminal. The fingerprint the relay presented is never shown, so that it cannot be
-/// copied back in place of the target's.
-fn approve_host_key(
-    target: &str,
-    relay: &str,
-    fingerprint: &str,
-    flagged: bool,
-) -> Result<HostKeyApproval, RevttyError> {
-    if flagged {
-        return Ok(HostKeyApproval::Flag);
-    }
-
+/// The relay only relays the agent's host key, so without a pairing code a first pin needs the
+/// fingerprint from the target itself (`revtty agent status`): given with --host-key, or typed
+/// at the terminal here. The fingerprint the relay presented is never shown, so that it cannot
+/// be copied back in place of the target's.
+fn confirm_host_key(target: &str, relay: &str, fingerprint: &str) -> Result<(), RevttyError> {
     if !std::io::stdin().is_terminal() {
         return Err(RevttyError::message(format!(
             "host key of {target} is not pinned yet; pass --host-key with the fingerprint \
@@ -308,7 +349,7 @@ fn approve_host_key(
         .map_err(|error| RevttyError::runtime("read host key confirmation", error))?;
 
     if answer.trim() == fingerprint {
-        Ok(HostKeyApproval::Interactive)
+        Ok(())
     } else {
         Err(RevttyError::message(
             "the fingerprint entered does not match the host key the relay presented; nothing \

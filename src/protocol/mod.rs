@@ -103,6 +103,10 @@ pub struct EnrollRequest {
     pub token: String,
     pub host_key: String,
     pub version: String,
+    /// With a pairing code: the agent's proof of `host_key` under the pairing secret, which
+    /// the relay stores and hands to operators but cannot produce (`crate::pairing`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key_proof: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +153,9 @@ pub struct OperatorAuthResponse {
     pub session_token: String,
     pub expires_in_secs: u64,
     pub host_key: String,
+    /// The proof the agent enrolled `host_key` with, if it was enrolled with a pairing code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key_proof: Option<String>,
 }
 
 #[cfg(test)]
@@ -254,11 +261,19 @@ mod tests {
 
     #[test]
     fn enrollment_messages_round_trip() {
-        let request = EnrollRequest {
+        let mut request = EnrollRequest {
             token: "rve_secret".to_owned(),
             host_key: "ssh-ed25519 AAAA".to_owned(),
             version: "0.1.0".to_owned(),
+            host_key_proof: None,
         };
+        // Without a proof the request is what earlier agents send.
+        let encoded = serde_json::to_string(&request).expect("serialize enrollment request");
+        assert!(!encoded.contains("host_key_proof"), "{encoded}");
+        let decoded: EnrollRequest =
+            serde_json::from_str(&encoded).expect("deserialize enrollment request");
+        assert!(decoded == request);
+        request.host_key_proof = Some("proof".to_owned());
         let encoded = serde_json::to_string(&request).expect("serialize enrollment request");
         let decoded: EnrollRequest =
             serde_json::from_str(&encoded).expect("deserialize enrollment request");
@@ -296,14 +311,21 @@ mod tests {
             serde_json::from_str(&encoded).expect("deserialize auth request");
         assert!(decoded == request);
 
-        let response = OperatorAuthResponse {
+        let mut response = OperatorAuthResponse {
             session_token: "rvo_secret".to_owned(),
             expires_in_secs: 30,
             host_key: "ssh-ed25519 AAAA host".to_owned(),
+            host_key_proof: Some("proof".to_owned()),
         };
         let encoded = serde_json::to_string(&response).expect("serialize auth response");
         let decoded: OperatorAuthResponse =
             serde_json::from_str(&encoded).expect("deserialize auth response");
+        assert!(decoded == response);
+        // What a relay that predates pairing codes answers.
+        response.host_key_proof = None;
+        let legacy = r#"{"session_token":"rvo_secret","expires_in_secs":30,"host_key":"ssh-ed25519 AAAA host"}"#;
+        let decoded: OperatorAuthResponse =
+            serde_json::from_str(legacy).expect("deserialize legacy auth response");
         assert!(decoded == response);
 
         assert_eq!(

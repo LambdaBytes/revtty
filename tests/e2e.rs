@@ -813,7 +813,7 @@ fn doctors_check_authentication_permissions_and_tls() {
     let relay_doctor =
         relay_role.run(&["relay", "doctor", "--db", db.to_str().expect("utf-8 path")]);
     assert!(
-        relay_doctor.contains("schema     v6"),
+        relay_doctor.contains("schema     v7"),
         "unexpected relay doctor output:\n{relay_doctor}"
     );
 
@@ -1230,4 +1230,276 @@ fn agent_run_finishes_an_interrupted_rotation_before_connecting() {
     assert!(probe.contains("status   reachable"), "{probe}");
     drop(agent_process);
     drop(relay);
+}
+
+/// A new enrollment for the agent, `--replace` when it replaces an enrolled one; its token.
+fn enrollment_token(root: &TempRoot, relay_role: &Role, operator: &Role, replace: bool) -> String {
+    let db = root.path("relay.db");
+    let operator_key = operator.config.join("id_ed25519.pub");
+    let mut args = vec![
+        "relay",
+        "enroll",
+        AGENT_NAME,
+        "--operator-key",
+        operator_key.to_str().expect("utf-8 path"),
+        "--db",
+        db.to_str().expect("utf-8 path"),
+    ];
+    if replace {
+        args.push("--replace");
+    }
+    field(&relay_role.run(&args), "token").to_owned()
+}
+
+/// Enrolls `agent` with a pairing code the operator made; returns the agent's host key
+/// fingerprint and the code.
+fn paired_enrollment(
+    root: &TempRoot,
+    relay_role: &Role,
+    operator: &Role,
+    agent: &Role,
+    url: &str,
+    replace: bool,
+) -> (String, String) {
+    let token = enrollment_token(root, relay_role, operator, replace);
+    let paired = operator.run(&["pair", AGENT_NAME, "--token", &token, "--relay", url]);
+    let code = field(&paired, "code").to_owned();
+    assert!(
+        paired.contains(&format!(
+            "revtty agent enroll --relay {url} --pairing-code {code}"
+        )),
+        "{paired}"
+    );
+
+    let enrolled = agent.run(&["agent", "enroll", "--relay", url, "--pairing-code", &code]);
+    let operator_fingerprint = field(&operator.run(&["init"]), "fingerprint").to_owned();
+    assert_eq!(
+        field(&enrolled, "operator"),
+        format!("{operator_fingerprint} (verified by pairing code)")
+    );
+    (field(&enrolled, "host").to_owned(), code)
+}
+
+/// The base64 of the pairing secret inside `code`, which must never reach the relay.
+fn pairing_secret(code: &str) -> String {
+    let secret = code.split('.').nth(2).expect("pairing secret");
+    secret
+        .strip_prefix("rvk_")
+        .expect("secret prefix")
+        .to_owned()
+}
+
+fn pending_pairings(operator: &Role) -> String {
+    std::fs::read_to_string(operator.config.join("pairings")).unwrap_or_default()
+}
+
+#[test]
+fn paired_enrollment_pins_the_host_key_on_first_contact() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let token = enrollment_token(&root, &relay_role, &operator, false);
+
+    // Paired where there was no operator identity, the code would be for a new key the
+    // enrollment cannot name.
+    let stranger = Role::new(&root, "stranger");
+    let refused = stranger.run_failing(&["pair", AGENT_NAME, "--token", &token, "--relay", &url]);
+    assert!(refused.contains("no operator identity"), "{refused}");
+    assert!(!stranger.config.join("pairings").exists());
+
+    let paired = operator.run(&["pair", AGENT_NAME, "--token", &token, "--relay", &url]);
+    let code = field(&paired, "code").to_owned();
+    let secret = pairing_secret(&code);
+
+    // Misused, the code is refused before anything is sent, and never quoted.
+    for args in [
+        vec!["--token", code.as_str()],
+        vec!["--token", token.as_str(), "--pairing-code", code.as_str()],
+        vec!["--pairing-code", &code[..code.len() - 3]],
+    ] {
+        let mut command = vec!["agent", "enroll", "--relay", url.as_str()];
+        command.extend(args);
+        let refused = agent.run_failing(&command);
+        assert!(!refused.contains(&secret), "{refused}");
+    }
+
+    // The enrollment was not used by those attempts.
+    let enrolled = agent.run(&["agent", "enroll", "--relay", &url, "--pairing-code", &code]);
+    assert!(
+        enrolled.contains("(verified by pairing code)"),
+        "{enrolled}"
+    );
+    let host_key = field(&enrolled, "host").to_owned();
+    let _agent_process = start_agent(&root, &agent);
+
+    let probe = operator.run(&["probe", AGENT_NAME, "--relay", &url]);
+    assert!(
+        probe.contains("status   reachable")
+            && probe.contains(&format!(
+                "pinned host key {host_key}, verified by pairing code"
+            )),
+        "{probe}"
+    );
+    assert!(
+        pending_pairings(&operator).is_empty(),
+        "pairing not used up"
+    );
+    let again = operator.run(&["probe", AGENT_NAME, "--relay", &url]);
+    assert!(!again.contains("pinned host key"), "{again}");
+
+    // The relay never had the secret.
+    for file in ["relay.db", "relay.db-wal"] {
+        let stored = std::fs::read(root.path(file)).unwrap_or_default();
+        assert!(
+            !stored
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "{file} holds the pairing secret"
+        );
+    }
+    assert!(
+        !relay.log().contains(&secret),
+        "the relay logged the secret"
+    );
+}
+
+#[test]
+fn a_relay_cannot_have_another_host_key_pinned_despite_pairing() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    let (host_key, _code) = paired_enrollment(&root, &relay_role, &operator, &agent, &url, false);
+    let _agent_process = start_agent(&root, &agent);
+    let known_hosts = operator.config.join("known_hosts");
+
+    // --host-key is the operator's own word: it is checked first, even against a valid proof.
+    let contradicted = operator.run_failing(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        "SHA256:not-the-agent",
+    ]);
+    assert!(
+        contradicted.contains("does not match --host-key"),
+        "{contradicted}"
+    );
+    assert!(!known_hosts.exists());
+    assert!(!pending_pairings(&operator).is_empty());
+
+    let db = tokio_rusqlite::rusqlite::Connection::open(root.path("relay.db"))
+        .expect("open relay database");
+    db.busy_timeout(Duration::from_secs(5))
+        .expect("wait for the relay's writes");
+    let (agent_key, agent_proof): (String, String) = db
+        .query_row(
+            "SELECT host_key, host_key_proof FROM agents WHERE name = ?1",
+            [AGENT_NAME],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read the enrolled host key and proof");
+    let other_key =
+        ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .expect("other host key")
+            .public_key()
+            .to_openssh()
+            .expect("encode other host key");
+    let present = |key: &str, proof: Option<&str>| {
+        db.execute(
+            "UPDATE agents SET host_key = ?1, host_key_proof = ?2 WHERE name = ?3",
+            tokio_rusqlite::rusqlite::params![key, proof, AGENT_NAME],
+        )
+        .expect("change what the relay presents");
+    };
+
+    // Another key with the agent's proof, or a proof the relay made up.
+    let made_up = "A".repeat(43);
+    for (key, proof) in [
+        (other_key.as_str(), agent_proof.as_str()),
+        (agent_key.as_str(), made_up.as_str()),
+    ] {
+        present(key, Some(proof));
+        let refused = operator.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
+        assert!(
+            refused.contains("nothing was pinned") && !refused.contains("SHA256:"),
+            "{refused}"
+        );
+        assert!(
+            !known_hosts.exists(),
+            "a host key was pinned without its proof"
+        );
+    }
+
+    // A relay that predates pairing codes sends no proof: the operator is asked for
+    // --host-key, which pins the key and discards the pairing.
+    present(&agent_key, None);
+    let refused = operator.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
+    assert!(refused.contains("--host-key"), "{refused}");
+    let probe = operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+    assert!(probe.contains("status   reachable"), "{probe}");
+    assert!(pending_pairings(&operator).is_empty());
+
+    // A pairing made later, for a reinstall that does not happen, is void once the pinned key
+    // is reaffirmed: a proof the relay holds back cannot replace it afterwards.
+    let token = enrollment_token(&root, &relay_role, &operator, true);
+    operator.run(&["pair", AGENT_NAME, "--token", &token, "--relay", &url]);
+    assert!(!pending_pairings(&operator).is_empty());
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+    assert!(pending_pairings(&operator).is_empty());
+}
+
+#[test]
+fn a_machine_paired_again_replaces_its_pin() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    paired_enrollment(&root, &relay_role, &operator, &agent, &url, false);
+    let old_agent = start_agent(&root, &agent);
+    operator.run(&["probe", AGENT_NAME, "--relay", &url]);
+    drop(old_agent);
+
+    // Reinstalled and paired again: its new key replaces the pin, with no `forget`.
+    let reinstalled = Role::new(&root, "reinstalled");
+    let (new_host_key, _code) =
+        paired_enrollment(&root, &relay_role, &operator, &reinstalled, &url, true);
+    let new_agent = start_agent(&root, &reinstalled);
+    let probe = operator.run(&["probe", AGENT_NAME, "--relay", &url]);
+    assert!(
+        probe.contains("status   reachable")
+            && probe.contains(&format!(
+                "pinned host key {new_host_key}, verified by pairing code"
+            )),
+        "{probe}"
+    );
+    let pins = std::fs::read_to_string(operator.config.join("known_hosts")).expect("read pins");
+    assert_eq!(pins.lines().count(), 1, "{pins}");
+    drop(new_agent);
+
+    // Reinstalled with a plain token, the operator key is the relay's word and a changed
+    // host key is a mismatch, as without pairing codes.
+    let third = Role::new(&root, "third");
+    let token = enrollment_token(&root, &relay_role, &operator, true);
+    let enrolled = third.run(&["agent", "enroll", "--relay", &url, "--token", &token]);
+    assert!(
+        enrolled.contains("(as reported by the relay, not verified)"),
+        "{enrolled}"
+    );
+    let _third_agent = start_agent(&root, &third);
+    let mismatch = operator.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
+    assert!(mismatch.contains("HOST KEY MISMATCH"), "{mismatch}");
 }

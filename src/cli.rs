@@ -73,7 +73,24 @@ pub enum Command {
         relay: String,
     },
 
-    /// Forget a machine's pinned host key, after it was reinstalled and re-enrolled.
+    /// Wrap an enrollment token from `revtty relay enroll` in a pairing code for the target,
+    /// so that its host key gets pinned on first contact and the relay cannot pick its
+    /// operator. Nothing is sent: the code's secret stays here and on the target.
+    Pair {
+        /// Machine name the enrollment was created for.
+        target: String,
+
+        /// Single-use enrollment token printed by `revtty relay enroll`.
+        #[arg(long)]
+        token: String,
+
+        /// Relay base URL the target enrolls with and this operator connects through.
+        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
+        relay: String,
+    },
+
+    /// Forget a machine's pinned host key, after it was reinstalled and re-enrolled; a
+    /// pairing pending for it is discarded too.
     Forget {
         /// Machine name.
         target: String,
@@ -105,8 +122,17 @@ pub enum AgentCommand {
         relay: String,
 
         /// Single-use enrollment token.
+        #[arg(
+            long,
+            required_unless_present = "pairing_code",
+            conflicts_with = "pairing_code"
+        )]
+        token: Option<String>,
+
+        /// Pairing code printed by `revtty pair`: the enrollment token with a secret the relay
+        /// never sees, which proves this machine's host key to the operator.
         #[arg(long)]
-        token: String,
+        pairing_code: Option<String>,
 
         /// Maximum concurrent probe/shell sessions accepted by this agent.
         #[arg(long, default_value_t = 4)]
@@ -324,6 +350,30 @@ mod tests {
         assert!(Args::try_parse_from(["revtty", "relay", "remove", "store-042"]).is_ok());
         assert!(Args::try_parse_from(["revtty", "forget", "store-042"]).is_ok());
         assert!(Args::try_parse_from(["revtty", "forget"]).is_err());
+    }
+
+    #[test]
+    fn parses_pairing_commands() {
+        assert!(
+            Args::try_parse_from(["revtty", "pair", "store-042", "--token", "rve_token"]).is_ok()
+        );
+        assert!(Args::try_parse_from(["revtty", "pair", "store-042"]).is_err());
+
+        let enroll = [
+            "revtty",
+            "agent",
+            "enroll",
+            "--relay",
+            "https://relay.example.com",
+        ];
+        let with = |extra: &[&'static str]| {
+            Args::try_parse_from(enroll.iter().chain(extra).copied().collect::<Vec<_>>())
+        };
+        assert!(with(&["--token", "rve_token"]).is_ok());
+        assert!(with(&["--pairing-code", "rvp1.code"]).is_ok());
+        // Exactly one of them.
+        assert!(with(&[]).is_err());
+        assert!(with(&["--token", "rve_token", "--pairing-code", "rvp1.code"]).is_err());
     }
 
     #[test]

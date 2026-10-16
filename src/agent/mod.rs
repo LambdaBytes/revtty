@@ -24,6 +24,7 @@ use crate::config::Paths;
 use crate::identity::ensure_agent;
 
 use crate::error::RevttyError;
+use crate::pairing::PairingCode;
 use crate::protocol::{
     AgentRotateRequest, CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse,
     ProbeResult, SESSION_ERROR_PREFIX, SessionRejectReason,
@@ -109,18 +110,72 @@ fn jitter_sample(failures: u32) -> u64 {
     value
 }
 
-pub async fn enroll(relay: &str, token: &str, max_sessions: usize) -> Result<(), RevttyError> {
-    validate_max_sessions(max_sessions)?;
+/// Enrolls with a plain enrollment `token`, or with a `pairing_code` from `revtty pair`.
+pub async fn enroll(
+    relay: &str,
+    token: Option<&str>,
+    pairing_code: Option<&str>,
+    max_sessions: usize,
+) -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
-    let identity = ensure_agent(&paths)?;
+    enroll_with(
+        &relay_client()?,
+        &paths,
+        relay,
+        token,
+        pairing_code,
+        max_sessions,
+    )
+    .await
+}
+
+async fn enroll_with(
+    client: &reqwest::Client,
+    paths: &Paths,
+    relay: &str,
+    token: Option<&str>,
+    pairing_code: Option<&str>,
+    max_sessions: usize,
+) -> Result<(), RevttyError> {
+    validate_max_sessions(max_sessions)?;
+    // Settled before anything is sent: only the token inside a pairing code goes to the
+    // relay, never its secret.
+    let pairing = match (token, pairing_code) {
+        (Some(token), None) => {
+            if token.contains('.') {
+                return Err(RevttyError::message(
+                    "--token was given a pairing code; pass it with --pairing-code, which keeps \
+                     its secret from the relay",
+                ));
+            }
+            None
+        }
+        (None, Some(code)) => Some(PairingCode::parse(code)?),
+        _ => {
+            return Err(RevttyError::message(
+                "pass either --token or --pairing-code",
+            ));
+        }
+    };
+    let token = match &pairing {
+        Some(code) => code.token(),
+        None => token.unwrap_or_default(),
+    };
+
+    let identity = ensure_agent(paths)?;
+    let host_key_proof = pairing
+        .as_ref()
+        .map(|code| code.secret().host_key_proof(&identity.fingerprint))
+        .transpose()?;
     let url = http_url(relay, "/v1/enroll")?;
     let request = EnrollRequest {
         token: token.to_owned(),
         host_key: identity.public_key.clone(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        host_key_proof,
     };
 
-    let response = relay_client()?
+    let response = client
         .post(url)
         .json(&request)
         .send()
@@ -156,6 +211,23 @@ pub async fn enroll(relay: &str, token: &str, max_sessions: usize) -> Result<(),
     if operator_key.algorithm() != Algorithm::Ed25519 {
         return Err(RevttyError::message("v1 requires an Ed25519 operator key"));
     }
+    // The agent will accept shells from this key: with a pairing code it must be the key the
+    // code was made for, whatever the relay says.
+    let operator_fingerprint = operator_key.fingerprint(HashAlg::Sha256).to_string();
+    let operator_source = match &pairing {
+        Some(code) => {
+            if !code.vouches_for(&enrolled.name, &operator_fingerprint)? {
+                return Err(RevttyError::message(
+                    "the relay enrolled this machine for an operator or a name the pairing code \
+                     was not made for; nothing was saved. The relay has used up the enrollment: \
+                     investigate it, then enroll this machine again with a new `revtty relay \
+                     enroll --replace` and `revtty pair`",
+                ));
+            }
+            "verified by pairing code"
+        }
+        None => "as reported by the relay, not verified",
+    };
 
     AgentConfig::new(
         relay.trim_end_matches('/').to_owned(),
@@ -165,10 +237,11 @@ pub async fn enroll(relay: &str, token: &str, max_sessions: usize) -> Result<(),
         enrolled.operator_key,
         max_sessions,
     )
-    .save(&paths)?;
+    .save(paths)?;
 
     println!("agent      {}", enrolled.name);
     println!("host       {}", identity.fingerprint);
+    println!("operator   {operator_fingerprint} ({operator_source})");
     println!(
         "identity   {}",
         if identity.created {
@@ -178,7 +251,7 @@ pub async fn enroll(relay: &str, token: &str, max_sessions: usize) -> Result<(),
         }
     );
     println!("sessions   {max_sessions}");
-    println!("config     {}", AgentConfig::path(&paths).display());
+    println!("config     {}", AgentConfig::path(paths).display());
     Ok(())
 }
 
@@ -1111,12 +1184,14 @@ mod tests {
     use super::ssh::OperatorAllowlist;
     use super::{
         ControlTimeouts, OPERATORS_RELOAD_INTERVAL, PendingRotation, RECONNECT_JITTER_PERCENT,
-        ReconnectBackoff, Rotation, describe_undecodable, finish_pending_rotation, pty_test,
-        reconnect_base_millis, reconnect_delay_millis, rotate_control_credential, run_control_once,
-        ssh, watch_operators,
+        ReconnectBackoff, Rotation, describe_undecodable, enroll_with, finish_pending_rotation,
+        pty_test, reconnect_base_millis, reconnect_delay_millis, rotate_control_credential,
+        run_control_once, ssh, watch_operators,
     };
     use crate::config::Paths;
+    use crate::pairing::{PairingCode, PairingSecret};
     use crate::protocol::SESSION_ERROR_PREFIX;
+    use crate::token::SecretToken;
 
     const FAST_CONTROL_TIMEOUTS: ControlTimeouts = ControlTimeouts {
         heartbeat: Duration::from_millis(50),
@@ -1668,5 +1743,185 @@ mod tests {
         );
         drop(running);
         std::fs::remove_dir_all(root).expect("clean rotation test directory");
+    }
+
+    /// The relay side of enrollment, answering with whatever `name` and `operator_key` it is
+    /// set to, and keeping every request body it receives.
+    #[derive(Default)]
+    struct FakeEnrollment {
+        name: String,
+        operator_key: String,
+        bodies: Vec<String>,
+    }
+
+    type SharedEnrollment = Arc<std::sync::Mutex<FakeEnrollment>>;
+
+    async fn enrollment_relay(state: SharedEnrollment) -> String {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+
+        let enroll = move |body: String| async move {
+            let mut state = state.lock().expect("fake relay");
+            state.bodies.push(body);
+            (
+                StatusCode::CREATED,
+                axum::Json(crate::protocol::EnrollResponse {
+                    agent_id: "agent-id".to_owned(),
+                    name: state.name.clone(),
+                    control_token: "rva_enrolled".to_owned(),
+                    operator_key: state.operator_key.clone(),
+                }),
+            )
+        };
+        let app = axum::Router::new().route("/v1/enroll", post(enroll));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake relay");
+        let address = listener.local_addr().expect("fake relay address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake relay");
+        });
+        format!("http://{address}")
+    }
+
+    /// An agent not enrolled yet, and a relay that enrolls it as `name` for `operator_key`.
+    async fn enrolling_agent(
+        name: &str,
+        operator_key: &str,
+    ) -> (std::path::PathBuf, Paths, SharedEnrollment, String) {
+        let root = std::env::temp_dir().join(format!("revtty-enroll-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(root.join("config"), root.join("state"));
+        let state = SharedEnrollment::default();
+        {
+            let mut state = state.lock().expect("fake relay");
+            state.name = name.to_owned();
+            state.operator_key = operator_key.to_owned();
+        }
+        let relay = enrollment_relay(Arc::clone(&state)).await;
+        (root, paths, state, relay)
+    }
+
+    fn pairing_code(name: &str, operator_key: &str) -> PairingCode {
+        let fingerprint = ssh_key::PublicKey::from_openssh(operator_key)
+            .expect("parse operator key")
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
+        PairingCode::new(
+            SecretToken::generate("rve").expect("token").expose(),
+            PairingSecret::generate().expect("pairing secret"),
+            name,
+            &fingerprint,
+        )
+        .expect("pairing code")
+    }
+
+    #[tokio::test]
+    async fn a_pairing_code_keeps_its_secret_and_proves_the_host_key() {
+        let operator = operator_key();
+        let (root, paths, relay_state, relay) = enrolling_agent("paired-agent", &operator).await;
+        let code = pairing_code("paired-agent", &operator);
+        let encoded = code.encode();
+
+        enroll_with(
+            &reqwest::Client::new(),
+            &paths,
+            &relay,
+            None,
+            Some(&encoded),
+            4,
+        )
+        .await
+        .expect("enroll with a pairing code");
+
+        let config = AgentConfig::load(&paths).expect("load agent config");
+        assert_eq!(config.operators, vec![operator]);
+        let bodies = relay_state.lock().expect("fake relay").bodies.clone();
+        assert_eq!(bodies.len(), 1);
+        let body = &bodies[0];
+        let tag = encoded.rsplit('.').next().expect("tag");
+        assert!(
+            !body.contains(&code.secret().expose()[4..]) && !body.contains(tag),
+            "the relay received the code's secret or tag: {body}"
+        );
+        let request: crate::protocol::EnrollRequest =
+            serde_json::from_str(body).expect("decode enrollment request");
+        assert_eq!(request.token, code.token());
+        let identity = crate::identity::ensure_agent(&paths).expect("agent identity");
+        let proof = request.host_key_proof.expect("host key proof sent");
+        assert!(
+            code.secret()
+                .host_key_proof_matches(&identity.fingerprint, &proof)
+                .expect("verify proof")
+        );
+        std::fs::remove_dir_all(root).expect("clean enrollment test directory");
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_pairing_code_does_not_vouch_for_saves_nothing() {
+        let client = reqwest::Client::new();
+        let operator = operator_key();
+        // The relay names another operator, or enrolls the machine under another name.
+        for (name, answered) in [
+            ("paired-agent", operator_key()),
+            ("other-agent", operator.clone()),
+        ] {
+            let (root, paths, _relay_state, relay) = enrolling_agent(name, &answered).await;
+            let code = pairing_code("paired-agent", &operator).encode();
+            let refused = enroll_with(&client, &paths, &relay, None, Some(&code), 4).await;
+            assert!(
+                refused.is_err_and(|error| error.to_string().contains("nothing was saved")),
+                "{name}"
+            );
+            assert!(!AgentConfig::path(&paths).exists(), "{name}");
+            std::fs::remove_dir_all(root).expect("clean enrollment test directory");
+        }
+
+        // Enrolling again: the configuration in place stays as it was.
+        let (root, paths, relay_state, relay) = enrolling_agent("paired-agent", &operator).await;
+        let code = pairing_code("paired-agent", &operator).encode();
+        enroll_with(&client, &paths, &relay, None, Some(&code), 4)
+            .await
+            .expect("first enrollment");
+        let before = std::fs::read(AgentConfig::path(&paths)).expect("read agent config");
+        relay_state.lock().expect("fake relay").operator_key = operator_key();
+        let code = pairing_code("paired-agent", &operator).encode();
+        let refused = enroll_with(&client, &paths, &relay, None, Some(&code), 4).await;
+        assert!(refused.is_err());
+        assert_eq!(
+            std::fs::read(AgentConfig::path(&paths)).expect("read agent config"),
+            before
+        );
+        std::fs::remove_dir_all(root).expect("clean enrollment test directory");
+    }
+
+    #[tokio::test]
+    async fn a_misused_pairing_code_is_refused_before_any_request() {
+        let operator = operator_key();
+        let (root, paths, relay_state, relay) = enrolling_agent("paired-agent", &operator).await;
+        let code = pairing_code("paired-agent", &operator);
+        let secret = code.secret().expose()[4..].to_owned();
+        let encoded = code.encode();
+        let damaged = encoded[..encoded.len() - 3].to_owned();
+
+        // Passed as a token, the whole code would reach the relay; damaged, it is not quoted.
+        for (token, pairing) in [
+            (Some(encoded.as_str()), None),
+            (None, Some(damaged.as_str())),
+        ] {
+            let refused =
+                enroll_with(&reqwest::Client::new(), &paths, &relay, token, pairing, 4).await;
+            let error = refused
+                .expect_err("enrolled with a misused code")
+                .to_string();
+            assert!(!error.contains(&secret), "{error}");
+        }
+        assert!(
+            relay_state.lock().expect("fake relay").bodies.is_empty(),
+            "a request reached the relay"
+        );
+        assert!(!AgentConfig::path(&paths).exists());
+        if root.exists() {
+            std::fs::remove_dir_all(root).expect("clean enrollment test directory");
+        }
     }
 }

@@ -23,13 +23,27 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
             host_key,
         } => crate::client::probe(&target, &relay, host_key.as_deref()).await,
         Command::Doctor { relay } => crate::client::doctor(&relay).await,
+        Command::Pair {
+            target,
+            token,
+            relay,
+        } => crate::client::pair(&target, &token, &relay),
         Command::Forget { target, relay } => crate::client::forget(&target, &relay),
         Command::Agent { command } => match command {
             AgentCommand::Enroll {
                 relay,
                 token,
+                pairing_code,
                 max_sessions,
-            } => crate::agent::enroll(&relay, &token, max_sessions).await,
+            } => {
+                crate::agent::enroll(
+                    &relay,
+                    token.as_deref(),
+                    pairing_code.as_deref(),
+                    max_sessions,
+                )
+                .await
+            }
             AgentCommand::Run => crate::agent::run().await,
             AgentCommand::PtyTest => crate::agent::pty_test(),
             AgentCommand::Status => crate::agent::status(),

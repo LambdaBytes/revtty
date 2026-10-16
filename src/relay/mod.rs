@@ -595,10 +595,23 @@ async fn enroll_agent(
         Ok(key) => key,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
+    // The relay cannot verify a proof, only bound what it stores and hands to operators.
+    if request
+        .host_key_proof
+        .as_deref()
+        .is_some_and(|proof| !crate::pairing::is_mac(proof))
+    {
+        return (StatusCode::BAD_REQUEST, "invalid host key proof").into_response();
+    }
 
     match state
         .store
-        .consume_enrollment(&request.token, &host_key, Some(&request.version))
+        .consume_enrollment(
+            &request.token,
+            &host_key,
+            request.host_key_proof.as_deref(),
+            Some(&request.version),
+        )
         .await
     {
         Ok(credential) => (
@@ -767,6 +780,7 @@ async fn operator_auth(
             session_token: session_token.expose().to_owned(),
             expires_in_secs: OPERATOR_SESSION_TTL.as_secs(),
             host_key: agent.host_key,
+            host_key_proof: agent.host_key_proof,
         }),
     )
         .into_response()
@@ -2052,6 +2066,7 @@ mod tests {
                 token: enrollment.token.expose().to_owned(),
                 host_key,
                 version: "0.1.0".to_owned(),
+                host_key_proof: None,
             })
             .send()
             .await
@@ -2083,6 +2098,7 @@ mod tests {
                     .to_openssh()
                     .expect("second host key"),
                 version: "0.1.0".to_owned(),
+                host_key_proof: None,
             })
             .send()
             .await
@@ -2092,6 +2108,59 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn host_key_proofs_are_bounded_stored_and_handed_to_operators() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let operator = ed25519_key();
+        let enrollment = store
+            .create_enrollment(
+                "proven",
+                &operator.public_key().to_openssh().expect("operator key"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("create enrollment");
+        let (_state, base, server) = http_relay(store).await;
+        let http = reqwest::Client::new();
+        let host_key = ed25519_key().public_key().to_openssh().expect("host key");
+        let enroll = |host_key_proof: String| {
+            http.post(format!("{base}/v1/enroll"))
+                .json(&EnrollRequest {
+                    token: enrollment.token.expose().to_owned(),
+                    host_key: host_key.clone(),
+                    version: "0.1.0".to_owned(),
+                    host_key_proof: Some(host_key_proof),
+                })
+                .send()
+        };
+
+        // The relay cannot check a proof, only that it is shaped like one; a refused request
+        // leaves the enrollment unused.
+        for malformed in [
+            "not base64!".to_owned(),
+            "A".repeat(4096),
+            URL_SAFE_NO_PAD.encode([0_u8; 31]),
+        ] {
+            let response = enroll(malformed).await.expect("send enrollment");
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
+        let proof = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let response = enroll(proof.clone()).await.expect("send enrollment");
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+
+        let challenge =
+            fetch_challenge(&http, format!("{base}/v1/operator/challenge/proven")).await;
+        let response = post_auth(&http, &base, "proven", &operator, &challenge).await;
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        let auth: OperatorAuthResponse = response.json().await.expect("decode operator auth");
+        assert_eq!(auth.host_key_proof.as_deref(), Some(proof.as_str()));
+
+        server.abort();
     }
 
     #[tokio::test]
@@ -2131,7 +2200,7 @@ mod tests {
                 .expect("create enrollment");
             let host_key = ed25519_key().public_key().to_openssh().expect("host key");
             store
-                .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+                .consume_enrollment(enrollment.token.expose(), &host_key, None, Some("0.1.0"))
                 .await
                 .expect("consume enrollment");
         }
@@ -2219,7 +2288,7 @@ mod tests {
             .await
             .expect("create enrollment");
         let credential = store
-            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .consume_enrollment(enrollment.token.expose(), &host_key, None, Some("0.1.0"))
             .await
             .expect("consume enrollment");
 
@@ -2493,7 +2562,7 @@ mod tests {
             .await
             .expect("create enrollment");
         let credential = store
-            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .consume_enrollment(enrollment.token.expose(), &host_key, None, Some("0.1.0"))
             .await
             .expect("consume enrollment");
 
@@ -2718,7 +2787,7 @@ mod tests {
             .await
             .expect("create enrollment");
         let credential = store
-            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .consume_enrollment(enrollment.token.expose(), &host_key, None, Some("0.1.0"))
             .await
             .expect("consume enrollment");
 
@@ -2954,7 +3023,7 @@ mod tests {
             .expect("create enrollment");
         let host_key = ed25519_key().public_key().to_openssh().expect("host key");
         store
-            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .consume_enrollment(enrollment.token.expose(), &host_key, None, Some("0.1.0"))
             .await
             .expect("consume enrollment");
     }
@@ -3420,7 +3489,7 @@ mod tests {
             .expect("create enrollment");
         let host_key = ed25519_key().public_key().to_openssh().expect("host key");
         let credential = store
-            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .consume_enrollment(enrollment.token.expose(), &host_key, None, Some("0.1.0"))
             .await
             .expect("consume enrollment");
         let (state, base, server) = http_relay(store.clone()).await;
@@ -3539,7 +3608,7 @@ mod tests {
             .expect("create enrollment");
         let host_key = ed25519_key().public_key().to_openssh().expect("host key");
         let credential = store
-            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .consume_enrollment(enrollment.token.expose(), &host_key, None, Some("0.1.0"))
             .await
             .expect("consume enrollment");
         // Production timeouts: the agent is not dropped for idling during the test.
@@ -3590,7 +3659,7 @@ mod tests {
             .expect("create enrollment");
         let host_key = ed25519_key().public_key().to_openssh().expect("host key");
         let credential = store
-            .consume_enrollment(enrollment.token.expose(), &host_key, Some("0.1.0"))
+            .consume_enrollment(enrollment.token.expose(), &host_key, None, Some("0.1.0"))
             .await
             .expect("consume enrollment");
         let (state, base, server) = http_relay(store).await;
@@ -3889,7 +3958,7 @@ mod tests {
         relay
             .state
             .store
-            .consume_enrollment(replacement.token.expose(), &host_key, Some("0.1.0"))
+            .consume_enrollment(replacement.token.expose(), &host_key, None, Some("0.1.0"))
             .await
             .expect("consume replacement");
 

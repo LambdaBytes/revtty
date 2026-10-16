@@ -20,7 +20,7 @@ That transport proof is now implemented together with the first authenticated SS
 - automatic reconnect after control-channel loss with bounded exponential backoff, jitter and a 30-second cap;
 - SSHSIG operator challenge/response authentication;
 - short-lived, single-use operator session credentials;
-- agent host-key pinning; a first pin needs the operator's confirmation (`--host-key` or an interactive prompt);
+- agent host-key pinning; a first pin needs the operator's confirmation (`--host-key` or an interactive prompt) or the agent's proof under a pairing code (`revtty pair`, `agent enroll --pairing-code`);
 - operator `list` scoped to the authenticated operator key;
 - operator `status <name>` with persisted presence metadata;
 - operator `probe <name>`;
