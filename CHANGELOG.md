@@ -59,6 +59,9 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - `relay enroll` refuses a name that is already enrolled unless `--replace` is given.
 - `agent enroll` prints the operator's fingerprint and whether a pairing code verified it, and refuses a pairing code given as `--token`. `forget` also discards a pairing pending for the machine.
 - `doctor` fails when other users can read `pairings`.
+- `probe` runs over SSH, as a shell does: the agent checks the operator against its own list and proves its pinned host key, and answers only `revtty-probe`. A probe answered without SSH, as older agents answer it and as a relay could, is refused; an older operator client gets no answer from a newer agent, which ends the session after 45 seconds.
+- Relay URLs with a user name or password are refused, without quoting them. reqwest sent them as Basic credentials ahead of revtty's bearer token, so they never authenticated anything, while `agent.toml` kept them. `agent run` stops at start on such a stored URL, and `agent status` shows any stored URL that `agent run` refuses as refused.
+- The request errors of operator commands and `agent enroll` show their cause, such as a refused connection or why a redirect was not followed.
 - WebSocket errors show their cause, such as the status of a refused upgrade or the TLS or connection failure, instead of only `websocket upgrade failed`, `reqwest error` or `tungstenite error`.
 - Operator and agent commands refuse a plain `http://` or `ws://` relay URL unless its host is `localhost`, `127.0.0.0/8` or `[::1]`, and do not follow a relay's redirect to one, since enrollment, control and session credentials would cross the network unencrypted. An agent enrolled with such a URL stops at `agent run`; change `relay` in its `agent.toml` to the `https://` URL.
 
@@ -84,5 +87,9 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - `known_hosts` was created with the default mode, so `doctor` failed after the first pin under umask 002; `relay doctor` now only warns about a group-writable database directory.
 - `probe` showed a decode error instead of the relay's reason, for example a busy agent.
 - Behind a TLS terminator that negotiates HTTP/2, as Caddy does by default, every WebSocket failed while plain requests worked: revtty now speaks HTTP/1.1 to the relay.
+- `relay serve` died on SIGINT and SIGTERM, losing queued audit records and leaving its open sessions to be closed at its next start, with that start's time. It now stops accepting connections, finishes the requests in flight, ends its connections, records their sessions as `interrupted` and writes the audit before it exits, within 5 seconds; it exits with an error when it cannot.
+- The relay stored, and handed to operators, the comment that came with an agent's host key; it keeps the key material only.
+- A refused remote `ws://` relay URL was shown as `http://`.
+- `probe` and `connect` could report `establish SSH transport: Disconnected` instead of the relay's reason, such as a busy agent.
 - Opening a WebSocket had no time limit: a relay or middlebox that accepted the connection and never answered kept an agent from reconnecting, and a data tunnel kept its session slot. Every handshake now gives up after 10 seconds.
 - An agent whose relay accepted the connection and then closed it, for example over an incompatible `Hello` or an operator list it could not store, reconnected about every second: the reconnect wait now restarts only once the relay answers a heartbeat ping.

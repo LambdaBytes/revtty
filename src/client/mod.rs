@@ -3,18 +3,16 @@ mod ssh;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use futures_util::StreamExt;
-use reqwest_websocket::Message;
 use ssh_key::{HashAlg, LineEnding, PrivateKey};
 
 use crate::config::Paths;
-use crate::error::RevttyError;
+use crate::error::{RevttyError, with_sources};
 use crate::identity::HostKeyTrust;
 use crate::pairing::{PairingCode, PairingSecret};
 use crate::protocol::{
     AgentListResponse, AgentStatusResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
-    OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, ProbeResult,
-    SESSION_ERROR_PREFIX, operator_auth_message, operator_list_auth_message,
+    OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, operator_auth_message,
+    operator_list_auth_message,
 };
 use crate::transport::{check_relay_health, connect_websocket, http_url, relay_client, valid_name};
 
@@ -156,7 +154,7 @@ pub async fn status(target: &str, relay: &str, host_key: Option<&str>) -> Result
         .bearer_auth(&operator.auth.session_token)
         .send()
         .await
-        .map_err(|error| RevttyError::runtime("request agent status", error))?;
+        .map_err(|error| RevttyError::runtime("request agent status", with_sources(&error)))?;
 
     let response_status = response.status();
     if !response_status.is_success() {
@@ -201,11 +199,9 @@ async fn request_agent_list(
     relay: &str,
 ) -> Result<reqwest::Response, RevttyError> {
     let challenge_url = http_url(relay, "/v1/operator/list/challenge")?;
-    let challenge_response = client
-        .post(challenge_url)
-        .send()
-        .await
-        .map_err(|error| RevttyError::runtime("request operator list challenge", error))?;
+    let challenge_response = client.post(challenge_url).send().await.map_err(|error| {
+        RevttyError::runtime("request operator list challenge", with_sources(&error))
+    })?;
 
     let challenge_status = challenge_response.status();
     if !challenge_status.is_success() {
@@ -236,7 +232,7 @@ async fn request_agent_list(
         })
         .send()
         .await
-        .map_err(|error| RevttyError::runtime("request agent list", error))
+        .map_err(|error| RevttyError::runtime("request agent list", with_sources(&error)))
 }
 
 fn session_capacity(status: &AgentStatusResponse) -> String {
@@ -365,11 +361,9 @@ async fn request_operator_session(
     relay: &str,
 ) -> Result<OperatorAuthResponse, RevttyError> {
     let challenge_url = http_url(relay, &format!("/v1/operator/challenge/{target}"))?;
-    let challenge_response = client
-        .post(challenge_url)
-        .send()
-        .await
-        .map_err(|error| RevttyError::runtime("request operator challenge", error))?;
+    let challenge_response = client.post(challenge_url).send().await.map_err(|error| {
+        RevttyError::runtime("request operator challenge", with_sources(&error))
+    })?;
 
     let challenge_status = challenge_response.status();
     if !challenge_status.is_success() {
@@ -399,7 +393,7 @@ async fn request_operator_session(
         })
         .send()
         .await
-        .map_err(|error| RevttyError::runtime("authenticate operator", error))?;
+        .map_err(|error| RevttyError::runtime("authenticate operator", with_sources(&error)))?;
 
     let auth_status = auth_response.status();
     if !auth_status.is_success() {
@@ -417,40 +411,22 @@ async fn request_operator_session(
 pub async fn probe(target: &str, relay: &str, host_key: Option<&str>) -> Result<(), RevttyError> {
     let operator = authenticate_operator(target, relay, host_key).await?;
     let path = format!("/v1/probe/{target}");
-    let mut websocket =
+    let websocket =
         connect_websocket(&operator.client, relay, &path, &operator.auth.session_token).await?;
+    let result = ssh::run_probe(
+        websocket,
+        &operator.private_key_path,
+        &operator.auth.host_key,
+        target,
+    )
+    .await?;
 
-    while let Some(message) = websocket.next().await {
-        match message {
-            Ok(Message::Text(text)) => {
-                // The relay explains a refused session (busy agent, timeout) before closing.
-                if let Some(detail) = text.strip_prefix(SESSION_ERROR_PREFIX) {
-                    return Err(RevttyError::message(detail.to_owned()));
-                }
-
-                let result: ProbeResult = serde_json::from_str(&text)
-                    .map_err(|error| RevttyError::runtime("decode probe result", error))?;
-
-                println!("target   {}", result.name);
-                println!("status   reachable");
-                println!("os       {}", result.os);
-                println!("arch     {}", result.arch);
-                println!("revtty   {}", result.version);
-                // Close the tunnel cleanly: the relay audits how sessions end.
-                let _ = websocket
-                    .close(reqwest_websocket::CloseCode::Normal, None)
-                    .await;
-                return Ok(());
-            }
-            Ok(Message::Close { .. }) => break,
-            Ok(_) => {}
-            Err(error) => return Err(RevttyError::runtime("receive probe result", error)),
-        }
-    }
-
-    Err(RevttyError::message(
-        "probe session closed before the agent returned a result",
-    ))
+    println!("target   {}", result.name);
+    println!("status   reachable");
+    println!("os       {}", result.os);
+    println!("arch     {}", result.arch);
+    println!("revtty   {}", result.version);
+    Ok(())
 }
 
 /// Exit code when the session ended without a remote exit status, as with ssh.

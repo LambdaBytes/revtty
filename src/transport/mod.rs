@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::task::JoinHandle;
 
 use crate::error::{RevttyError, with_sources};
-use crate::protocol::SESSION_ERROR_PREFIX;
+use crate::protocol::{ProbeResult, SESSION_ERROR_PREFIX};
 
 pub const DEFAULT_TRANSPORT: &str = "wss";
 
@@ -74,6 +74,14 @@ pub fn websocket_byte_stream(
                             if let Some(detail) = session_error_detail(&text) {
                                 return Err(RevttyError::message(detail.to_owned()));
                             }
+                            // What agents that predate probes over SSH answer, and what a
+                            // relay could make up: never trusted.
+                            if serde_json::from_str::<ProbeResult>(&text).is_ok() {
+                                return Err(RevttyError::message(
+                                    "the probe was answered without SSH, as older revtty agents \
+                                     do; upgrade revtty on the target",
+                                ));
+                            }
 
                             return Err(RevttyError::message(
                                 "unexpected text frame on binary session transport",
@@ -120,14 +128,18 @@ pub fn websocket_byte_stream(
 }
 
 /// Waits briefly for the bridge to close the tunnel after the SSH session released the
-/// stream, then stops it.
-pub async fn finish_byte_stream(mut bridge: JoinHandle<Result<(), RevttyError>>) {
-    if tokio::time::timeout(BRIDGE_CLOSE_WAIT, &mut bridge)
-        .await
-        .is_err()
-    {
-        bridge.abort();
-        let _ = bridge.await;
+/// stream, then stops it. Returns the error the bridge ended with, if any.
+pub async fn finish_byte_stream(
+    mut bridge: JoinHandle<Result<(), RevttyError>>,
+) -> Option<RevttyError> {
+    match tokio::time::timeout(BRIDGE_CLOSE_WAIT, &mut bridge).await {
+        Ok(Ok(Err(error))) => Some(error),
+        Ok(_) => None,
+        Err(_) => {
+            bridge.abort();
+            let _ = bridge.await;
+            None
+        }
     }
 }
 
@@ -147,7 +159,7 @@ pub fn relay_client() -> Result<Client, RevttyError> {
     Client::builder()
         .http1_only()
         .redirect(reqwest::redirect::Policy::custom(
-            |attempt| match refuse_remote_plaintext(attempt.url().as_str()) {
+            |attempt| match check_relay_url(attempt.url().as_str()) {
                 Ok(()) => reqwest::redirect::Policy::default().redirect(attempt),
                 Err(error) => attempt.error(error.to_string()),
             },
@@ -232,7 +244,7 @@ pub fn http_url(relay: &str, path: &str) -> Result<String, RevttyError> {
     }
 
     let base = relay.trim_end_matches('/');
-    let base = if let Some(rest) = base.strip_prefix("wss://") {
+    let http_base = if let Some(rest) = base.strip_prefix("wss://") {
         format!("https://{rest}")
     } else if let Some(rest) = base.strip_prefix("ws://") {
         format!("http://{rest}")
@@ -244,9 +256,10 @@ pub fn http_url(relay: &str, path: &str) -> Result<String, RevttyError> {
         ));
     };
 
-    let url = format!("{base}{path}");
-    refuse_remote_plaintext(&url)?;
-    Ok(url)
+    // As given: the conversion keeps the host and whether TLS is used, and an error names
+    // the scheme the user wrote.
+    check_relay_url(base)?;
+    Ok(format!("{http_base}{path}"))
 }
 
 pub fn websocket_url(relay: &str, path: &str) -> Result<String, RevttyError> {
@@ -255,7 +268,7 @@ pub fn websocket_url(relay: &str, path: &str) -> Result<String, RevttyError> {
     }
 
     let base = relay.trim_end_matches('/');
-    let base = if let Some(rest) = base.strip_prefix("https://") {
+    let websocket_base = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = base.strip_prefix("http://") {
         format!("ws://{rest}")
@@ -267,9 +280,25 @@ pub fn websocket_url(relay: &str, path: &str) -> Result<String, RevttyError> {
         ));
     };
 
-    let url = format!("{base}{path}");
-    refuse_remote_plaintext(&url)?;
-    Ok(url)
+    check_relay_url(base)?;
+    Ok(format!("{websocket_base}{path}"))
+}
+
+/// A relay URL revtty sends requests to: plain http:// or ws:// only on this machine, and
+/// no user name or password. reqwest would send those as Basic credentials ahead of the
+/// bearer token the relay reads, so they never authenticate anything, while every place
+/// that stores or shows the URL would keep or print them. The error never quotes the URL.
+fn check_relay_url(url: &str) -> Result<(), RevttyError> {
+    refuse_remote_plaintext(url)?;
+
+    let parsed =
+        reqwest::Url::parse(url).map_err(|error| RevttyError::runtime("parse relay URL", error))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(RevttyError::message(
+            "relay URL must not contain a user name or password",
+        ));
+    }
+    Ok(())
 }
 
 /// Every request to the relay carries a bearer credential (enrollment, control, tunnel or
@@ -475,6 +504,78 @@ mod tests {
             assert!(http_url(relay, "/health").is_ok(), "{relay}");
             assert!(websocket_url(relay, "/v1/agent/demo").is_ok(), "{relay}");
         }
+    }
+
+    #[test]
+    fn refuses_relay_urls_with_credentials() {
+        for relay in [
+            "https://alice:SECRETPW@relay.example.com",
+            "wss://alice@relay.example.com",
+            "http://:SECRETPW@127.0.0.1:8787",
+        ] {
+            for error in [
+                http_url(relay, "/health").expect_err(relay),
+                websocket_url(relay, "/v1/agent/demo").expect_err(relay),
+            ] {
+                let error = error.to_string();
+                assert!(error.contains("user name or password"), "{relay}: {error}");
+                assert!(
+                    !error.contains("SECRETPW") && !error.contains("alice"),
+                    "{relay}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refused_relay_urls_are_shown_with_the_scheme_given() {
+        let error = http_url("ws://relay.example.com", "/health")
+            .expect_err("remote ws://")
+            .to_string();
+        assert!(error.contains("ws://relay.example.com"), "{error}");
+        let error = websocket_url("http://relay.example.com", "/v1/agent/demo")
+            .expect_err("remote http://")
+            .to_string();
+        assert!(error.contains("http://relay.example.com"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn relay_client_does_not_follow_a_redirect_to_credentials() {
+        use axum::http::StatusCode;
+        use axum::http::header::LOCATION;
+        use axum::routing::post;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirecting relay");
+        let address = listener.local_addr().expect("redirecting relay address");
+        // Followed, it would land on this server: loopback, so only the credentials refuse it.
+        let location = format!("http://alice:SECRETPW@{address}/landed");
+        let app = axum::Router::new()
+            .route(
+                "/to-credentials",
+                post(
+                    move || async move { (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, location)]) },
+                ),
+            )
+            .route("/landed", post(|| async { StatusCode::NO_CONTENT }));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve redirecting relay");
+        });
+
+        let refused = super::relay_client()
+            .expect("relay client")
+            .post(format!("http://{address}/to-credentials"))
+            .json(&"rve_secret")
+            .send()
+            .await
+            .expect_err("followed a redirect to a URL with credentials");
+        assert!(refused.is_redirect(), "{refused:?}");
+        let error = crate::error::with_sources(&refused);
+        assert!(error.contains("user name or password"), "{error}");
+        assert!(!error.contains("SECRETPW"), "{error}");
     }
 
     #[tokio::test]

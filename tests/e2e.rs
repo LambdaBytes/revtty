@@ -592,6 +592,66 @@ fn agent_recovers_after_relay_restart() {
 }
 
 #[test]
+fn relay_stops_on_sigterm_and_audits_the_sessions_it_ends() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (mut relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let agent_process = start_agent(&root, &agent);
+
+    let mut terminal = Terminal::connect(&operator, &url, Some(&host_key));
+    terminal.wait_ready(Duration::from_secs(20), &[&relay, &agent_process]);
+
+    // `systemctl stop` sends SIGTERM.
+    let relay_pid = relay.child.id().to_string();
+    let signalled = Command::new("kill")
+        .args(["-TERM", &relay_pid])
+        .status()
+        .expect("send SIGTERM to relay");
+    assert!(signalled.success());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Ok(Some(status)) = relay.child.try_wait() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "relay did not stop within 5 s of SIGTERM:\n{}",
+            relay.log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "relay exited with {status} after SIGTERM:\n{}",
+        relay.log()
+    );
+
+    let ended = terminal
+        .wait_exit(Duration::from_secs(10))
+        .expect("revtty connect kept running after the relay stopped");
+    assert_eq!(ended.exit_code(), 255);
+
+    // Recorded by the relay that ended the session, not left open for its next start.
+    let db = root.path("relay.db");
+    let sessions = relay_role.run(&[
+        "relay",
+        "sessions",
+        "--db",
+        db.to_str().expect("utf-8 path"),
+    ]);
+    let shell = sessions
+        .lines()
+        .find(|line| line.contains("\tshell\t"))
+        .unwrap_or_else(|| panic!("no shell session audited:\n{sessions}"));
+    assert!(
+        shell.contains("outcome=interrupted") && !shell.contains("ended=-"),
+        "shell session not closed by the stopping relay: {shell}"
+    );
+}
+
+#[test]
 fn first_contact_requires_host_key_confirmation() {
     let root = TempRoot::new();
     let (operator, agent, relay_role) = prepare(&root);
@@ -913,7 +973,7 @@ fn unencrypted_relays_are_refused_off_loopback() {
         "rve_unused",
     ]);
     assert!(
-        redirected.contains("redirect") && !redirected.contains("dns error"),
+        redirected.contains("refusing unencrypted relay URL") && !redirected.contains("dns error"),
         "{redirected}"
     );
     assert!(!agent.config.join("agent.toml").exists());
@@ -950,6 +1010,200 @@ fn unencrypted_relays_are_refused_off_loopback() {
     assert!(stderr.contains("unencrypted"), "{stderr}");
 }
 
+/// Runs `args` until it exits, at most `within`; panics if it keeps running.
+fn run_until_exit(role: &Role, args: &[&str], within: Duration) -> std::process::Output {
+    let mut run = role
+        .command()
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn revtty");
+    let deadline = Instant::now() + within;
+    while run.try_wait().expect("poll revtty").is_none() {
+        if Instant::now() >= deadline {
+            let _ = run.kill();
+            let _ = run.wait();
+            panic!("revtty {args:?} kept running");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    run.wait_with_output().expect("revtty output")
+}
+
+#[test]
+fn relay_urls_with_credentials_are_refused() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    // reqwest sends them as Basic credentials, which authenticate nothing at the relay.
+    let with_credentials = url.replacen("http://", "http://alice:SECRETPW@", 1);
+    let token = enrollment_token(&root, &relay_role, &operator, false);
+
+    let refused = agent.run_failing(&[
+        "agent",
+        "enroll",
+        "--relay",
+        &with_credentials,
+        "--token",
+        &token,
+    ]);
+    assert!(refused.contains("user name or password"), "{refused}");
+    assert!(!refused.contains("SECRETPW"), "{refused}");
+    assert!(!agent.config.join("agent.toml").exists());
+
+    // An agent an older version enrolled with them keeps them out of its output and stops.
+    agent.run(&["agent", "enroll", "--relay", &url, "--token", &token]);
+    let config_path = agent.config.join("agent.toml");
+    let config = std::fs::read_to_string(&config_path).expect("read agent config");
+    std::fs::write(&config_path, config.replace(&url, &with_credentials))
+        .expect("store a relay with credentials");
+
+    let status = agent.run(&["agent", "status"]);
+    assert!(
+        status.contains("relay      refused: relay URL must not contain a user name or password"),
+        "{status}"
+    );
+    assert!(!status.contains("SECRETPW"), "{status}");
+
+    let run = run_until_exit(&agent, &["agent", "run"], Duration::from_secs(15));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success(), "{stderr}");
+    assert!(stderr.contains("user name or password"), "{stderr}");
+    assert!(!stderr.contains("SECRETPW"), "{stderr}");
+}
+
+#[test]
+fn operator_request_errors_show_their_cause() {
+    let root = TempRoot::new();
+    let (operator, _agent, _relay_role) = prepare(&root);
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+    let url = format!("http://{}", closed.local_addr().expect("reserved port"));
+    drop(closed);
+
+    for args in [
+        vec!["list", "--relay", &url],
+        vec!["status", AGENT_NAME, "--relay", &url],
+    ] {
+        let failed = operator.run_failing(&args);
+        assert!(failed.contains("refused"), "{args:?}: {failed}");
+    }
+}
+
+/// Stands in for the enrolled agent on its control connection and answers the first probe
+/// offer as agents did before probes went over SSH, and as a relay could on its own: a
+/// `ProbeResult` in a text frame, with no SSH session to prove the pinned host key.
+fn answer_probe_without_ssh(url: &str, control_token: &str) {
+    use futures_util::{SinkExt, StreamExt};
+    use reqwest_websocket::{CloseCode, Message, Upgrade};
+
+    let relay = url.replace("http://", "ws://");
+    let token = control_token.to_owned();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fake agent runtime");
+        runtime.block_on(async move {
+            let client = reqwest::Client::new();
+            let mut control = client
+                .get(format!("{relay}/v1/agent/{AGENT_NAME}"))
+                .bearer_auth(&token)
+                .upgrade()
+                .send()
+                .await
+                .expect("fake agent control upgrade")
+                .into_websocket()
+                .await
+                .expect("fake agent control connection");
+            let hello = serde_json::json!({
+                "type": "hello",
+                "version": 1,
+                "name": AGENT_NAME,
+                "agent_version": "0.1.0",
+                "active_sessions": 0,
+                "max_sessions": 4,
+            });
+            control
+                .send(Message::Text(hello.to_string()))
+                .await
+                .expect("send fake hello");
+
+            while let Some(Ok(message)) = control.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let offer: serde_json::Value =
+                    serde_json::from_str(&text).expect("decode control message");
+                if offer["type"] != "probe_offer" {
+                    continue;
+                }
+                let session_id = offer["session_id"].as_str().expect("session id");
+                let tunnel_token = offer["tunnel_token"].as_str().expect("tunnel token");
+                let accept = serde_json::json!({
+                    "type": "session_accept",
+                    "version": 1,
+                    "session_id": session_id,
+                });
+                control
+                    .send(Message::Text(accept.to_string()))
+                    .await
+                    .expect("accept probe");
+
+                let mut tunnel = client
+                    .get(format!("{relay}/v1/session/{session_id}"))
+                    .bearer_auth(tunnel_token)
+                    .upgrade()
+                    .send()
+                    .await
+                    .expect("fake tunnel upgrade")
+                    .into_websocket()
+                    .await
+                    .expect("fake tunnel");
+                let answer = serde_json::json!({
+                    "name": AGENT_NAME,
+                    "os": "linux",
+                    "arch": "x86_64",
+                    "version": "0.1.0",
+                });
+                tunnel
+                    .send(Message::Text(answer.to_string()))
+                    .await
+                    .expect("send probe answer");
+                let _ = tunnel.close(CloseCode::Normal, None).await;
+                return;
+            }
+        });
+    });
+}
+
+#[test]
+fn a_probe_answered_without_ssh_is_refused() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+
+    // The enrolled agent's control credential, used by a process that is not revtty.
+    let config = std::fs::read_to_string(agent.config.join("agent.toml")).expect("read agent.toml");
+    let config: toml::Table = toml::from_str(&config).expect("parse agent.toml");
+    let control_token = config["control_token"].as_str().expect("control token");
+    answer_probe_without_ssh(&url, control_token);
+    relay.wait_for_log("agent online", Duration::from_secs(10));
+
+    let refused = operator.run_failing(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+    assert!(!refused.contains("reachable"), "{refused}");
+    assert!(refused.contains("answered without SSH"), "{refused}");
+}
+
 #[test]
 fn busy_agent_is_reported_to_probe() {
     let root = TempRoot::new();
@@ -964,6 +1218,38 @@ fn busy_agent_is_reported_to_probe() {
         &["--max-sessions", "1"],
     );
     let agent_process = start_agent(&root, &agent);
+
+    // A probe ends its SSH session cleanly and gives the only slot back for the next one.
+    let db = root.path("relay.db");
+    let db = db.to_str().expect("utf-8 path");
+    for probes in 1..=2 {
+        let probed = operator.run(&[
+            "probe",
+            AGENT_NAME,
+            "--relay",
+            &url,
+            "--host-key",
+            &host_key,
+        ]);
+        assert!(probed.contains("status   reachable"), "{probed}");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let sessions = relay_role.run(&["relay", "sessions", "--db", db]);
+            let completed = sessions
+                .lines()
+                .filter(|line| line.contains("\tprobe\t") && line.contains("outcome=completed"))
+                .count();
+            if completed == probes {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "probe {probes} not audited as completed:\n{sessions}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 
     // The only session slot is taken by an open shell.
     let mut terminal = Terminal::connect(&operator, &url, Some(&host_key));

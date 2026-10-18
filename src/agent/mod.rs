@@ -182,7 +182,12 @@ async fn enroll_with(
         .json(&request)
         .send()
         .await
-        .map_err(|error| RevttyError::runtime("send enrollment request", error))?;
+        .map_err(|error| {
+            RevttyError::runtime(
+                "send enrollment request",
+                crate::error::with_sources(&error),
+            )
+        })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -524,19 +529,30 @@ async fn run_control_once(
                                 let client = client.clone();
                                 let relay = relay.to_owned();
                                 let name = name.to_owned();
+                                let allowlist = allowlist.clone();
                                 let task_session_id = session_id.clone();
+                                let shell_shutdown = shell_shutdown.clone();
 
+                                // Over SSH, as a shell: the agent checks the operator against
+                                // its own list and proves its host key.
                                 let task = tokio::spawn(async move {
                                     let _permit = permit;
-                                    if let Err(error) = send_probe(
-                                        &client,
-                                        &relay,
-                                        &tunnel_token,
-                                        &task_session_id,
-                                        &name,
-                                    )
-                                    .await
-                                    {
+                                    let probed = match probe_answer(&name) {
+                                        Ok(answer) => {
+                                            ssh::serve(
+                                                &client,
+                                                &relay,
+                                                &tunnel_token,
+                                                &task_session_id,
+                                                allowlist,
+                                                shell_shutdown,
+                                                ssh::SessionKind::Probe(answer),
+                                            )
+                                            .await
+                                        }
+                                        Err(error) => Err(error),
+                                    };
+                                    if let Err(error) = probed {
                                         eprintln!("probe {task_session_id} failed: {error}");
                                     }
                                 });
@@ -574,6 +590,7 @@ async fn run_control_once(
                                         &task_session_id,
                                         allowlist,
                                         shell_shutdown,
+                                        ssh::SessionKind::Shell,
                                     )
                                     .await
                                     {
@@ -735,16 +752,8 @@ async fn send_frame(
     }
 }
 
-async fn send_probe(
-    client: &reqwest::Client,
-    relay: &str,
-    tunnel_token: &str,
-    session_id: &str,
-    name: &str,
-) -> Result<(), RevttyError> {
-    let path = format!("/v1/session/{session_id}");
-    let mut websocket = connect_websocket(client, relay, &path, tunnel_token).await?;
-
+/// What a probe session answers to `PROBE_COMMAND`.
+fn probe_answer(name: &str) -> Result<String, RevttyError> {
     let result = ProbeResult {
         name: name.to_owned(),
         os: std::env::consts::OS.to_owned(),
@@ -752,18 +761,8 @@ async fn send_probe(
         version: env!("CARGO_PKG_VERSION").to_owned(),
     };
 
-    let text = serde_json::to_string(&result)
-        .map_err(|error| RevttyError::runtime("encode probe result", error))?;
-
-    websocket
-        .send(Message::Text(text))
-        .await
-        .map_err(|error| RevttyError::runtime("send probe result", websocket_error(error)))?;
-
-    websocket
-        .close(reqwest_websocket::CloseCode::Normal, None)
-        .await
-        .map_err(|error| RevttyError::runtime("close probe session", websocket_error(error)))
+    serde_json::to_string(&result)
+        .map_err(|error| RevttyError::runtime("encode probe result", error))
 }
 
 pub fn pty_test() -> Result<(), RevttyError> {
@@ -833,7 +832,11 @@ pub fn status() -> Result<(), RevttyError> {
     let identity = ensure_agent(&paths)?;
 
     println!("agent      {}", config.name);
-    println!("relay      {}", config.relay);
+    // A URL `agent run` refuses is not shown: it may hold a password.
+    match http_url(&config.relay, "/") {
+        Ok(_) => println!("relay      {}", config.relay),
+        Err(error) => println!("relay      refused: {error}"),
+    }
     println!("id         {}", config.agent_id);
     println!("host       {}", identity.fingerprint);
     println!("sessions   {}", config.max_sessions);

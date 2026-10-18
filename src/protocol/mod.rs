@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
 pub const OPERATOR_AUTH_NAMESPACE: &str = "revtty-control-v1";
 pub const SESSION_ERROR_PREFIX: &str = "revtty-error:";
+/// The one command a probe session runs over SSH: the agent answers it with a `ProbeResult`
+/// in JSON and exit status 0.
+pub const PROBE_COMMAND: &str = "revtty-probe";
 /// Bound of an agent's operator list, which `OperatorsReport` carries whole in one message.
 /// Keys are reported without their comments, so the message stays far below the relay's
 /// 64 KiB limit, which would otherwise drop the control connection on every reconnect.

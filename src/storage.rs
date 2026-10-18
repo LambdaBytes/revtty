@@ -304,6 +304,36 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Occupies the database until `release` is signalled, so that other calls queue behind
+    /// it; `held` is signalled once it does.
+    #[cfg(test)]
+    pub(crate) async fn hold(
+        &self,
+        held: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let _ = self
+            .conn
+            .call(move |_| {
+                let _ = held.send(());
+                let _ = release.recv();
+                Ok::<_, StoreError>(())
+            })
+            .await;
+    }
+
+    /// Every write fails from now on, as on a database that has gone read-only.
+    #[cfg(test)]
+    pub(crate) async fn refuse_writes(&self) {
+        self.conn
+            .call(|conn| {
+                conn.execute_batch("PRAGMA query_only = ON")?;
+                Ok::<_, StoreError>(())
+            })
+            .await
+            .expect("make the database read-only");
+    }
+
     /// A single-use enrollment for a new agent; the name must not be enrolled yet.
     pub async fn create_enrollment(
         &self,

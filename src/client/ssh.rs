@@ -11,8 +11,10 @@ use russh::keys::{Algorithm, PrivateKey, PublicKey, PublicKeyOrCertificate};
 use russh::{Channel, ChannelMsg, Disconnect, Preferred, client};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::error::RevttyError;
+use crate::protocol::{PROBE_COMMAND, ProbeResult};
 use crate::transport::{SSH_TIMEOUTS, SshTimeouts, finish_byte_stream, websocket_byte_stream};
 
 const STDIN_CHUNK: usize = 4096;
@@ -20,6 +22,10 @@ const STDIN_QUEUE_DEPTH: usize = 16;
 /// Bound on key exchange plus operator authentication; russh does not bound the wait for
 /// the agent's banner on the client side.
 const SSH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// From the authenticated session to the agent's whole answer to `PROBE_COMMAND`.
+const PROBE_ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+/// A probe answer is a few short strings.
+const PROBE_ANSWER_LIMIT: usize = 4096;
 
 struct ClientHandler {
     expected_server_key: PublicKey,
@@ -195,13 +201,11 @@ where
         .map_err(|_| RevttyError::message("SSH handshake with the agent timed out"))?
 }
 
-/// Runs an interactive terminal session; returns the remote exit status, or `None` when the
-/// session ended without one (for example because the agent went away).
-pub async fn connect_terminal(
-    websocket: WebSocket,
+/// The operator's private key and the pinned agent host key a session authenticates with.
+fn session_keys(
     operator_key_path: &Path,
     encoded_host_key: &str,
-) -> Result<Option<u32>, RevttyError> {
+) -> Result<(PrivateKey, PublicKey), RevttyError> {
     let operator_key = PrivateKey::read_openssh_file(operator_key_path)
         .map_err(|error| RevttyError::runtime("read operator SSH private key", error))?;
     let expected_server_key = PublicKey::from_openssh(encoded_host_key)
@@ -213,6 +217,124 @@ pub async fn connect_terminal(
         ));
     }
 
+    Ok((operator_key, expected_server_key))
+}
+
+/// Ends the transport under a finished session. When the session failed because its
+/// transport did, as when the relay explains a refused session, that is the error to report:
+/// the session can fail on the closed stream before the transport task has returned it.
+async fn finish_session<T>(
+    result: Result<T, RevttyError>,
+    bridge_task: JoinHandle<Result<(), RevttyError>>,
+) -> Result<T, RevttyError> {
+    let transport_error = finish_byte_stream(bridge_task).await;
+    match (result, transport_error) {
+        (Err(_), Some(error)) => Err(error),
+        (result, _) => result,
+    }
+}
+
+/// Runs `PROBE_COMMAND` on the agent over SSH and returns its answer: the session proves the
+/// pinned host key, and the agent checks the operator's key against its own list.
+pub async fn run_probe(
+    websocket: WebSocket,
+    operator_key_path: &Path,
+    encoded_host_key: &str,
+    target: &str,
+) -> Result<ProbeResult, RevttyError> {
+    let (operator_key, expected_server_key) = session_keys(operator_key_path, encoded_host_key)?;
+    let (stream, bridge_task) = websocket_byte_stream(websocket);
+
+    let result = async {
+        let session = open_session(
+            stream,
+            client_config(SSH_TIMEOUTS),
+            expected_server_key,
+            operator_key,
+            SSH_HANDSHAKE_TIMEOUT,
+        )
+        .await?;
+
+        let answer = tokio::time::timeout(PROBE_ANSWER_TIMEOUT, probe_answer(&session, target))
+            .await
+            .unwrap_or_else(|_| {
+                Err(RevttyError::message(format!(
+                    "the agent did not answer the probe within {}s",
+                    PROBE_ANSWER_TIMEOUT.as_secs()
+                )))
+            });
+        // Hanging up ends the agent's session and gives its slot back.
+        let _ = session
+            .disconnect(Disconnect::ByApplication, "", "English")
+            .await;
+        answer
+    }
+    .await;
+
+    finish_session(result, bridge_task).await
+}
+
+/// The answer of the agent `session` reached, which must call itself `target`.
+async fn probe_answer(
+    session: &client::Handle<ClientHandler>,
+    target: &str,
+) -> Result<ProbeResult, RevttyError> {
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(|error| RevttyError::runtime("open SSH probe channel", error))?;
+    channel
+        .exec(true, PROBE_COMMAND)
+        .await
+        .map_err(|error| RevttyError::runtime("request probe", error))?;
+
+    let mut answer = Vec::new();
+    let mut exit_status = None;
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Failure) => {
+                return Err(RevttyError::message("the agent refused the probe"));
+            }
+            Some(ChannelMsg::Data { data }) => {
+                if answer.len() + data.len() > PROBE_ANSWER_LIMIT {
+                    return Err(RevttyError::message(format!(
+                        "the agent's probe answer exceeds {PROBE_ANSWER_LIMIT} bytes"
+                    )));
+                }
+                answer.extend_from_slice(&data);
+            }
+            Some(ChannelMsg::ExitStatus {
+                exit_status: status,
+            }) => exit_status = Some(status),
+            Some(ChannelMsg::Close) | None => break,
+            Some(_) => {}
+        }
+    }
+
+    if exit_status != Some(0) {
+        return Err(RevttyError::message(
+            "the agent's probe ended without succeeding",
+        ));
+    }
+    let result: ProbeResult = serde_json::from_slice(&answer)
+        .map_err(|error| RevttyError::runtime("decode probe result", error))?;
+    if result.name != target {
+        return Err(RevttyError::message(format!(
+            "the agent answered the probe as {:?}, not as {target}",
+            result.name
+        )));
+    }
+    Ok(result)
+}
+
+/// Runs an interactive terminal session; returns the remote exit status, or `None` when the
+/// session ended without one (for example because the agent went away).
+pub async fn connect_terminal(
+    websocket: WebSocket,
+    operator_key_path: &Path,
+    encoded_host_key: &str,
+) -> Result<Option<u32>, RevttyError> {
+    let (operator_key, expected_server_key) = session_keys(operator_key_path, encoded_host_key)?;
     let (stream, bridge_task) = websocket_byte_stream(websocket);
 
     let result = async {
@@ -307,16 +429,7 @@ pub async fn connect_terminal(
     }
     .await;
 
-    if result.is_err() && bridge_task.is_finished() {
-        let bridge_result = bridge_task.await;
-        return match bridge_result {
-            Ok(Err(error)) => Err(error),
-            _ => result,
-        };
-    }
-
-    finish_byte_stream(bridge_task).await;
-    result
+    finish_session(result, bridge_task).await
 }
 
 #[cfg(test)]
@@ -329,9 +442,14 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{ClientHandler, client_config, ed25519_only, open_session, open_terminal_channel};
-    use crate::transport::SshTimeouts;
+    use super::{
+        ClientHandler, client_config, ed25519_only, open_session, open_terminal_channel,
+        probe_answer,
+    };
+    use crate::error::RevttyError;
+    use crate::protocol::ProbeResult;
     use crate::transport::test_support::{ControlledStream, StreamControl};
+    use crate::transport::{SSH_TIMEOUTS, SshTimeouts};
 
     struct HandshakeOnlyServer;
 
@@ -572,5 +690,102 @@ mod tests {
 
         server_task.abort();
         let _ = server_task.await;
+    }
+
+    const FORGED_ANSWER: &str = r#"{"name":"demo","os":"forged","arch":"x86_64","version":"0"}"#;
+
+    /// Answers the probe for any operator, as a relay posing as the agent would.
+    struct ProbeAnsweringServer;
+
+    impl server::Handler for ProbeAnsweringServer {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            _public_key: &PublicKey,
+        ) -> Result<server::Auth, Self::Error> {
+            Ok(server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<server::Msg>,
+            reply: server::ChannelOpenHandle,
+            _session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _data: &[u8],
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            session.data(channel, FORGED_ANSWER.as_bytes().to_vec())?;
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    /// A probe of `target` as `run_probe` makes it, to a server holding `server_key`, pinned
+    /// as `pinned`.
+    async fn probe_through(
+        server_key: PrivateKey,
+        pinned: PublicKey,
+        target: &str,
+    ) -> Result<ProbeResult, RevttyError> {
+        let server_config = server::Config {
+            keys: vec![server_key],
+            preferred: ed25519_only(),
+            ..Default::default()
+        };
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(running) =
+                server::run_stream(Arc::new(server_config), server_stream, ProbeAnsweringServer)
+                    .await
+            {
+                let _ = running.await;
+            }
+        });
+
+        let session = open_session(
+            client_stream,
+            client_config(SSH_TIMEOUTS),
+            pinned,
+            ed25519_key(),
+            Duration::from_secs(5),
+        )
+        .await?;
+        probe_answer(&session, target).await
+    }
+
+    #[tokio::test]
+    async fn only_the_pinned_host_key_can_answer_a_probe() {
+        // The server answers whoever asks: with the pinned key, its answer comes through.
+        let pinned = ed25519_key();
+        let pinned_key = pinned.public_key().clone();
+        let answer = probe_through(pinned.clone(), pinned_key.clone(), "demo")
+            .await
+            .expect("the pinned key answered");
+        assert_eq!(answer.os, "forged");
+
+        // With any other key, as a relay has, it is refused before it can say anything.
+        let Err(refused) = probe_through(ed25519_key(), pinned_key.clone(), "demo").await else {
+            panic!("a server without the pinned key answered the probe");
+        };
+        assert!(refused.to_string().contains("SSH transport"), "{refused}");
+
+        // Nor does the pinned key's answer count for another target.
+        let Err(misnamed) = probe_through(pinned, pinned_key, "other").await else {
+            panic!("an answer for demo counted as a probe of other");
+        };
+        assert!(misnamed.to_string().contains("not as other"), "{misnamed}");
     }
 }

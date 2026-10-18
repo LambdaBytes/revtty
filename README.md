@@ -31,7 +31,7 @@ Design principles, scope and roadmap: [docs/BRIEF.md](docs/BRIEF.md), [docs/V1_S
 **Access**
 
 - Interactive shell on a real PTY of an enrolled Linux or macOS machine: input, output, live resize, EOF, and the remote exit status as `revtty connect`'s exit code (255 when the session ended without one).
-- `probe` checks a target end to end; `list` and `status` show presence: online/offline, last seen, version, sessions in use and allowed.
+- `probe` checks a target end to end, over SSH as a shell does: the agent checks the operator against its own list and proves its pinned host key, so the relay cannot answer for it. `list` and `status` show presence: online/offline, last seen, version, sessions in use and allowed.
 - Several concurrent sessions per agent (default 4, up to 64); extra requests get an explicit "agent is busy".
 
 **Security**
@@ -45,6 +45,7 @@ Design principles, scope and roadmap: [docs/BRIEF.md](docs/BRIEF.md), [docs/V1_S
 - The agent authenticates the operator's key again inside SSH, against its own operator list in `agent.toml`. Only Ed25519 keys are accepted.
 - Operators are managed on the target with `revtty agent operator list|add|revoke`, locally or from an operator's `revtty connect` shell. The running agent applies a change within 2 seconds: a revoked operator's open sessions are closed and new ones refused. The last operator cannot be revoked.
 - The relay learns the agent's operator list from the agent, and issues session credentials only to those operators; it cannot add one, because the agent's own list decides SSH access.
+- Relay URLs with a user name or password are refused: revtty authenticates with its own credentials, and would otherwise store and print them.
 
 **Reliability**
 
@@ -52,6 +53,7 @@ Design principles, scope and roadmap: [docs/BRIEF.md](docs/BRIEF.md), [docs/V1_S
 - The relay drops agents that stop sending heartbeats, so `status` does not report vanished machines as online.
 - SSH keepalives on both ends: idle sessions stay open, sessions on a dead network path end and free their slot.
 - Shell teardown never injects input, reaps the shell (SIGHUP, then SIGKILL after 5 s) and releases the PTY; on SIGINT the agent waits up to 10 s for these teardowns before it exits.
+- On SIGINT or SIGTERM, `relay serve` stops accepting connections, finishes the requests in flight, ends its control connections and sessions, and writes their audit records (sessions `interrupted`) before it exits, within 5 s.
 
 **Operations**
 
@@ -134,7 +136,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | `init` | operator | Create or show the operator identity. |
 | `list --relay URL` | operator | Agents enrolled for this operator key, with presence and capacity. |
 | `status NAME --relay URL [--host-key FP]` | operator | One agent's status. |
-| `probe NAME --relay URL [--host-key FP]` | operator | Round trip through the agent: name, OS, architecture, version. |
+| `probe NAME --relay URL [--host-key FP]` | operator | Round trip through the agent over SSH: name, OS, architecture, version. |
 | `connect NAME --relay URL [--host-key FP]` | operator | Interactive shell; exits with the remote status. |
 | `doctor --relay URL` | operator | Local permissions, relay reachability and signed authentication. |
 | `pair NAME --token TOKEN --relay URL` | operator | Wrap an enrollment token in a pairing code for the target; nothing is sent. |
@@ -168,6 +170,7 @@ On Linux the defaults are `~/.config/revtty` and `~/.local/share/revtty`; `REVTT
 - **Not yet validated** across a real NAT/CGNAT boundary or under real network loss; local tests cover relay restarts and silent peers.
 - **No roles**: every authorized operator of an agent can manage its operators.
 - **Pairing codes need both ends updated**: an operator client that predates them pins the first host key by confirmation, as before. A pairing code covers the agent's first operator only; operators added later confirm the host key themselves.
+- **Probes need both ends updated**: an operator client of this version refuses a probe answered without SSH, as older agents answer it, and an older client gets no answer from a newer agent, which ends the session after 45 s.
 - **One relay process**: agent presence lives in its memory; there is no clustering or high availability.
 - **Not yet**: rate limiting, packages or signed release artifacts, a launchd service for macOS agents, Windows support.
 - **Audit is best effort**: records are written asynchronously and dropped with a warning if the queue fills up.

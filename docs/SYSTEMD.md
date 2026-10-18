@@ -27,7 +27,7 @@ sudo install -d -m 0700 -o "$ACCOUNT" -g "$GROUP" \
   "/var/lib/revtty/$ACCOUNT/state"
 ```
 
-Enroll as that same account, with the same paths used by the unit:
+Enroll as that same account, with the same paths used by the unit, and the pairing code the operator made with `revtty pair` from the enrollment token:
 
 ```bash
 sudo -u "$ACCOUNT" env \
@@ -35,10 +35,12 @@ sudo -u "$ACCOUNT" env \
   REVTTY_STATE_DIR="/var/lib/revtty/$ACCOUNT/state" \
   /usr/bin/revtty agent enroll \
     --relay https://revtty.example.com \
-    --token <single-use-enrollment-token>
+    --pairing-code <code-from-revtty-pair>
 ```
 
-`agent enroll` prints the agent's host key fingerprint (`host`). Give it to the operators: their first `status`, `probe` or `connect` pins the key with `--host-key <fingerprint>` or after confirming it interactively.
+Give the code only as `--pairing-code`, never as `--token`: a revtty that predates pairing codes would send its secret to the relay. Without a code, `--token <single-use-enrollment-token>` enrolls the same way.
+
+`agent enroll` prints the operator's fingerprint, `verified by pairing code` or, with `--token`, `as reported by the relay, not verified`, and the agent's host key fingerprint (`host`). With a pairing code, the operator's first `status`, `probe` or `connect` pins the host key the agent proved. With a token, give the operators the fingerprint: they pin it with `--host-key <fingerprint>` or by typing it at the prompt.
 
 Then enable the service:
 

@@ -41,7 +41,7 @@ Fields:
 
 ### probe_offer
 
-Relay asks the agent to open the data side of a probe rendezvous.
+Relay asks the agent to open the data side of a probe rendezvous. The agent serves SSH on it, as for a shell, and answers only `exec revtty-probe`: a `ProbeResult` in JSON (`name`, `os`, `arch`, `version`) on the channel, exit status 0, then EOF and close. A PTY, a shell or any other command is refused, and the session ends after 45 s at most. The operator hangs up once it has the answer.
 
 Fields:
 
@@ -188,6 +188,8 @@ operator WSS ===== opaque relay ===== agent WSS
                                      PTY
 ```
 
+A probe takes the same path; the agent's SSH server answers `revtty-probe` instead of starting a PTY.
+
 SSH performs agent host authentication and operator public-key authentication independently of the relay control authorization.
 
 ## Implemented invariants
@@ -207,6 +209,8 @@ SSH performs agent host authentication and operator public-key authentication in
 - A pairing secret never reaches the relay; with a pairing code the agent keeps no operator the code was not made for, and the operator pins no host key the agent did not prove.
 - Operator session credentials, control connections and sessions belong to one enrolled agent instance; when it is removed or re-enrolled, the relay closes them within its removal sweep (5 s), data tunnels included.
 - The relay can route terminal data without understanding the SSH payload.
+- A probe answer counts only over SSH, from the pinned host key, to an operator on the agent's own list; an answer in a text frame is refused.
+- A relay stopping on SIGINT or SIGTERM admits no new connection, ends every session as `interrupted` and writes its audit records before it exits, within 5 s.
 - Secret-bearing control types do not derive debug formatting.
 
 ## Required before the stable v1 protocol

@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::{Future, IntoFuture};
 use std::path::Path as FsPath;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -17,7 +18,8 @@ use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use ssh_key::{Algorithm, HashAlg, PublicKey, SshSig};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::error::RevttyError;
@@ -54,6 +56,9 @@ struct RelayTimeouts {
     /// How often the relay checks that the agents it serves are still enrolled, closing the
     /// connections of removed or re-enrolled ones.
     removal_sweep: Duration,
+    /// From SIGINT or SIGTERM until the relay has finished the requests in flight, ended its
+    /// connections and written their audit records.
+    shutdown: Duration,
 }
 
 const RELAY_TIMEOUTS: RelayTimeouts = RelayTimeouts {
@@ -63,6 +68,7 @@ const RELAY_TIMEOUTS: RelayTimeouts = RelayTimeouts {
     agent_accept: Duration::from_secs(5),
     data_tunnel: Duration::from_secs(10),
     removal_sweep: Duration::from_secs(5),
+    shutdown: Duration::from_secs(5),
 };
 
 /// A session transition and when it happened (Unix seconds): the write may run later.
@@ -87,12 +93,15 @@ enum AuditEvent {
         outcome: String,
         at: i64,
     },
+    /// Answered once every record queued before it is handled, with how many of those since
+    /// the previous flush could not be written.
+    Flush(oneshot::Sender<usize>),
 }
 
 /// Session audit records, written in order by one background task so the session path
 /// never waits on SQLite. Audit is best effort: a full queue drops a record with a warning
-/// instead of stalling sessions, and records still queued when the relay stops are lost
-/// (the next start marks those sessions interrupted).
+/// instead of stalling sessions. A relay that stops writes what is queued first; one that
+/// is killed loses it, and its next start marks those sessions interrupted.
 #[derive(Clone)]
 struct AuditLog {
     events: mpsc::Sender<AuditEvent>,
@@ -103,6 +112,7 @@ impl AuditLog {
         let (events, mut queue) = mpsc::channel(AUDIT_QUEUE_DEPTH);
 
         tokio::spawn(async move {
+            let mut unwritten = 0;
             while let Some(event) = queue.recv().await {
                 let written = match event {
                     AuditEvent::Requested {
@@ -127,9 +137,14 @@ impl AuditLog {
                     AuditEvent::Ended { id, outcome, at } => {
                         store.record_session_ended(&id, &outcome, at).await
                     }
+                    AuditEvent::Flush(written) => {
+                        let _ = written.send(std::mem::take(&mut unwritten));
+                        continue;
+                    }
                 };
 
                 if let Err(error) = written {
+                    unwritten += 1;
                     eprintln!("session audit write failed: {error}");
                 }
             }
@@ -176,6 +191,23 @@ impl AuditLog {
         });
     }
 
+    /// Returns once every record queued so far is handled: an error if one of those queued
+    /// since the previous flush could not be written.
+    async fn flush(&self) -> Result<(), RevttyError> {
+        let stopped = || RevttyError::message("the session audit writer has stopped");
+        let (written, flushed) = oneshot::channel();
+        self.events
+            .send(AuditEvent::Flush(written))
+            .await
+            .map_err(|_| stopped())?;
+        match flushed.await.map_err(|_| stopped())? {
+            0 => Ok(()),
+            unwritten => Err(RevttyError::message(format!(
+                "{unwritten} session audit records could not be written"
+            ))),
+        }
+    }
+
     /// Stamps the event now, when it happens, and queues it.
     fn record(&self, event: impl FnOnce(i64) -> AuditEvent) {
         let at = match crate::storage::unix_now() {
@@ -192,11 +224,76 @@ impl AuditLog {
     }
 }
 
+/// The relay's WebSocket tasks, which axum's graceful shutdown stops tracking once it has
+/// handed their connection over: shutdown ends them and waits for them through this.
+struct Lifecycle {
+    /// Cloned by every task that enters and taken when shutdown begins, so that no task
+    /// enters after that and `ended` closes once the last one is over.
+    entry: std::sync::Mutex<Option<mpsc::Sender<()>>>,
+    ended: Mutex<mpsc::Receiver<()>>,
+    stopping: watch::Sender<bool>,
+}
+
+/// Held by a running WebSocket task.
+struct LiveTask {
+    _entry: mpsc::Sender<()>,
+    stopping: watch::Receiver<bool>,
+}
+
+impl Lifecycle {
+    fn new() -> Self {
+        let (entry, ended) = mpsc::channel(1);
+        Self {
+            entry: std::sync::Mutex::new(Some(entry)),
+            ended: Mutex::new(ended),
+            stopping: watch::channel(false).0,
+        }
+    }
+
+    /// `None` once shutdown has begun: the task must not start.
+    fn enter(&self) -> Option<LiveTask> {
+        let entry = self.entry.lock().unwrap_or_else(PoisonError::into_inner);
+        entry.as_ref().map(|entry| LiveTask {
+            _entry: entry.clone(),
+            stopping: self.stopping.subscribe(),
+        })
+    }
+
+    fn begin_shutdown(&self) {
+        self.entry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        self.stopping.send_replace(true);
+    }
+
+    /// Resolves once shutdown has begun.
+    fn stopping(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut stopping = self.stopping.subscribe();
+        async move {
+            let _ = stopping.wait_for(|stopping| *stopping).await;
+        }
+    }
+
+    /// After `begin_shutdown`: resolves once every task that entered is over.
+    async fn tasks_ended(&self) {
+        while self.ended.lock().await.recv().await.is_some() {}
+    }
+}
+
+impl LiveTask {
+    /// Resolves once shutdown has begun, also when it began before this call.
+    async fn stopping(&mut self) {
+        let _ = self.stopping.wait_for(|stopping| *stopping).await;
+    }
+}
+
 #[derive(Clone)]
 struct RelayState {
     store: Store,
     audit: AuditLog,
     timeouts: RelayTimeouts,
+    lifecycle: Arc<Lifecycle>,
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
     pending: Arc<Mutex<HashMap<String, PendingSession>>>,
     challenges: Arc<ChallengeSigner>,
@@ -213,6 +310,7 @@ impl RelayState {
             audit: AuditLog::start(store.clone()),
             store,
             timeouts: RELAY_TIMEOUTS,
+            lifecycle: Arc::new(Lifecycle::new()),
             agents: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             challenges: Arc::new(ChallengeSigner::new()?),
@@ -528,6 +626,18 @@ pub async fn list_sessions(db: &FsPath, limit: u32) -> Result<(), RevttyError> {
 }
 
 pub async fn serve(bind: &str, db: &FsPath) -> Result<(), RevttyError> {
+    // Before the relay says it listens: a signal right after that must not kill it.
+    let mut interrupt = signal(SignalKind::interrupt())
+        .map_err(|error| RevttyError::runtime("listen for SIGINT", error))?;
+    let mut terminate = signal(SignalKind::terminate())
+        .map_err(|error| RevttyError::runtime("listen for SIGTERM", error))?;
+    let shutdown = async move {
+        tokio::select! {
+            _ = interrupt.recv() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+        }
+    };
+
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| RevttyError::runtime("bind relay", error))?;
@@ -544,13 +654,62 @@ pub async fn serve(bind: &str, db: &FsPath) -> Result<(), RevttyError> {
     }
     let state = RelayState::new(store)?;
     spawn_removal_sweep(state.clone());
-    let app = router(state);
 
     eprintln!("revtty relay listening on {address}");
+    serve_until(listener, state, shutdown).await
+}
 
-    axum::serve(listener, app)
-        .await
-        .map_err(|error| RevttyError::runtime("serve relay", error))
+/// Serves until `shutdown` resolves, then stops accepting connections, finishes the requests
+/// in flight, ends every control connection and operator session (audited `interrupted`) and
+/// writes the queued audit records, all within `timeouts.shutdown`.
+async fn serve_until(
+    listener: tokio::net::TcpListener,
+    state: RelayState,
+    shutdown: impl Future<Output = &'static str>,
+) -> Result<(), RevttyError> {
+    let lifecycle = Arc::clone(&state.lifecycle);
+    let audit = state.audit.clone();
+    let grace = state.timeouts.shutdown;
+    let server = axum::serve(listener, router(state))
+        .with_graceful_shutdown(lifecycle.stopping())
+        .into_future();
+    tokio::pin!(server);
+
+    let signal = tokio::select! {
+        served = &mut server => {
+            return served.map_err(|error| RevttyError::runtime("serve relay", error));
+        }
+        signal = shutdown => signal,
+    };
+    eprintln!("{signal}: relay stopping");
+    lifecycle.begin_shutdown();
+
+    let stopped = tokio::time::timeout(grace, async {
+        let served = server
+            .await
+            .map_err(|error| RevttyError::runtime("serve relay", error));
+        lifecycle.tasks_ended().await;
+        // Every session has queued its end by now.
+        let audited = audit.flush().await.map_err(|error| {
+            RevttyError::message(format!(
+                "{error}; the relay's next start marks the sessions still open as interrupted"
+            ))
+        });
+        served.and(audited)
+    })
+    .await;
+    match stopped {
+        Ok(Ok(())) => {
+            eprintln!("relay stopped");
+            Ok(())
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(RevttyError::message(format!(
+            "relay did not stop within {}s; its next start marks the sessions still open as \
+             interrupted",
+            grace.as_secs()
+        ))),
+    }
 }
 
 fn router(state: RelayState) -> Router {
@@ -579,7 +738,7 @@ async fn enroll_agent(
     State(state): State<RelayState>,
     Json(request): Json<EnrollRequest>,
 ) -> Response {
-    let host_key = match PublicKey::from_openssh(&request.host_key) {
+    let mut host_key = match PublicKey::from_openssh(&request.host_key) {
         Ok(key) if key.algorithm() == Algorithm::Ed25519 => key,
         Ok(_) => {
             return (
@@ -591,6 +750,10 @@ async fn enroll_agent(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid SSH host key").into_response(),
     };
 
+    // Key material only: the comment is text from whoever enrolled, handed to every
+    // operator, and a client before 4f30334 would write one with a line break into
+    // `known_hosts` as a pin of its own.
+    host_key.set_comment("");
     let host_key = match host_key.to_openssh() {
         Ok(key) => key,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -1041,7 +1204,16 @@ async fn persistent_agent_upgrade(
 
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_agent(socket, state, name, agent_id))
+        .on_upgrade(move |socket| async move {
+            let Some(mut task) = state.lifecycle.enter() else {
+                return;
+            };
+            // From the Hello on: a stopping relay must not wait for it.
+            tokio::select! {
+                () = handle_agent(socket, state, name, agent_id) => {}
+                () = task.stopping() => {}
+            }
+        })
         .into_response()
 }
 
@@ -1525,6 +1697,9 @@ async fn handle_operator_session(
     control: mpsc::Sender<ControlMessage>,
     kind: SessionKind,
 ) {
+    let Some(mut task) = state.lifecycle.enter() else {
+        return;
+    };
     let session_id = Uuid::new_v4().simple().to_string();
     // Audited before the sweep can see the session, so that even a session cancelled at once
     // has its request on record.
@@ -1556,6 +1731,14 @@ async fn handle_operator_session(
             state.audit.ended(&session_id, "agent_removed");
             eprintln!(
                 "{} {session_id} for {agent_name} closed: the agent was removed or re-enrolled",
+                kind.label()
+            );
+        }
+        () = task.stopping() => {
+            state.pending.lock().await.remove(&session_id);
+            state.audit.ended(&session_id, "interrupted");
+            eprintln!(
+                "{} {session_id} for {agent_name} closed: the relay is stopping",
                 kind.label()
             );
         }
@@ -1917,9 +2100,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        AgentDecision, AgentHandle, OperatorSession, PendingSession, RelayState, RelayTimeouts,
-        record_agent_decision, record_operators_report, router, spend_challenge,
+        AgentDecision, AgentHandle, Lifecycle, OperatorSession, PendingSession, RelayState,
+        RelayTimeouts, record_agent_decision, record_operators_report, router, serve_until,
+        spend_challenge,
     };
+    use crate::error::RevttyError;
     use crate::protocol::{
         AgentListResponse, AgentStatusResponse, CONTROL_PROTOCOL_VERSION, ControlMessage,
         EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
@@ -2159,6 +2344,58 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::CREATED);
         let auth: OperatorAuthResponse = response.json().await.expect("decode operator auth");
         assert_eq!(auth.host_key_proof.as_deref(), Some(proof.as_str()));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn host_keys_are_stored_without_their_comment() {
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let operator = ed25519_key();
+        let enrollment = store
+            .create_enrollment(
+                "commented",
+                &operator.public_key().to_openssh().expect("operator key"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("create enrollment");
+        let (_state, base, server) = http_relay(store.clone()).await;
+        let http = reqwest::Client::new();
+        let mut host_key = ed25519_key().public_key().clone();
+        host_key.set_comment("admin@secret-host");
+
+        let response = http
+            .post(format!("{base}/v1/enroll"))
+            .json(&EnrollRequest {
+                token: enrollment.token.expose().to_owned(),
+                host_key: host_key.to_openssh().expect("host key"),
+                version: "0.1.0".to_owned(),
+                host_key_proof: None,
+            })
+            .send()
+            .await
+            .expect("send enrollment");
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+
+        let agents = store.list_agents().await.expect("list agents");
+        assert!(
+            !agents[0].host_key.contains("secret-host"),
+            "{}",
+            agents[0].host_key
+        );
+        let challenge =
+            fetch_challenge(&http, format!("{base}/v1/operator/challenge/commented")).await;
+        let response = post_auth(&http, &base, "commented", &operator, &challenge).await;
+        let auth: OperatorAuthResponse = response.json().await.expect("decode operator auth");
+        let handed = PublicKey::from_openssh(&auth.host_key).expect("parse handed host key");
+        assert_eq!(
+            auth.host_key.split_whitespace().count(),
+            2,
+            "{}",
+            auth.host_key
+        );
+        assert_eq!(handed.key_data(), host_key.key_data());
 
         server.abort();
     }
@@ -2741,6 +2978,7 @@ mod tests {
         agent_accept: Duration::from_millis(300),
         data_tunnel: Duration::from_millis(300),
         removal_sweep: Duration::from_millis(100),
+        shutdown: Duration::from_secs(3),
     };
 
     /// A relay with short timeouts on a free local port and one enrolled agent.
@@ -2750,7 +2988,9 @@ mod tests {
         control_token: String,
         agent_id: String,
         operator_fingerprint: String,
-        server: tokio::task::JoinHandle<()>,
+        /// Stops the relay as SIGINT or SIGTERM would.
+        stop: oneshot::Sender<()>,
+        server: tokio::task::JoinHandle<Result<(), RevttyError>>,
     }
 
     async fn fast_relay(agent: &str) -> FastRelay {
@@ -2772,10 +3012,14 @@ mod tests {
             .await
             .expect("bind test relay");
         let address = listener.local_addr().expect("test relay address");
-        let app = router(state.clone());
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test relay");
-        });
+        let (stop, stopped) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve_until(listener, state.clone(), async move {
+            // Only an explicit stop: a test that drops it keeps its relay running.
+            if stopped.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            "stop"
+        }));
 
         let operator_key = ed25519_key()
             .public_key()
@@ -2798,8 +3042,161 @@ mod tests {
             agent_id: credential.id,
             operator_fingerprint: crate::storage::operator_fingerprint(&operator_key)
                 .expect("operator fingerprint"),
+            stop,
             server,
         }
+    }
+
+    /// Production timeouts, so that a session waits for its agent through the whole test.
+    const STOPPING_TIMEOUTS: RelayTimeouts = RelayTimeouts {
+        shutdown: Duration::from_secs(3),
+        ..super::RELAY_TIMEOUTS
+    };
+
+    #[tokio::test]
+    async fn no_task_starts_once_the_relay_is_stopping() {
+        let lifecycle = Lifecycle::new();
+        let mut running = lifecycle.enter().expect("a task enters a running relay");
+        lifecycle.begin_shutdown();
+        assert!(
+            lifecycle.enter().is_none(),
+            "a task entered a stopping relay"
+        );
+
+        // A task that entered before learns of the shutdown, however late it looks.
+        tokio::time::timeout(Duration::from_secs(1), running.stopping())
+            .await
+            .expect("running task told to stop");
+        let ended = lifecycle.tasks_ended();
+        tokio::pin!(ended);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut ended)
+                .await
+                .is_err(),
+            "the relay did not wait for a running task"
+        );
+        drop(running);
+        tokio::time::timeout(Duration::from_secs(1), ended)
+            .await
+            .expect("the relay saw the last task end");
+    }
+
+    #[tokio::test]
+    async fn a_stopping_relay_ends_its_sessions_and_writes_their_audit_first() {
+        const NAME: &str = "stopping-agent";
+        let mut relay = fast_relay_with(NAME, STOPPING_TIMEOUTS).await;
+        let (mut agent, _operator) = connect_agent_and_operator(&relay, NAME, "connect").await;
+        audited_outcome_stage(&relay.state, |_| true).await;
+
+        // With the database busy, the session's end can only be queued.
+        let (held, holding) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let store = relay.state.store.clone();
+        let hold = tokio::spawn(async move { store.hold(held, released).await });
+        holding.await.expect("database held");
+
+        relay.stop.send(()).expect("stop relay");
+        let closed = tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(Ok(_)) = agent.next().await {}
+        })
+        .await;
+        assert!(closed.is_ok(), "the agent's control connection stayed open");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !relay.server.is_finished(),
+            "the relay stopped before writing its audit records"
+        );
+
+        release.send(()).expect("release database");
+        tokio::time::timeout(Duration::from_secs(3), &mut relay.server)
+            .await
+            .expect("relay stopped")
+            .expect("relay task")
+            .expect("relay stopped cleanly");
+        hold.await.expect("database hold");
+        let sessions = relay
+            .state
+            .store
+            .list_sessions(10)
+            .await
+            .expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].outcome.as_deref(), Some("interrupted"));
+        assert!(sessions[0].ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_relay_whose_audit_writes_fail_does_not_stop_cleanly() {
+        const NAME: &str = "unaudited-agent";
+        let relay = fast_relay_with(NAME, STOPPING_TIMEOUTS).await;
+        let (_agent, _operator) = connect_agent_and_operator(&relay, NAME, "connect").await;
+        audited_outcome_stage(&relay.state, |_| true).await;
+        relay.state.store.refuse_writes().await;
+
+        relay.stop.send(()).expect("stop relay");
+        let stopped = tokio::time::timeout(Duration::from_secs(3), relay.server)
+            .await
+            .expect("relay stopped")
+            .expect("relay task");
+        let error = stopped.expect_err("a relay that lost its audit records stopped cleanly");
+        assert!(
+            error.to_string().contains("could not be written"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_cannot_write_its_audit_stops_after_its_grace_period() {
+        const NAME: &str = "stuck-agent";
+        let relay = fast_relay_with(
+            NAME,
+            RelayTimeouts {
+                shutdown: Duration::from_millis(300),
+                ..super::RELAY_TIMEOUTS
+            },
+        )
+        .await;
+        let (_agent, _operator) = connect_agent_and_operator(&relay, NAME, "connect").await;
+        audited_outcome_stage(&relay.state, |_| true).await;
+        let (held, holding) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let store = relay.state.store.clone();
+        let hold = tokio::spawn(async move { store.hold(held, released).await });
+        holding.await.expect("database held");
+
+        relay.stop.send(()).expect("stop relay");
+        let stopped = tokio::time::timeout(Duration::from_secs(2), relay.server)
+            .await
+            .expect("relay gave up within its grace period")
+            .expect("relay task");
+        let error = stopped.expect_err("a relay that could not write its audit stopped cleanly");
+        assert!(error.to_string().contains("did not stop within"), "{error}");
+
+        release.send(()).expect("release database");
+        hold.await.expect("database hold");
+    }
+
+    #[tokio::test]
+    async fn a_stopping_relay_does_not_wait_for_a_hello() {
+        const NAME: &str = "silent-agent";
+        let relay = fast_relay_with(NAME, STOPPING_TIMEOUTS).await;
+        let _agent = connect_websocket(
+            &reqwest::Client::new(),
+            &relay.url,
+            &format!("/v1/agent/{NAME}"),
+            &relay.control_token,
+        )
+        .await
+        .expect("connect agent");
+        // The connection's task waits for a Hello, for 10 s.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        relay.stop.send(()).expect("stop relay");
+        tokio::time::timeout(Duration::from_secs(1), relay.server)
+            .await
+            .expect("the relay waited for the agent's Hello")
+            .expect("relay task")
+            .expect("relay stopped cleanly");
     }
 
     async fn wait_registered(state: &RelayState, name: &str, registered: bool) -> bool {

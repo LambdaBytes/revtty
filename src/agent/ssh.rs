@@ -19,6 +19,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use crate::config::Paths;
 use crate::error::RevttyError;
 use crate::identity::ensure_agent;
+use crate::protocol::PROBE_COMMAND;
 use crate::transport::{
     SSH_TIMEOUTS, SshTimeouts, connect_websocket, finish_byte_stream, websocket_byte_stream,
 };
@@ -40,6 +41,18 @@ const KILL_REAP_WAIT: Duration = Duration::from_secs(5);
 const OUTPUT_DRAIN_WAIT: Duration = Duration::from_secs(1);
 /// Time the SSH session of a revoked operator gets to end once its transport is cut.
 const REVOKED_SESSION_WAIT: Duration = Duration::from_secs(5);
+/// A probe session ends after this long whatever the operator does: longer than the
+/// operator's own bounds on the handshake (30 s) and on the answer (10 s).
+const PROBE_SESSION_LIMIT: Duration = Duration::from_secs(45);
+
+/// What an operator's SSH session is for, as the relay's offer says.
+#[derive(Clone)]
+pub enum SessionKind {
+    /// An interactive shell in a PTY.
+    Shell,
+    /// Only `exec` of `PROBE_COMMAND`, answered with this encoded `ProbeResult`.
+    Probe(String),
+}
 
 /// The operator keys this agent accepts, as last read from its configuration.
 #[derive(Clone)]
@@ -178,6 +191,7 @@ struct AgentSshHandler {
     /// The key this session authenticated with, watched for revocation by `serve_stream`.
     authenticated: Arc<Mutex<Option<PublicKey>>>,
     shutdown: ShellShutdown,
+    kind: SessionKind,
     open_channel: Option<ChannelId>,
     pending_pty: Option<PendingPty>,
     active_shell: Option<ActiveShell>,
@@ -188,11 +202,13 @@ impl AgentSshHandler {
         allowlist: watch::Receiver<OperatorAllowlist>,
         authenticated: Arc<Mutex<Option<PublicKey>>>,
         shutdown: ShellShutdown,
+        kind: SessionKind,
     ) -> Self {
         Self {
             allowlist,
             authenticated,
             shutdown,
+            kind,
             open_channel: None,
             pending_pty: None,
             active_shell: None,
@@ -296,7 +312,9 @@ impl server::Handler for AgentSshHandler {
         _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if self.open_channel != Some(channel)
+        // A probe has no terminal, and without a PTY no shell starts either.
+        if matches!(self.kind, SessionKind::Probe(_))
+            || self.open_channel != Some(channel)
             || self.pending_pty.is_some()
             || self.active_shell.is_some()
         {
@@ -320,6 +338,29 @@ impl server::Handler for AgentSshHandler {
             }
         }
 
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // A shell session keeps russh's default, which answers nothing.
+        let SessionKind::Probe(answer) = &self.kind else {
+            return Ok(());
+        };
+        if self.open_channel != Some(channel) || data != PROBE_COMMAND.as_bytes() {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+
+        session.channel_success(channel)?;
+        session.data(channel, answer.clone().into_bytes())?;
+        session.exit_status_request(channel, 0)?;
+        session.eof(channel)?;
+        session.close(channel)?;
         Ok(())
     }
 
@@ -791,6 +832,7 @@ pub async fn serve(
     session_id: &str,
     allowlist: watch::Receiver<OperatorAllowlist>,
     shutdown: ShellShutdown,
+    kind: SessionKind,
 ) -> Result<(), RevttyError> {
     let path = format!("/v1/session/{session_id}");
     let websocket = connect_websocket(client, relay, &path, tunnel_token).await?;
@@ -803,12 +845,15 @@ pub async fn serve(
         let host_key = PrivateKey::read_openssh_file(&identity.private_key_path)
             .map_err(|error| RevttyError::runtime("read agent SSH host key", error))?;
 
+        let limit = matches!(kind, SessionKind::Probe(_)).then_some(PROBE_SESSION_LIMIT);
         serve_stream(
             stream,
             transport,
             server_config(host_key, SSH_TIMEOUTS),
             allowlist,
             shutdown,
+            kind,
+            limit,
         )
         .await
     }
@@ -818,14 +863,17 @@ pub async fn serve(
     result
 }
 
-/// Runs one operator's SSH session over `stream` until it ends or the key it authenticated
-/// with is revoked. `transport` is the task that carries `stream`.
+/// Runs one operator's SSH session over `stream` until it ends, the key it authenticated
+/// with is revoked or `limit`, counted from the start, is over. `transport` is the task that
+/// carries `stream`.
 async fn serve_stream<S>(
     stream: S,
     transport: AbortHandle,
     config: server::Config,
     allowlist: watch::Receiver<OperatorAllowlist>,
     shutdown: ShellShutdown,
+    kind: SessionKind,
+    limit: Option<Duration>,
 ) -> Result<(), RevttyError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -834,14 +882,34 @@ where
     // Subscribed before the handler can authenticate anyone, so every later change of the
     // allowlist is seen here.
     let mut changes = allowlist.clone();
+    // From the start: russh waits for the operator's banner for as long as the inactivity
+    // timeout (120 s) before it returns the session.
+    let limit_reached = async {
+        match limit {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(limit_reached);
+    let over_limit = || {
+        RevttyError::message(format!(
+            "session still open after {}s",
+            limit.unwrap_or_default().as_secs_f64()
+        ))
+    };
 
-    let mut running = server::run_stream(
-        Arc::new(config),
-        stream,
-        AgentSshHandler::new(allowlist, Arc::clone(&authenticated), shutdown),
-    )
-    .await
-    .map_err(|error| RevttyError::runtime("start SSH server", error))?;
+    let started = tokio::select! {
+        started = server::run_stream(
+            Arc::new(config),
+            stream,
+            AgentSshHandler::new(allowlist, Arc::clone(&authenticated), shutdown, kind),
+        ) => started,
+        () = &mut limit_reached => {
+            transport.abort();
+            return Err(over_limit());
+        }
+    };
+    let mut running = started.map_err(|error| RevttyError::runtime("start SSH server", error))?;
 
     tokio::select! {
         result = &mut running => {
@@ -866,6 +934,12 @@ where
                 "operator {fingerprint} was revoked"
             )))
         }
+        () = &mut limit_reached => {
+            // A probe whose operator never hangs up must not keep its session slot.
+            transport.abort();
+            let _ = tokio::time::timeout(REVOKED_SESSION_WAIT, &mut running).await;
+            Err(over_limit())
+        }
     }
 }
 
@@ -882,10 +956,11 @@ mod tests {
     use tokio::sync::{mpsc, watch};
 
     use super::{
-        AgentSshHandler, OperatorAllowlist, ShellShutdown, authorize, ed25519_only,
+        AgentSshHandler, OperatorAllowlist, SessionKind, ShellShutdown, authorize, ed25519_only,
         operator_revoked, serve_stream, server_config, signal_if_running,
     };
     use crate::error::RevttyError;
+    use crate::protocol::PROBE_COMMAND;
     use crate::transport::test_support::{ControlledStream, StreamControl};
     use crate::transport::{SSH_TIMEOUTS, SshTimeouts};
 
@@ -978,6 +1053,7 @@ mod tests {
                     allow_only(&authorized_client),
                     Arc::default(),
                     shell_shutdown,
+                    SessionKind::Shell,
                 ),
             )
             .await
@@ -1100,6 +1176,7 @@ mod tests {
                     allow_only(&authorized_client),
                     Arc::default(),
                     shell_shutdown,
+                    SessionKind::Shell,
                 ),
             )
             .await
@@ -1176,6 +1253,7 @@ mod tests {
                         allow_only(&authorized_client),
                         Arc::default(),
                         shell_shutdown,
+                        SessionKind::Shell,
                     ),
                 )
                 .await
@@ -1604,6 +1682,7 @@ mod tests {
                     allow_only(&authorized_client),
                     Arc::default(),
                     shell_shutdown,
+                    SessionKind::Shell,
                 ),
             )
             .await
@@ -1699,6 +1778,7 @@ mod tests {
                     allow_only(ed25519_key().public_key()),
                     Arc::default(),
                     shutdown.handle(),
+                    SessionKind::Shell,
                 ),
             ),
         )
@@ -1739,6 +1819,8 @@ mod tests {
             server_config(server_key, SSH_TIMEOUTS),
             allowlist_rx,
             shutdown.handle(),
+            SessionKind::Shell,
+            None,
         ));
 
         let client_config = client::Config {
@@ -1924,5 +2006,218 @@ mod tests {
             revoked.is_ok(),
             "a revocation published during authentication was never applied"
         );
+    }
+
+    const PROBE_ANSWER: &str = r#"{"name":"probed","os":"linux","arch":"x86_64","version":"0"}"#;
+
+    /// A probe session as the agent serves it, and an SSH client that tried to authenticate
+    /// to it with `operator`, which the agent's list holds only if `listed`.
+    async fn probe_session(
+        operator: &PrivateKey,
+        listed: bool,
+    ) -> (client::Handle<TestClient>, bool) {
+        let server_key = ed25519_key();
+        let expected_server_key = server_key.public_key().clone();
+        let allowed = if listed {
+            operator.public_key().clone()
+        } else {
+            ed25519_key().public_key().clone()
+        };
+        let (client_stream, agent_stream) = tokio::io::duplex(64 * 1024);
+        // Stands in for the bridge task that carries the agent's stream.
+        let transport = tokio::spawn(std::future::pending::<()>());
+        tokio::spawn(serve_stream(
+            agent_stream,
+            transport.abort_handle(),
+            server_config(server_key, SSH_TIMEOUTS),
+            allow_only(&allowed),
+            TestShutdown::new().handle(),
+            SessionKind::Probe(PROBE_ANSWER.to_owned()),
+            Some(Duration::from_secs(30)),
+        ));
+
+        let client_config = client::Config {
+            preferred: ed25519_only(),
+            ..Default::default()
+        };
+        let mut session = client::connect_stream(
+            Arc::new(client_config),
+            client_stream,
+            TestClient {
+                expected_server_key,
+            },
+        )
+        .await
+        .expect("connect SSH client");
+        let auth = session
+            .authenticate_publickey(
+                "revtty",
+                PrivateKeyWithHashAlg::new(Arc::new(operator.clone()), None),
+            )
+            .await
+            .expect("authenticate operator");
+        (session, auth.success())
+    }
+
+    /// What `channel` gets, up to its close or for at most 2 s.
+    async fn channel_messages(channel: &mut russh::Channel<client::Msg>) -> Vec<ChannelMsg> {
+        let mut messages = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(message) = channel.wait().await {
+                let closed = matches!(message, ChannelMsg::Close);
+                messages.push(message);
+                if closed {
+                    break;
+                }
+            }
+        })
+        .await;
+        messages
+    }
+
+    #[tokio::test]
+    async fn a_probe_session_answers_the_probe_command() {
+        let operator = ed25519_key();
+        let (session, authenticated) = probe_session(&operator, true).await;
+        assert!(authenticated, "listed operator was rejected");
+
+        let mut channel = session.channel_open_session().await.expect("open channel");
+        channel
+            .exec(true, PROBE_COMMAND)
+            .await
+            .expect("request probe");
+        let messages = channel_messages(&mut channel).await;
+
+        assert!(matches!(messages.first(), Some(ChannelMsg::Success)));
+        let answer = messages
+            .iter()
+            .filter_map(|message| match message {
+                ChannelMsg::Data { data } => Some(data.to_vec()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(answer, PROBE_ANSWER.as_bytes());
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, ChannelMsg::ExitStatus { exit_status: 0 }))
+        );
+        assert!(matches!(messages.last(), Some(ChannelMsg::Close)));
+    }
+
+    #[tokio::test]
+    async fn a_probe_session_runs_nothing_else() {
+        let operator = ed25519_key();
+
+        let (session, _) = probe_session(&operator, true).await;
+        let mut channel = session.channel_open_session().await.expect("open channel");
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .expect("request PTY");
+        channel.request_shell(true).await.expect("request shell");
+        let messages = channel_messages(&mut channel).await;
+        let replies = messages
+            .iter()
+            .filter(|message| matches!(message, ChannelMsg::Success | ChannelMsg::Failure))
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(replies[..], [ChannelMsg::Failure, ChannelMsg::Failure]),
+            "a probe session gave a terminal: {messages:?}"
+        );
+
+        let (session, _) = probe_session(&operator, true).await;
+        let mut channel = session.channel_open_session().await.expect("open channel");
+        channel.exec(true, "id").await.expect("request command");
+        let messages = channel_messages(&mut channel).await;
+        assert!(
+            matches!(messages.first(), Some(ChannelMsg::Failure))
+                && !messages
+                    .iter()
+                    .any(|message| matches!(message, ChannelMsg::Data { .. })),
+            "a probe session ran another command: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operator_the_agent_does_not_list_gets_no_probe_answer() {
+        let (_session, authenticated) = probe_session(&ed25519_key(), false).await;
+        assert!(!authenticated, "unlisted operator authenticated to a probe");
+    }
+
+    #[tokio::test]
+    async fn a_probe_session_ends_at_its_limit_even_before_the_banner() {
+        // An operator that never speaks: russh alone would wait 120 s for its banner.
+        let (_silent_operator, agent_stream) = tokio::io::duplex(64 * 1024);
+        let transport = tokio::spawn(std::future::pending::<()>());
+        let served = tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_stream(
+                agent_stream,
+                transport.abort_handle(),
+                server_config(ed25519_key(), SSH_TIMEOUTS),
+                allow_only(ed25519_key().public_key()),
+                TestShutdown::new().handle(),
+                SessionKind::Probe(PROBE_ANSWER.to_owned()),
+                Some(Duration::from_millis(300)),
+            ),
+        )
+        .await
+        .expect("the probe session outlived its limit");
+        assert!(served.is_err(), "a silent probe session ended as a success");
+        assert!(transport.await.is_err_and(|error| error.is_cancelled()));
+    }
+
+    #[tokio::test]
+    async fn a_probe_operator_that_never_hangs_up_loses_its_session_at_the_limit() {
+        let operator = ed25519_key();
+        let server_key = ed25519_key();
+        let expected_server_key = server_key.public_key().clone();
+        let (client_stream, relay_side) = tokio::io::duplex(64 * 1024);
+        let (application, agent_side) = tokio::io::duplex(64 * 1024);
+        // Stands in for the bridge task: ending it closes the agent's stream.
+        let bridge = tokio::spawn(async move {
+            let (mut relay_side, mut agent_side) = (relay_side, agent_side);
+            let _ = tokio::io::copy_bidirectional(&mut relay_side, &mut agent_side).await;
+        });
+        let server = tokio::spawn(serve_stream(
+            application,
+            bridge.abort_handle(),
+            server_config(server_key, SSH_TIMEOUTS),
+            allow_only(operator.public_key()),
+            TestShutdown::new().handle(),
+            SessionKind::Probe(PROBE_ANSWER.to_owned()),
+            Some(Duration::from_millis(500)),
+        ));
+
+        let client_config = client::Config {
+            preferred: ed25519_only(),
+            ..Default::default()
+        };
+        let mut session = client::connect_stream(
+            Arc::new(client_config),
+            client_stream,
+            TestClient {
+                expected_server_key,
+            },
+        )
+        .await
+        .expect("connect SSH client");
+        let auth = session
+            .authenticate_publickey(
+                "revtty",
+                PrivateKeyWithHashAlg::new(Arc::new(operator.clone()), None),
+            )
+            .await
+            .expect("authenticate operator");
+        assert!(auth.success());
+
+        // Authenticated, it then keeps the session without asking anything.
+        let served = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("the probe session outlived its limit")
+            .expect("probe session task");
+        assert!(served.is_err(), "an idle probe session ended as a success");
     }
 }
