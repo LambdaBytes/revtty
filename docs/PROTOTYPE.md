@@ -261,6 +261,8 @@ All of it, the end-to-end tests included, passes on both Linux and macOS (CI run
 The next gates for M1 are:
 
 1. run the authenticated `connect` path across a real NAT/CGNAT boundary;
-2. exercise recovery under real network loss and NAT mapping changes; local tests cover relay restarts, silent agents and silent relays.
+2. exercise recovery under real network loss and NAT mapping changes; local tests cover relay restarts, silent agents, silent relays and relays that never answer a WebSocket handshake.
+
+[FIELD_TEST.md](FIELD_TEST.md) is the runbook for both.
 
 This keeps transport, identity, SSH, PTY and lifecycle failures independently observable.

@@ -125,6 +125,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
   Then use `--relay https://revtty.example.com` everywhere. Keep the relay database and its directory writable only by the relay's account: `relay doctor` fails if other users can write them, and warns about a group-writable directory.
 - **Agent**: enroll and run it as the account whose shell operators should get, ideally as a service ([docs/SYSTEMD.md](docs/SYSTEMD.md)). Enroll it with a pairing code from its first operator, or give the operators the fingerprint that `agent enroll` prints.
 - **Operator**: run `revtty init` once per operator machine; the relay administrator enrolls each agent for that operator's public key.
+- **First field test**: [docs/FIELD_TEST.md](docs/FIELD_TEST.md) sets up a relay on a VPS and a target behind NAT, and lists the recovery drills with their expected results.
 
 ## Command reference
 
