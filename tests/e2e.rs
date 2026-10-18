@@ -1297,16 +1297,13 @@ fn operators_are_managed_from_a_session_and_revocation_closes_it() {
         &logs,
     );
 
-    // An operator revoking itself: the change is written, then its session is closed.
+    // An operator revoking itself: the change is written, then its session is closed. The
+    // agent cuts a revoked operator off at once, which can be before the command's own output
+    // reaches the terminal: the change is checked on the target instead.
+    let started = Instant::now();
     terminal.send(&format!(
         "{REVTTY} agent operator revoke {second_fingerprint}\r"
     ));
-    terminal.wait_for(
-        &format!("revoked    {second_fingerprint}"),
-        Duration::from_secs(10),
-        &logs,
-    );
-    let started = Instant::now();
     let status = terminal
         .wait_exit(Duration::from_secs(10))
         .unwrap_or_else(|| {
@@ -1326,6 +1323,11 @@ fn operators_are_managed_from_a_session_and_revocation_closes_it() {
         "a revoked session ended as a success"
     );
     agent_process.wait_for_log("was revoked; closing its session", Duration::from_secs(5));
+    let listed = agent.run(&["agent", "operator", "list"]);
+    assert!(
+        listed.contains("revision   3") && !listed.contains(&second_fingerprint),
+        "the revocation was not written:\n{listed}"
+    );
 
     // The relay no longer issues it credentials, and the agent would refuse it anyway.
     relay.wait_for_log("operators updated to revision 3", Duration::from_secs(10));
@@ -1344,6 +1346,17 @@ fn operators_are_managed_from_a_session_and_revocation_closes_it() {
         "--host-key",
         &host_key,
     ]);
+    // Revoked on the target, outside any session, `revoke` confirms what it changed.
+    agent.run(&[
+        "agent",
+        "operator",
+        "add",
+        second_key.to_str().expect("utf-8 path"),
+    ]);
+    let revoked = agent.run(&["agent", "operator", "revoke", &second_fingerprint]);
+    assert_eq!(field(&revoked, "revoked"), second_fingerprint);
+    assert_eq!(field(&revoked, "revision"), "5");
+
     let first_fingerprint = field(&operator.run(&["init"]), "fingerprint").to_owned();
     let last = agent.run_failing(&["agent", "operator", "revoke", &first_fingerprint]);
     assert!(
