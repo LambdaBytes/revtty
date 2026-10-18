@@ -788,7 +788,7 @@ fn doctors_check_authentication_permissions_and_tls() {
     let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
     let _agent_process = start_agent(&root, &agent);
 
-    // After a first pin, as on any real operator machine.
+    // After a first pin, as on any real operator machine, and with a pairing not used yet.
     operator.run(&[
         "probe",
         AGENT_NAME,
@@ -796,6 +796,14 @@ fn doctors_check_authentication_permissions_and_tls() {
         &url,
         "--host-key",
         &host_key,
+    ]);
+    operator.run(&[
+        "pair",
+        "other-machine",
+        "--token",
+        "rve_unused",
+        "--relay",
+        &url,
     ]);
     let operator_doctor = operator.run(&["doctor", "--relay", &url]);
     assert!(
@@ -852,6 +860,18 @@ fn doctors_check_authentication_permissions_and_tls() {
             exposed.contains("accessible by other users"),
             "readable agent config not reported:\n{exposed}"
         );
+
+        // Whoever reads a pairing's secret can forge the proof that pins a host key with it.
+        let pairings = operator.config.join("pairings");
+        std::fs::set_permissions(&pairings, std::fs::Permissions::from_mode(0o644))
+            .expect("make pairings readable");
+        let readable = operator.run_failing(&["doctor", "--relay", &url]);
+        assert!(
+            readable.contains("accessible by other users"),
+            "readable pairings not reported:\n{readable}"
+        );
+        std::fs::set_permissions(&pairings, std::fs::Permissions::from_mode(0o600))
+            .expect("restore pairings");
     }
 
     // Speaking TLS to a plain-HTTP relay fails with the TLS cause, not just "request failed".

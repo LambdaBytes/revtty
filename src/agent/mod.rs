@@ -30,7 +30,9 @@ use crate::protocol::{
     ProbeResult, SESSION_ERROR_PREFIX, SessionRejectReason,
 };
 use crate::token::SecretToken;
-use crate::transport::{check_relay_health, connect_websocket, http_url, relay_client, valid_name};
+use crate::transport::{
+    check_relay_health, connect_websocket, http_url, relay_client, valid_name, websocket_error,
+};
 
 const RECONNECT_BASE_MILLIS: u64 = 1_000;
 const RECONNECT_CAP_MILLIS: u64 = 30_000;
@@ -434,7 +436,6 @@ async fn run_control_once(
     .await?;
     send_operators_report(&mut sender, &mut operator_changes).await?;
 
-    backoff.reset();
     eprintln!("agent {name} connected to {relay}");
 
     let mut heartbeat = tokio::time::interval(timeouts.heartbeat);
@@ -597,10 +598,18 @@ async fn run_control_once(
                     Some(Ok(Message::Ping(data))) => {
                         send_frame(&mut sender, Message::Pong(data), "send control pong").await?;
                     }
+                    // The answer to a heartbeat ping: the relay accepted the hello and the
+                    // operator list, kept the connection for a heartbeat and the path works
+                    // both ways. Only now has reconnecting worked; a relay that accepts the
+                    // upgrade and then closes keeps the backoff growing.
+                    Some(Ok(Message::Pong(_))) => backoff.reset(),
                     Some(Ok(Message::Close { .. })) | None => return Ok(()),
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
-                        return Err(RevttyError::runtime("receive control message", error));
+                        return Err(RevttyError::runtime(
+                            "receive control message",
+                            websocket_error(error),
+                        ));
                     }
                 }
             }
@@ -718,7 +727,7 @@ async fn send_frame(
     context: &str,
 ) -> Result<(), RevttyError> {
     match tokio::time::timeout(CONTROL_SEND_TIMEOUT, sender.send(frame)).await {
-        Ok(sent) => sent.map_err(|error| RevttyError::runtime(context, error)),
+        Ok(sent) => sent.map_err(|error| RevttyError::runtime(context, websocket_error(error))),
         Err(_) => Err(RevttyError::message(format!(
             "{context}: no progress for {}s",
             CONTROL_SEND_TIMEOUT.as_secs()
@@ -749,12 +758,12 @@ async fn send_probe(
     websocket
         .send(Message::Text(text))
         .await
-        .map_err(|error| RevttyError::runtime("send probe result", error))?;
+        .map_err(|error| RevttyError::runtime("send probe result", websocket_error(error)))?;
 
     websocket
         .close(reqwest_websocket::CloseCode::Normal, None)
         .await
-        .map_err(|error| RevttyError::runtime("close probe session", error))
+        .map_err(|error| RevttyError::runtime("close probe session", websocket_error(error)))
 }
 
 pub fn pty_test() -> Result<(), RevttyError> {
@@ -1190,7 +1199,7 @@ mod tests {
     };
     use crate::config::Paths;
     use crate::pairing::{PairingCode, PairingSecret};
-    use crate::protocol::SESSION_ERROR_PREFIX;
+    use crate::protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage, SESSION_ERROR_PREFIX};
     use crate::token::SecretToken;
 
     const FAST_CONTROL_TIMEOUTS: ControlTimeouts = ControlTimeouts {
@@ -1207,6 +1216,13 @@ mod tests {
         /// Sends a message type this agent does not know, keeps answering pings, then
         /// closes the connection.
         Extending,
+        /// Keeps sending messages this agent does not know without ever reading, so that the
+        /// agent's pings go unanswered, then closes the connection.
+        Deaf,
+        /// Drops the connection without a close frame, as a relay that dies does.
+        Vanishing,
+        /// Offers a probe whose data tunnel never gets an answer, then keeps answering pings.
+        OfferingDeadTunnel,
     }
 
     async fn fake_relay(behaviour: FakeRelay) -> String {
@@ -1215,6 +1231,35 @@ mod tests {
             get(move |ws: WebSocketUpgrade| async move {
                 ws.on_upgrade(move |mut socket| async move {
                     let _hello = socket.recv().await;
+                    if let FakeRelay::Vanishing = behaviour {
+                        return;
+                    }
+                    if let FakeRelay::Deaf = behaviour {
+                        let future = r#"{"type":"exec_offer","version":1,"session_id":"s"}"#;
+                        for _ in 0..16 {
+                            if socket
+                                .send(RelayMessage::Text(future.into()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        let _ = socket.send(RelayMessage::Close(None)).await;
+                        return;
+                    }
+                    if let FakeRelay::OfferingDeadTunnel = behaviour {
+                        let offer = serde_json::to_string(&ControlMessage::ProbeOffer {
+                            version: CONTROL_PROTOCOL_VERSION,
+                            session_id: "dead-tunnel".to_owned(),
+                            tunnel_token: "rvs_test".to_owned(),
+                        })
+                        .expect("encode probe offer");
+                        let _ = socket.send(RelayMessage::Text(offer.into())).await;
+                        while socket.recv().await.is_some() {}
+                        return;
+                    }
                     if let FakeRelay::Rejecting = behaviour {
                         let rejection = format!(
                             "{SESSION_ERROR_PREFIX}incompatible control protocol version 1"
@@ -1238,6 +1283,11 @@ mod tests {
                 })
             }),
         );
+        // An upgrade request that is never answered, as from a frozen relay.
+        let app = app.route(
+            "/v1/session/{session_id}",
+            get(std::future::pending::<axum::http::StatusCode>),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fake relay");
@@ -1248,7 +1298,25 @@ mod tests {
         format!("ws://{address}")
     }
 
-    async fn run_against(relay: &str) -> Result<Result<(), crate::error::RevttyError>, ()> {
+    async fn run_against(
+        relay: &str,
+        backoff: &mut ReconnectBackoff,
+    ) -> Result<Result<(), crate::error::RevttyError>, ()> {
+        run_with_slots(
+            relay,
+            backoff,
+            Arc::new(Semaphore::new(4)),
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    async fn run_with_slots(
+        relay: &str,
+        backoff: &mut ReconnectBackoff,
+        session_slots: Arc<Semaphore>,
+        limit: Duration,
+    ) -> Result<Result<(), crate::error::RevttyError>, ()> {
         let operator_key = PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519)
             .expect("operator key")
             .public_key()
@@ -1272,13 +1340,13 @@ mod tests {
         let shell_shutdown = ssh::ShellShutdown::new(shutdown.subscribe(), &guard);
 
         tokio::time::timeout(
-            Duration::from_secs(5),
+            limit,
             run_control_once(
                 &reqwest::Client::new(),
                 &config,
                 &allowlist,
-                &mut ReconnectBackoff::default(),
-                &Arc::new(Semaphore::new(4)),
+                backoff,
+                &session_slots,
                 &Arc::new(Mutex::new(HashMap::new())),
                 &shell_shutdown,
                 FAST_CONTROL_TIMEOUTS,
@@ -1293,7 +1361,7 @@ mod tests {
         let relay = fake_relay(FakeRelay::Silent).await;
         let started = tokio::time::Instant::now();
 
-        let outcome = run_against(&relay).await;
+        let outcome = run_against(&relay, &mut ReconnectBackoff::default()).await;
 
         assert!(
             matches!(outcome, Ok(Err(_))),
@@ -1306,7 +1374,7 @@ mod tests {
     async fn relay_rejection_ends_control_connection_with_its_reason() {
         let relay = fake_relay(FakeRelay::Rejecting).await;
 
-        let outcome = run_against(&relay).await;
+        let outcome = run_against(&relay, &mut ReconnectBackoff::default()).await;
 
         let Ok(Err(error)) = outcome else {
             panic!("agent ignored the relay's rejection");
@@ -1370,7 +1438,7 @@ mod tests {
     async fn unknown_control_message_does_not_drop_the_connection() {
         let relay = fake_relay(FakeRelay::Extending).await;
 
-        let outcome = run_against(&relay).await;
+        let outcome = run_against(&relay, &mut ReconnectBackoff::default()).await;
 
         // The relay closed the connection itself after the unknown message; the agent did
         // not give up on it.
@@ -1378,6 +1446,103 @@ mod tests {
             matches!(outcome, Ok(Ok(()))),
             "agent dropped its control connection over an unknown message: {outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_refuses_the_hello_keeps_the_backoff_growing() {
+        let relay = fake_relay(FakeRelay::Rejecting).await;
+        let mut backoff = ReconnectBackoff { failures: 3 };
+
+        let outcome = run_against(&relay, &mut backoff).await;
+
+        assert!(matches!(outcome, Ok(Err(_))), "{outcome:?}");
+        // Sending the hello and the operator list proved nothing: the relay closed the
+        // connection without accepting them, so the next attempt must not come after 1 s.
+        assert_eq!(backoff.failures, 3);
+    }
+
+    #[tokio::test]
+    async fn frames_without_pongs_do_not_reset_the_backoff() {
+        let relay = fake_relay(FakeRelay::Deaf).await;
+        let mut backoff = ReconnectBackoff { failures: 3 };
+
+        let outcome = run_against(&relay, &mut backoff).await;
+
+        assert!(matches!(outcome, Ok(Ok(()))), "{outcome:?}");
+        assert_eq!(backoff.failures, 3);
+    }
+
+    #[tokio::test]
+    async fn a_relay_answering_heartbeat_pings_resets_the_backoff() {
+        let relay = fake_relay(FakeRelay::Extending).await;
+        let mut backoff = ReconnectBackoff { failures: 3 };
+
+        let outcome = run_against(&relay, &mut backoff).await;
+
+        assert!(matches!(outcome, Ok(Ok(()))), "{outcome:?}");
+        assert_eq!(backoff.failures, 0);
+    }
+
+    #[tokio::test]
+    async fn a_lost_control_connection_reports_its_cause() {
+        let relay = fake_relay(FakeRelay::Vanishing).await;
+
+        let outcome = run_against(&relay, &mut ReconnectBackoff::default()).await;
+
+        let Ok(Err(error)) = outcome else {
+            panic!("the agent did not notice the lost connection: {outcome:?}");
+        };
+        // reqwest-websocket's own message stops at "tungstenite error". The loss shows on the
+        // next read, or on a write when the agent was still sending its operator list.
+        let error = error.to_string();
+        assert!(
+            ["without closing handshake", "Broken pipe", "reset by peer"]
+                .iter()
+                .any(|cause| error.contains(cause)),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_that_never_attaches_gives_its_session_slot_back() {
+        let relay = fake_relay(FakeRelay::OfferingDeadTunnel).await;
+        let slots = Arc::new(Semaphore::new(1));
+        let control = tokio::spawn({
+            let slots = slots.clone();
+            async move {
+                run_with_slots(
+                    &relay,
+                    &mut ReconnectBackoff::default(),
+                    slots,
+                    Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+
+        let reserved = wait_until(Duration::from_secs(5), || slots.available_permits() == 0).await;
+        assert!(
+            reserved,
+            "the agent did not take a session slot for the offer"
+        );
+        // The handshake bound, not the relay, ends the attempt and with it the reservation.
+        let released = wait_until(Duration::from_secs(14), || slots.available_permits() == 1).await;
+        control.abort();
+        assert!(
+            released,
+            "a tunnel stuck in its handshake kept its session slot"
+        );
+    }
+
+    async fn wait_until(limit: Duration, condition: impl Fn() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        condition()
     }
 
     #[test]

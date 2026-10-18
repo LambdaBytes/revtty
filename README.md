@@ -159,7 +159,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | agent | `agent_ed25519`, `agent_ed25519.pub` (host key) | state directory |
 | relay | SQLite database | `--db` |
 
-On Linux the defaults are `~/.config/revtty` and `~/.local/share/revtty`; `REVTTY_CONFIG_DIR` and `REVTTY_STATE_DIR` override them with absolute paths. revtty creates these directories private to the user and writes private keys, `known_hosts`, `pairings` and `agent.toml` with mode 0600. The doctors refuse files or directories that other users could modify; the one exception is the directory holding the relay database, which the administrator chooses: there a group-writable mode is a warning (with user private groups, the default on Debian and Ubuntu, the group is only the owner) and a world-writable one fails.
+On Linux the defaults are `~/.config/revtty` and `~/.local/share/revtty`; `REVTTY_CONFIG_DIR` and `REVTTY_STATE_DIR` override them with absolute paths. revtty creates these directories private to the user and writes private keys, `known_hosts`, `pairings` and `agent.toml` with mode 0600. The doctors refuse files or directories that other users could modify, and credential files they could read (`agent.toml` in `agent doctor`, `pairings` in `doctor`; a private key is made private again whenever revtty loads it); the one exception is the directory holding the relay database, which the administrator chooses: there a group-writable mode is a warning (with user private groups, the default on Debian and Ubuntu, the group is only the owner) and a world-writable one fails.
 
 ## Limitations
 

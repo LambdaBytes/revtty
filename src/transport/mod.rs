@@ -16,6 +16,11 @@ const STREAM_BUFFER_SIZE: usize = 256 * 1024;
 const STREAM_CHUNK_SIZE: usize = 16 * 1024;
 /// Time the bridge gets to send its close frame once the SSH side is done with the stream.
 const BRIDGE_CLOSE_WAIT: Duration = Duration::from_secs(2);
+/// Opening a WebSocket to the relay: name resolution, TCP, TLS and the HTTP upgrade. reqwest's
+/// TCP keepalive and user timeout notice a dead path, not a peer that accepts the connection
+/// and never answers, such as a frozen relay or a middlebox. The relay answers the upgrade
+/// once it has authenticated the request, and gives an agent's data tunnel 10 s to attach.
+const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// SSH liveness policy shared by the operator client and the agent server.
 #[derive(Clone, Copy, Debug)]
@@ -59,7 +64,9 @@ pub fn websocket_byte_stream(
                             websocket_sender
                                 .send(Message::Pong(data))
                                 .await
-                                .map_err(|error| RevttyError::runtime("send websocket pong", error))?;
+                                .map_err(|error| {
+                                    RevttyError::runtime("send websocket pong", websocket_error(error))
+                                })?;
                         }
                         Some(Ok(Message::Pong(_))) => {}
                         Some(Ok(Message::Close { .. })) | None => break,
@@ -73,7 +80,10 @@ pub fn websocket_byte_stream(
                             ));
                         }
                         Some(Err(error)) => {
-                            return Err(RevttyError::runtime("receive websocket session data", error));
+                            return Err(RevttyError::runtime(
+                                "receive websocket session data",
+                                websocket_error(error),
+                            ));
                         }
                     }
                 }
@@ -96,7 +106,9 @@ pub fn websocket_byte_stream(
                     websocket_sender
                         .send(Message::Binary(buffer[..read].to_vec().into()))
                         .await
-                        .map_err(|error| RevttyError::runtime("send websocket session data", error))?;
+                        .map_err(|error| {
+                            RevttyError::runtime("send websocket session data", websocket_error(error))
+                        })?;
                 }
             }
         }
@@ -127,8 +139,13 @@ fn session_error_detail(text: &str) -> Option<&str> {
 /// The HTTP client for every request to the relay. Redirects are followed as reqwest does by
 /// default, except to a URL `refuse_remote_plaintext` refuses: a 307 or 308 resends the
 /// request body, which can hold a credential (the enrollment token, for one).
+///
+/// HTTP/1.1 only: reqwest-websocket upgrades over HTTP/1.1, so a TLS terminator in front of
+/// the relay that picked h2 from the ALPN offer, as Caddy does by default, would fail every
+/// WebSocket while plain requests still worked.
 pub fn relay_client() -> Result<Client, RevttyError> {
     Client::builder()
+        .http1_only()
         .redirect(reqwest::redirect::Policy::custom(
             |attempt| match refuse_remote_plaintext(attempt.url().as_str()) {
                 Ok(()) => reqwest::redirect::Policy::default().redirect(attempt),
@@ -163,20 +180,50 @@ pub async fn connect_websocket(
     path: &str,
     token: &str,
 ) -> Result<WebSocket, RevttyError> {
+    connect_websocket_within(client, relay, path, token, WEBSOCKET_HANDSHAKE_TIMEOUT).await
+}
+
+async fn connect_websocket_within(
+    client: &Client,
+    relay: &str,
+    path: &str,
+    token: &str,
+    limit: Duration,
+) -> Result<WebSocket, RevttyError> {
     let url = websocket_url(relay, path)?;
 
-    let response = client
-        .get(url)
-        .bearer_auth(token)
-        .upgrade()
-        .send()
-        .await
-        .map_err(|error| RevttyError::runtime("websocket handshake", error))?;
+    let handshake = async {
+        let response = client
+            .get(url)
+            .bearer_auth(token)
+            .upgrade()
+            .send()
+            .await
+            .map_err(|error| RevttyError::runtime("websocket handshake", websocket_error(error)))?;
 
-    response
-        .into_websocket()
+        response
+            .into_websocket()
+            .await
+            .map_err(|error| RevttyError::runtime("websocket upgrade", websocket_error(error)))
+    };
+
+    tokio::time::timeout(limit, handshake)
         .await
-        .map_err(|error| RevttyError::runtime("websocket upgrade", error))
+        .unwrap_or_else(|_| {
+            Err(RevttyError::message(format!(
+                "websocket handshake with the relay timed out after {limit:?}"
+            )))
+        })
+}
+
+/// reqwest-websocket's own messages ("reqwest error", "websocket upgrade failed", "tungstenite
+/// error") leave the cause, such as the status of a refused upgrade or a TLS failure, to the
+/// source chain. The URL reqwest adds is left out: the caller's context names the relay.
+pub fn websocket_error(error: reqwest_websocket::Error) -> String {
+    match error {
+        reqwest_websocket::Error::Reqwest(error) => with_sources(&error.without_url()),
+        error => with_sources(&error),
+    }
 }
 
 pub fn http_url(relay: &str, path: &str) -> Result<String, RevttyError> {
@@ -362,6 +409,8 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{http_url, session_error_detail, valid_name, websocket_url};
 
     #[test]
@@ -476,6 +525,175 @@ mod tests {
             .await
             .expect("follow a redirect on loopback");
         assert_eq!(followed.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_websocket_handshake_nobody_answers_is_bounded() {
+        // Accepts connections and never answers, as a frozen relay does: TCP keepalive sees a
+        // healthy peer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind frozen relay");
+        let address = listener.local_addr().expect("frozen relay address");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let client = super::relay_client().expect("relay client");
+        let started = tokio::time::Instant::now();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::connect_websocket_within(
+                &client,
+                &format!("http://{address}"),
+                "/v1/agent/demo",
+                "rva_test",
+                Duration::from_millis(200),
+            ),
+        )
+        .await;
+
+        let Ok(Err(error)) = outcome else {
+            panic!("the handshake was not bounded");
+        };
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn relay_client_offers_only_http1_to_tls_relays() {
+        use tokio::io::AsyncReadExt;
+
+        // Records the ClientHello and hangs up: no certificate is needed to see the offer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind TLS listener");
+        let port = listener.local_addr().expect("TLS listener address").port();
+        let hello = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept TLS client");
+            let mut hello = vec![0_u8; 5 + 16 * 1024];
+            let mut read = 0;
+            // One TLS record; its length follows the 5-byte record header.
+            while read < 5 || read < 5 + usize::from(u16::from_be_bytes([hello[3], hello[4]])) {
+                let more = stream
+                    .read(&mut hello[read..])
+                    .await
+                    .expect("read ClientHello");
+                if more == 0 {
+                    break;
+                }
+                read += more;
+            }
+            hello.truncate(read);
+            hello
+        });
+        let client = super::relay_client().expect("relay client");
+
+        let _ = super::connect_websocket(
+            &client,
+            &format!("https://localhost:{port}"),
+            "/v1/agent/demo",
+            "rva_test",
+        )
+        .await
+        .expect_err("the listener hangs up");
+
+        // reqwest-websocket upgrades over HTTP/1.1 only: a TLS terminator that picks h2, as
+        // Caddy does by default, would fail every WebSocket.
+        let hello = hello.await.expect("ClientHello");
+        assert_eq!(offered_protocols(&hello), Some(vec!["http/1.1".to_owned()]));
+    }
+
+    /// The protocols a TLS ClientHello record offers in its ALPN extension.
+    fn offered_protocols(hello: &[u8]) -> Option<Vec<String>> {
+        let number = |at: usize, width: usize| -> Option<usize> {
+            hello.get(at..at + width).map(|bytes| {
+                bytes
+                    .iter()
+                    .fold(0, |value, byte| value << 8 | usize::from(*byte))
+            })
+        };
+        // Record header, handshake header, client version and random.
+        let mut at = 5 + 4 + 2 + 32;
+        at += 1 + number(at, 1)?; // session id
+        at += 2 + number(at, 2)?; // cipher suites
+        at += 1 + number(at, 1)?; // compression methods
+        let end = at + 2 + number(at, 2)?;
+        at += 2;
+        while at + 4 <= end {
+            let (kind, size) = (number(at, 2)?, number(at + 2, 2)?);
+            at += 4;
+            if kind == 0x0010 {
+                let mut protocols = Vec::new();
+                let mut entry = at + 2;
+                while entry < at + size {
+                    let length = number(entry, 1)?;
+                    let name = hello.get(entry + 1..entry + 1 + length)?;
+                    protocols.push(String::from_utf8_lossy(name).into_owned());
+                    entry += 1 + length;
+                }
+                return Some(protocols);
+            }
+            at += size;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn a_refused_websocket_upgrade_reports_the_status() {
+        let app = axum::Router::new().route(
+            "/v1/agent/demo",
+            axum::routing::get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refusing relay");
+        let address = listener.local_addr().expect("refusing relay address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve refusing relay");
+        });
+        let client = super::relay_client().expect("relay client");
+
+        let error = super::connect_websocket(
+            &client,
+            &format!("http://{address}"),
+            "/v1/agent/demo",
+            "rva_test",
+        )
+        .await
+        .expect_err("the relay refused the upgrade")
+        .to_string();
+
+        assert!(error.contains("401"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn websocket_errors_show_their_cause_without_the_url() {
+        // Nothing listens on the port once this listener is gone.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("pick a free port")
+            .port();
+        let client = super::relay_client().expect("relay client");
+
+        // reqwest prints the URL it was sending to, here with a marker in its query.
+        let error = super::connect_websocket(
+            &client,
+            &format!("http://127.0.0.1:{port}/?url-marker"),
+            "/v1/agent/demo",
+            "rva_test",
+        )
+        .await
+        .expect_err("nothing listens")
+        .to_string();
+
+        assert!(error.contains("refused"), "{error}");
+        assert!(!error.contains("url-marker"), "{error}");
     }
 
     #[test]

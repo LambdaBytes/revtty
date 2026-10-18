@@ -57,6 +57,8 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - `relay agents` shows each agent's `operators=` fingerprints; operator session credentials are checked against the agent's current operators when used.
 - `relay enroll` refuses a name that is already enrolled unless `--replace` is given.
 - `agent enroll` prints the operator's fingerprint and whether a pairing code verified it, and refuses a pairing code given as `--token`. `forget` also discards a pairing pending for the machine.
+- `doctor` fails when other users can read `pairings`.
+- WebSocket errors show their cause, such as the status of a refused upgrade or the TLS or connection failure, instead of only `websocket upgrade failed`, `reqwest error` or `tungstenite error`.
 - Operator and agent commands refuse a plain `http://` or `ws://` relay URL unless its host is `localhost`, `127.0.0.0/8` or `[::1]`, and do not follow a relay's redirect to one, since enrollment, control and session credentials would cross the network unencrypted. An agent enrolled with such a URL stops at `agent run`; change `relay` in its `agent.toml` to the `https://` URL.
 
 ### Removed
@@ -80,3 +82,6 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - PTY or shell failures left a silent terminal; unknown control messages dropped the agent's connection.
 - `known_hosts` was created with the default mode, so `doctor` failed after the first pin under umask 002; `relay doctor` now only warns about a group-writable database directory.
 - `probe` showed a decode error instead of the relay's reason, for example a busy agent.
+- Behind a TLS terminator that negotiates HTTP/2, as Caddy does by default, every WebSocket failed while plain requests worked: revtty now speaks HTTP/1.1 to the relay.
+- Opening a WebSocket had no time limit: a relay or middlebox that accepted the connection and never answered kept an agent from reconnecting, and a data tunnel kept its session slot. Every handshake now gives up after 10 seconds.
+- An agent whose relay accepted the connection and then closed it, for example over an incompatible `Hello` or an operator list it could not store, reconnected about every second: the reconnect wait now restarts only once the relay answers a heartbeat ping.

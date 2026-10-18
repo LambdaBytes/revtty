@@ -493,6 +493,11 @@ pub async fn doctor(relay: &str) -> Result<(), RevttyError> {
     if known_hosts.exists() {
         crate::config::check_not_writable_by_others(&known_hosts)?;
     }
+    // Whoever can read a pairing's secret can forge the proof that pins a host key with it.
+    let pairings = paths.config_dir.join("pairings");
+    if pairings.exists() {
+        crate::config::check_private_file(&pairings)?;
+    }
 
     check_relay_health(&client, relay).await?;
 
