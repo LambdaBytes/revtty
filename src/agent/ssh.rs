@@ -44,6 +44,13 @@ const REVOKED_SESSION_WAIT: Duration = Duration::from_secs(5);
 /// A probe session ends after this long whatever the operator does: longer than the
 /// operator's own bounds on the handshake (30 s) and on the answer (10 s).
 const PROBE_SESSION_LIMIT: Duration = Duration::from_secs(45);
+/// A session whose operator has not authenticated this long after it started is closed, so
+/// that only an operator the agent lists keeps one of its slots any longer: longer than the
+/// operator's own bound on its SSH handshake (30 s). russh alone ends an unauthenticated
+/// session only as an idle one, after up to 120 s. The slot comes back once russh's session
+/// task is over, which may first finish delaying a rejected authentication (1 s), and
+/// `REVOKED_SESSION_WAIT` later at most.
+const AUTHENTICATION_LIMIT: Duration = Duration::from_secs(45);
 
 /// What an operator's SSH session is for, as the relay's offer says.
 #[derive(Clone)]
@@ -347,8 +354,9 @@ impl server::Handler for AgentSshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // A shell session keeps russh's default, which answers nothing.
+        // A shell session runs no command.
         let SessionKind::Probe(answer) = &self.kind else {
+            session.channel_failure(channel)?;
             return Ok(());
         };
         if self.open_channel != Some(channel) || data != PROBE_COMMAND.as_bytes() {
@@ -361,6 +369,42 @@ impl server::Handler for AgentSshHandler {
         session.exit_status_request(channel, 0)?;
         session.eof(channel)?;
         session.close(channel)?;
+        Ok(())
+    }
+
+    // russh's defaults for the requests below answer nothing, so a client waiting for the
+    // reply would hang: the agent runs no subsystem, sets no variable and forwards no X11.
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        _name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel)?;
+        Ok(())
+    }
+
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        _variable_name: &str,
+        _variable_value: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel)?;
+        Ok(())
+    }
+
+    async fn x11_request(
+        &mut self,
+        channel: ChannelId,
+        _single_connection: bool,
+        _x11_auth_protocol: &str,
+        _x11_auth_cookie: &str,
+        _x11_screen_number: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel)?;
         Ok(())
     }
 
@@ -854,6 +898,7 @@ pub async fn serve(
             shutdown,
             kind,
             limit,
+            AUTHENTICATION_LIMIT,
         )
         .await
     }
@@ -864,8 +909,9 @@ pub async fn serve(
 }
 
 /// Runs one operator's SSH session over `stream` until it ends, the key it authenticated
-/// with is revoked or `limit`, counted from the start, is over. `transport` is the task that
-/// carries `stream`.
+/// with is revoked, `limit` is over or `authentication_limit` is over before the operator
+/// authenticated, both counted from the start. `transport` is the task that carries `stream`.
+#[allow(clippy::too_many_arguments)]
 async fn serve_stream<S>(
     stream: S,
     transport: AbortHandle,
@@ -874,6 +920,7 @@ async fn serve_stream<S>(
     shutdown: ShellShutdown,
     kind: SessionKind,
     limit: Option<Duration>,
+    authentication_limit: Duration,
 ) -> Result<(), RevttyError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -897,6 +944,23 @@ where
             limit.unwrap_or_default().as_secs_f64()
         ))
     };
+    let unauthenticated_at_limit = async {
+        tokio::time::sleep(authentication_limit).await;
+        let in_time = authenticated
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        if in_time {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(unauthenticated_at_limit);
+    let unauthenticated = || {
+        RevttyError::message(format!(
+            "operator did not authenticate within {}s",
+            authentication_limit.as_secs_f64()
+        ))
+    };
 
     let started = tokio::select! {
         started = server::run_stream(
@@ -907,6 +971,10 @@ where
         () = &mut limit_reached => {
             transport.abort();
             return Err(over_limit());
+        }
+        () = &mut unauthenticated_at_limit => {
+            transport.abort();
+            return Err(unauthenticated());
         }
     };
     let mut running = started.map_err(|error| RevttyError::runtime("start SSH server", error))?;
@@ -940,6 +1008,14 @@ where
             let _ = tokio::time::timeout(REVOKED_SESSION_WAIT, &mut running).await;
             Err(over_limit())
         }
+        () = &mut unauthenticated_at_limit => {
+            // Waited for, as for a revoked operator: the session's stream still yields what
+            // the transport had buffered, so a key accepted just past the limit could start a
+            // shell after the slot was given back.
+            transport.abort();
+            let _ = tokio::time::timeout(REVOKED_SESSION_WAIT, &mut running).await;
+            Err(unauthenticated())
+        }
     }
 }
 
@@ -956,8 +1032,8 @@ mod tests {
     use tokio::sync::{mpsc, watch};
 
     use super::{
-        AgentSshHandler, OperatorAllowlist, SessionKind, ShellShutdown, authorize, ed25519_only,
-        operator_revoked, serve_stream, server_config, signal_if_running,
+        AUTHENTICATION_LIMIT, AgentSshHandler, OperatorAllowlist, SessionKind, ShellShutdown,
+        authorize, ed25519_only, operator_revoked, serve_stream, server_config, signal_if_running,
     };
     use crate::error::RevttyError;
     use crate::protocol::PROBE_COMMAND;
@@ -1799,7 +1875,11 @@ mod tests {
         _shutdown: TestShutdown,
     }
 
-    async fn revocable_session(operator: &PrivateKey, allowed: &[&PublicKey]) -> RevocableSession {
+    async fn revocable_session(
+        operator: &PrivateKey,
+        allowed: &[&PublicKey],
+        authentication_limit: Duration,
+    ) -> RevocableSession {
         let server_key = ed25519_key();
         let expected_server_key = server_key.public_key().clone();
         let (allowlist, allowlist_rx) = watch::channel(allowlist_of(allowed));
@@ -1821,6 +1901,7 @@ mod tests {
             shutdown.handle(),
             SessionKind::Shell,
             None,
+            authentication_limit,
         ));
 
         let client_config = client::Config {
@@ -1879,8 +1960,12 @@ mod tests {
     async fn revoked_operator_session_is_closed_and_its_shell_reaped() {
         let operator = ed25519_key();
         let other = ed25519_key();
-        let shell =
-            revocable_session(&operator, &[operator.public_key(), other.public_key()]).await;
+        let shell = revocable_session(
+            &operator,
+            &[operator.public_key(), other.public_key()],
+            AUTHENTICATION_LIMIT,
+        )
+        .await;
 
         let mut channel = shell
             .session
@@ -1925,7 +2010,8 @@ mod tests {
     async fn allowlist_change_that_keeps_the_key_keeps_the_session() {
         let operator = ed25519_key();
         let added = ed25519_key();
-        let shell = revocable_session(&operator, &[operator.public_key()]).await;
+        let shell =
+            revocable_session(&operator, &[operator.public_key()], AUTHENTICATION_LIMIT).await;
 
         shell
             .allowlist
@@ -2034,6 +2120,7 @@ mod tests {
             TestShutdown::new().handle(),
             SessionKind::Probe(PROBE_ANSWER.to_owned()),
             Some(Duration::from_secs(30)),
+            AUTHENTICATION_LIMIT,
         ));
 
         let client_config = client::Config {
@@ -2073,6 +2160,79 @@ mod tests {
         })
         .await;
         messages
+    }
+
+    /// The first `count` replies `channel` gets to its requests, waiting at most 5 s.
+    async fn channel_replies(
+        channel: &mut russh::Channel<client::Msg>,
+        count: usize,
+    ) -> Vec<ChannelMsg> {
+        let mut replies = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while replies.len() < count {
+                match channel.wait().await {
+                    Some(reply @ (ChannelMsg::Success | ChannelMsg::Failure)) => {
+                        replies.push(reply)
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        })
+        .await;
+        replies
+    }
+
+    /// Asks `channel` for what no agent session runs.
+    async fn request_unsupported(channel: &russh::Channel<client::Msg>) {
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .expect("request subsystem");
+        channel
+            .set_env(true, "LANG", "C")
+            .await
+            .expect("request variable");
+        channel
+            .request_x11(true, false, "MIT-MAGIC-COOKIE-1", "00", 0)
+            .await
+            .expect("request X11");
+    }
+
+    #[tokio::test]
+    async fn a_shell_session_refuses_what_it_does_not_run() {
+        let operator = ed25519_key();
+        let shell =
+            revocable_session(&operator, &[operator.public_key()], AUTHENTICATION_LIMIT).await;
+        let mut channel = shell
+            .session
+            .channel_open_session()
+            .await
+            .expect("open channel");
+
+        channel.exec(true, "id").await.expect("request command");
+        request_unsupported(&channel).await;
+        // The refusals leave the channel to its terminal.
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .expect("request PTY");
+        let replies = channel_replies(&mut channel, 5).await;
+
+        assert!(
+            matches!(
+                replies[..],
+                [
+                    ChannelMsg::Failure,
+                    ChannelMsg::Failure,
+                    ChannelMsg::Failure,
+                    ChannelMsg::Failure,
+                    ChannelMsg::Success
+                ]
+            ),
+            "a shell session left a request unanswered: {replies:?}"
+        );
+        shell.server.abort();
     }
 
     #[tokio::test]
@@ -2138,6 +2298,22 @@ mod tests {
                     .any(|message| matches!(message, ChannelMsg::Data { .. })),
             "a probe session ran another command: {messages:?}"
         );
+
+        let (session, _) = probe_session(&operator, true).await;
+        let mut channel = session.channel_open_session().await.expect("open channel");
+        request_unsupported(&channel).await;
+        let replies = channel_replies(&mut channel, 3).await;
+        assert!(
+            matches!(
+                replies[..],
+                [
+                    ChannelMsg::Failure,
+                    ChannelMsg::Failure,
+                    ChannelMsg::Failure
+                ]
+            ),
+            "a probe session left a request unanswered: {replies:?}"
+        );
     }
 
     #[tokio::test]
@@ -2161,6 +2337,7 @@ mod tests {
                 TestShutdown::new().handle(),
                 SessionKind::Probe(PROBE_ANSWER.to_owned()),
                 Some(Duration::from_millis(300)),
+                AUTHENTICATION_LIMIT,
             ),
         )
         .await
@@ -2189,6 +2366,7 @@ mod tests {
             TestShutdown::new().handle(),
             SessionKind::Probe(PROBE_ANSWER.to_owned()),
             Some(Duration::from_millis(500)),
+            AUTHENTICATION_LIMIT,
         ));
 
         let client_config = client::Config {
@@ -2219,5 +2397,103 @@ mod tests {
             .expect("the probe session outlived its limit")
             .expect("probe session task");
         assert!(served.is_err(), "an idle probe session ended as a success");
+    }
+
+    #[tokio::test]
+    async fn an_operator_that_never_authenticates_loses_its_session_at_the_limit() {
+        // An operator that never speaks: russh alone would wait 120 s for its banner.
+        let (_silent_operator, agent_stream) = tokio::io::duplex(64 * 1024);
+        let transport = tokio::spawn(std::future::pending::<()>());
+        let served = tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_stream(
+                agent_stream,
+                transport.abort_handle(),
+                server_config(ed25519_key(), SSH_TIMEOUTS),
+                allow_only(ed25519_key().public_key()),
+                TestShutdown::new().handle(),
+                SessionKind::Shell,
+                None,
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("an unauthenticated session outlived its limit");
+
+        let error = served.expect_err("an unauthenticated session ended as a success");
+        assert!(
+            error.to_string().contains("did not authenticate"),
+            "{error}"
+        );
+        assert!(transport.await.is_err_and(|error| error.is_cancelled()));
+    }
+
+    #[tokio::test]
+    async fn an_operator_that_stops_after_the_key_exchange_loses_its_session_at_the_limit() {
+        let server_key = ed25519_key();
+        let expected_server_key = server_key.public_key().clone();
+        let (client_stream, relay_side) = tokio::io::duplex(64 * 1024);
+        let (application, agent_side) = tokio::io::duplex(64 * 1024);
+        // Stands in for the bridge task: ending it closes the agent's stream.
+        let bridge = tokio::spawn(async move {
+            let (mut relay_side, mut agent_side) = (relay_side, agent_side);
+            let _ = tokio::io::copy_bidirectional(&mut relay_side, &mut agent_side).await;
+        });
+        let server = tokio::spawn(serve_stream(
+            application,
+            bridge.abort_handle(),
+            server_config(server_key, SSH_TIMEOUTS),
+            allow_only(ed25519_key().public_key()),
+            TestShutdown::new().handle(),
+            SessionKind::Shell,
+            None,
+            Duration::from_millis(300),
+        ));
+
+        let client_config = client::Config {
+            preferred: ed25519_only(),
+            ..Default::default()
+        };
+        let _session = client::connect_stream(
+            Arc::new(client_config),
+            client_stream,
+            TestClient {
+                expected_server_key,
+            },
+        )
+        .await
+        .expect("connect SSH client");
+
+        // It never authenticates: russh alone would keep the session until its first
+        // keepalive, 30 s in, which a russh client does not expect before authenticating.
+        let served = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("an unauthenticated session outlived its limit")
+            .expect("session task");
+        let error = served.expect_err("an unauthenticated session ended as a success");
+        assert!(
+            error.to_string().contains("did not authenticate"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_session_outlives_the_authentication_limit() {
+        let operator = ed25519_key();
+        let started = tokio::time::Instant::now();
+        let shell =
+            revocable_session(&operator, &[operator.public_key()], Duration::from_secs(2)).await;
+
+        tokio::time::sleep_until(started + Duration::from_secs(3)).await;
+        assert!(
+            !shell.server.is_finished(),
+            "the authentication limit closed an authenticated session"
+        );
+        shell
+            .session
+            .channel_open_session()
+            .await
+            .expect("session is still usable");
+        shell.server.abort();
     }
 }

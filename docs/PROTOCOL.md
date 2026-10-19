@@ -190,6 +190,8 @@ operator WSS ===== opaque relay ===== agent WSS
 
 A probe takes the same path; the agent's SSH server answers `revtty-probe` instead of starting a PTY.
 
+In either kind of session the agent refuses, with a channel failure, `exec` of any other command, `subsystem`, `env` and `x11-req`, and closes the session if the operator has not authenticated within 45 s of its start.
+
 SSH performs agent host authentication and operator public-key authentication independently of the relay control authorization.
 
 ## Implemented invariants
@@ -200,7 +202,7 @@ SSH performs agent host authentication and operator public-key authentication in
 - Operator inventory challenges are short lived, single use and return only agents authorized for the proven key.
 - Agent data-tunnel credentials are per-rendezvous and single use.
 - A v1 rendezvous requires explicit agent acceptance before pairing.
-- Concurrent probe/shell sessions are bounded by persisted per-agent configuration.
+- Concurrent probe/shell sessions are bounded by persisted per-agent configuration; a session whose operator has not authenticated over SSH is closed 45 s after its start and gives its slot back within 5 s more.
 - Agent acceptance and data-tunnel waits have separate deadlines; timeout triggers `session_cancel`.
 - A persistent agent control credential cannot open a `/v1/session` data tunnel.
 - A pending agent side is paired at most once.
