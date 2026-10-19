@@ -14,7 +14,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::Message;
 use ssh_key::{Algorithm, HashAlg, PublicKey};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
@@ -61,7 +61,24 @@ const CONTROL_TIMEOUTS: ControlTimeouts = ControlTimeouts {
     relay_idle: Duration::from_secs(45),
 };
 
-type SessionTasks = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
+type SessionTasks = Arc<Mutex<HashMap<String, SessionTask>>>;
+
+/// A session's task, which holds its slot, and the way to cancel it (`cancel_session`).
+struct SessionTask {
+    task: JoinHandle<()>,
+    cancel: oneshot::Sender<()>,
+}
+
+/// Asks the task of `session_id` to end its session, returning whether it was tracked. The
+/// task gives its slot back once the SSH session is over; aborting the task instead would give
+/// it back while russh, in a task of its own, kept running the session.
+async fn cancel_session(session_tasks: &SessionTasks, session_id: &str) -> bool {
+    let Some(session) = session_tasks.lock().await.remove(session_id) else {
+        return false;
+    };
+    let _ = session.cancel.send(());
+    true
+}
 
 #[derive(Debug, Default)]
 struct ReconnectBackoff {
@@ -462,7 +479,7 @@ async fn run_control_once(
                 session_tasks
                     .lock()
                     .await
-                    .retain(|_, task| !task.is_finished());
+                    .retain(|_, session| !session.task.is_finished());
 
                 send_control(
                     &mut sender,
@@ -532,6 +549,7 @@ async fn run_control_once(
                                 let allowlist = allowlist.clone();
                                 let task_session_id = session_id.clone();
                                 let shell_shutdown = shell_shutdown.clone();
+                                let (cancel, cancelled) = oneshot::channel();
 
                                 // Over SSH, as a shell: the agent checks the operator against
                                 // its own list and proves its host key.
@@ -547,6 +565,7 @@ async fn run_control_once(
                                                 allowlist,
                                                 shell_shutdown,
                                                 ssh::SessionKind::Probe(answer),
+                                                cancelled,
                                             )
                                             .await
                                         }
@@ -557,7 +576,10 @@ async fn run_control_once(
                                     }
                                 });
 
-                                session_tasks.lock().await.insert(session_id, task);
+                                session_tasks
+                                    .lock()
+                                    .await
+                                    .insert(session_id, SessionTask { task, cancel });
                             }
                             ControlMessage::ShellOffer {
                                 version,
@@ -580,6 +602,7 @@ async fn run_control_once(
                                 let allowlist = allowlist.clone();
                                 let task_session_id = session_id.clone();
                                 let shell_shutdown = shell_shutdown.clone();
+                                let (cancel, cancelled) = oneshot::channel();
 
                                 let task = tokio::spawn(async move {
                                     let _permit = permit;
@@ -591,6 +614,7 @@ async fn run_control_once(
                                         allowlist,
                                         shell_shutdown,
                                         ssh::SessionKind::Shell,
+                                        cancelled,
                                     )
                                     .await
                                     {
@@ -598,14 +622,17 @@ async fn run_control_once(
                                     }
                                 });
 
-                                session_tasks.lock().await.insert(session_id, task);
+                                session_tasks
+                                    .lock()
+                                    .await
+                                    .insert(session_id, SessionTask { task, cancel });
                             }
                             ControlMessage::SessionCancel {
                                 version,
                                 session_id,
                             } if version == CONTROL_PROTOCOL_VERSION => {
-                                if let Some(task) = session_tasks.lock().await.remove(&session_id) {
-                                    task.abort();
+                                let tracked = cancel_session(session_tasks, &session_id).await;
+                                if tracked {
                                     eprintln!("session cancelled by relay: {session_id}");
                                 }
                             }
@@ -1189,16 +1216,17 @@ mod tests {
     use axum::extract::ws::{Message as RelayMessage, WebSocketUpgrade};
     use axum::routing::get;
     use ssh_key::{Algorithm, PrivateKey};
-    use tokio::sync::{Mutex, Semaphore, mpsc, watch};
+    use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 
     use super::config::AgentConfig;
     use super::config::RunLock;
     use super::ssh::OperatorAllowlist;
     use super::{
         ControlTimeouts, OPERATORS_RELOAD_INTERVAL, PendingRotation, RECONNECT_JITTER_PERCENT,
-        ReconnectBackoff, Rotation, describe_undecodable, enroll_with, finish_pending_rotation,
-        pty_test, reconnect_base_millis, reconnect_delay_millis, rotate_control_credential,
-        run_control_once, ssh, watch_operators,
+        ReconnectBackoff, Rotation, SessionTask, SessionTasks, cancel_session,
+        describe_undecodable, enroll_with, finish_pending_rotation, pty_test,
+        reconnect_base_millis, reconnect_delay_millis, rotate_control_credential, run_control_once,
+        ssh, watch_operators,
     };
     use crate::config::Paths;
     use crate::pairing::{PairingCode, PairingSecret};
@@ -1226,6 +1254,8 @@ mod tests {
         Vanishing,
         /// Offers a probe whose data tunnel never gets an answer, then keeps answering pings.
         OfferingDeadTunnel,
+        /// As `OfferingDeadTunnel`, and cancels the session shortly after the offer.
+        CancellingDeadTunnel,
     }
 
     async fn fake_relay(behaviour: FakeRelay) -> String {
@@ -1252,7 +1282,9 @@ mod tests {
                         let _ = socket.send(RelayMessage::Close(None)).await;
                         return;
                     }
-                    if let FakeRelay::OfferingDeadTunnel = behaviour {
+                    if let FakeRelay::OfferingDeadTunnel | FakeRelay::CancellingDeadTunnel =
+                        behaviour
+                    {
                         let offer = serde_json::to_string(&ControlMessage::ProbeOffer {
                             version: CONTROL_PROTOCOL_VERSION,
                             session_id: "dead-tunnel".to_owned(),
@@ -1260,6 +1292,18 @@ mod tests {
                         })
                         .expect("encode probe offer");
                         let _ = socket.send(RelayMessage::Text(offer.into())).await;
+                        if let FakeRelay::CancellingDeadTunnel = behaviour {
+                            // Not reading meanwhile leaves the agent's pings unanswered: well
+                            // below `FAST_CONTROL_TIMEOUTS.relay_idle`, or the agent drops the
+                            // control connection before the cancellation reaches it.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            let cancel = serde_json::to_string(&ControlMessage::SessionCancel {
+                                version: CONTROL_PROTOCOL_VERSION,
+                                session_id: "dead-tunnel".to_owned(),
+                            })
+                            .expect("encode session cancel");
+                            let _ = socket.send(RelayMessage::Text(cancel.into())).await;
+                        }
                         while socket.recv().await.is_some() {}
                         return;
                     }
@@ -1534,6 +1578,60 @@ mod tests {
         assert!(
             released,
             "a tunnel stuck in its handshake kept its session slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_session_asks_its_task_instead_of_aborting_it() {
+        let session_tasks: SessionTasks = Arc::default();
+        let (cancel, cancelled) = oneshot::channel();
+        let (report, reported) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            // A session task reacts to the cancellation; an aborted one never reports.
+            let _ = report.send(cancelled.await.is_ok());
+        });
+        session_tasks
+            .lock()
+            .await
+            .insert("s1".to_owned(), SessionTask { task, cancel });
+
+        assert!(!cancel_session(&session_tasks, "unknown").await);
+        assert!(cancel_session(&session_tasks, "s1").await);
+        assert!(session_tasks.lock().await.is_empty());
+        let reported = tokio::time::timeout(Duration::from_secs(2), reported)
+            .await
+            .expect("the session task never saw the cancellation");
+        assert_eq!(reported, Ok(true), "the session task was aborted");
+    }
+
+    #[tokio::test]
+    async fn a_session_cancelled_before_its_tunnel_opens_gives_its_slot_back_at_once() {
+        let relay = fake_relay(FakeRelay::CancellingDeadTunnel).await;
+        let slots = Arc::new(Semaphore::new(1));
+        let control = tokio::spawn({
+            let slots = slots.clone();
+            async move {
+                run_with_slots(
+                    &relay,
+                    &mut ReconnectBackoff::default(),
+                    slots,
+                    Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+
+        let reserved = wait_until(Duration::from_secs(5), || slots.available_permits() == 0).await;
+        assert!(
+            reserved,
+            "the agent did not take a session slot for the offer"
+        );
+        // Well before the 10 s handshake bound that would end the attempt otherwise.
+        let released = wait_until(Duration::from_secs(3), || slots.available_permits() == 1).await;
+        control.abort();
+        assert!(
+            released,
+            "a session the relay cancelled kept its slot until its handshake bound"
         );
     }
 

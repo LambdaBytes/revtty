@@ -93,7 +93,7 @@ Fields:
 - `version`
 - `session_id`
 
-The agent tracks spawned session tasks by ID and aborts the matching task on cancellation.
+The agent tracks its session tasks by ID. On cancellation the matching task stops opening the session's data tunnel or, once it is open, closes it and waits up to 5 s for the SSH session to end, before it gives the session slot back.
 
 ### operators_report
 

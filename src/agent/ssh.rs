@@ -869,6 +869,19 @@ fn server_config(host_key: PrivateKey, timeouts: SshTimeouts) -> server::Config 
     }
 }
 
+/// Resolves once the relay cancels the session through `cancel`; never when the agent only
+/// stopped tracking it and dropped the sender.
+async fn relay_cancelled(cancel: oneshot::Receiver<()>) {
+    if cancel.await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn cancelled_by_relay() -> RevttyError {
+    RevttyError::message("session cancelled by the relay")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     client: &Client,
     relay: &str,
@@ -877,9 +890,16 @@ pub async fn serve(
     allowlist: watch::Receiver<OperatorAllowlist>,
     shutdown: ShellShutdown,
     kind: SessionKind,
+    cancel: oneshot::Receiver<()>,
 ) -> Result<(), RevttyError> {
+    let cancelled = relay_cancelled(cancel);
+    tokio::pin!(cancelled);
+
     let path = format!("/v1/session/{session_id}");
-    let websocket = connect_websocket(client, relay, &path, tunnel_token).await?;
+    let websocket = tokio::select! {
+        websocket = connect_websocket(client, relay, &path, tunnel_token) => websocket?,
+        () = &mut cancelled => return Err(cancelled_by_relay()),
+    };
     let (stream, bridge_task) = websocket_byte_stream(websocket);
     let transport = bridge_task.abort_handle();
 
@@ -899,6 +919,7 @@ pub async fn serve(
             kind,
             limit,
             AUTHENTICATION_LIMIT,
+            cancelled,
         )
         .await
     }
@@ -909,8 +930,9 @@ pub async fn serve(
 }
 
 /// Runs one operator's SSH session over `stream` until it ends, the key it authenticated
-/// with is revoked, `limit` is over or `authentication_limit` is over before the operator
-/// authenticated, both counted from the start. `transport` is the task that carries `stream`.
+/// with is revoked, the relay cancels it (`cancelled`), `limit` is over or
+/// `authentication_limit` is over before the operator authenticated, both counted from the
+/// start. `transport` is the task that carries `stream`.
 #[allow(clippy::too_many_arguments)]
 async fn serve_stream<S>(
     stream: S,
@@ -921,10 +943,12 @@ async fn serve_stream<S>(
     kind: SessionKind,
     limit: Option<Duration>,
     authentication_limit: Duration,
+    cancelled: impl Future<Output = ()>,
 ) -> Result<(), RevttyError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    tokio::pin!(cancelled);
     let authenticated = Arc::new(Mutex::new(None));
     // Subscribed before the handler can authenticate anyone, so every later change of the
     // allowlist is seen here.
@@ -976,6 +1000,10 @@ where
             transport.abort();
             return Err(unauthenticated());
         }
+        () = &mut cancelled => {
+            transport.abort();
+            return Err(cancelled_by_relay());
+        }
     };
     let mut running = started.map_err(|error| RevttyError::runtime("start SSH server", error))?;
 
@@ -1016,6 +1044,14 @@ where
             let _ = tokio::time::timeout(REVOKED_SESSION_WAIT, &mut running).await;
             Err(unauthenticated())
         }
+        () = &mut cancelled => {
+            // Returning while russh still runs the session would give its slot back early:
+            // its task outlives `running` if dropped. Ending the transport stops it, as for a
+            // revoked operator.
+            transport.abort();
+            let _ = tokio::time::timeout(REVOKED_SESSION_WAIT, &mut running).await;
+            Err(cancelled_by_relay())
+        }
     }
 }
 
@@ -1029,11 +1065,12 @@ mod tests {
     use russh::keys::key::{PrivateKeyWithHashAlg, safe_rng};
     use russh::keys::{Algorithm, PrivateKey, PublicKey, PublicKeyOrCertificate};
     use russh::{client, server};
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::{mpsc, oneshot, watch};
 
     use super::{
         AUTHENTICATION_LIMIT, AgentSshHandler, OperatorAllowlist, SessionKind, ShellShutdown,
-        authorize, ed25519_only, operator_revoked, serve_stream, server_config, signal_if_running,
+        authorize, ed25519_only, operator_revoked, relay_cancelled, serve_stream, server_config,
+        signal_if_running,
     };
     use crate::error::RevttyError;
     use crate::protocol::PROBE_COMMAND;
@@ -1870,6 +1907,8 @@ mod tests {
     /// task like the agent's WebSocket bridge, authenticated as `operator`.
     struct RevocableSession {
         allowlist: watch::Sender<OperatorAllowlist>,
+        /// What the agent's control loop fires on the relay's `SessionCancel`.
+        cancel: oneshot::Sender<()>,
         session: client::Handle<TestClient>,
         server: tokio::task::JoinHandle<Result<(), RevttyError>>,
         _shutdown: TestShutdown,
@@ -1893,6 +1932,7 @@ mod tests {
         });
 
         let shutdown = TestShutdown::new();
+        let (cancel, cancelled) = oneshot::channel();
         let server = tokio::spawn(serve_stream(
             application,
             bridge.abort_handle(),
@@ -1902,6 +1942,7 @@ mod tests {
             SessionKind::Shell,
             None,
             authentication_limit,
+            relay_cancelled(cancelled),
         ));
 
         let client_config = client::Config {
@@ -1928,6 +1969,7 @@ mod tests {
 
         RevocableSession {
             allowlist,
+            cancel,
             session,
             server,
             _shutdown: shutdown,
@@ -2004,6 +2046,103 @@ mod tests {
             gone,
             "shell {pid} of a revoked operator survived its session"
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_the_relay_cancels_is_closed_and_its_shell_reaped() {
+        let operator = ed25519_key();
+        let mut shell =
+            revocable_session(&operator, &[operator.public_key()], AUTHENTICATION_LIMIT).await;
+
+        let mut channel = shell
+            .session
+            .channel_open_session()
+            .await
+            .expect("open terminal channel");
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .expect("request PTY");
+        channel.request_shell(true).await.expect("request shell");
+        channel
+            .data_bytes(b"echo PID=$$ END_$((3+4))\n".to_vec())
+            .await
+            .expect("send shell input");
+        let text = read_until(&mut channel, "END_7", Duration::from_secs(10)).await;
+        let pid = marker_value(&text, "PID=");
+
+        shell.cancel.send(()).expect("session still listening");
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), &mut shell.server)
+            .await
+            .expect("a cancelled session stayed open")
+            .expect("session task");
+        let error = ended.expect_err("cancelled session ended as if completed");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+
+        // The operator's side of the transport is gone too: the session did not carry on
+        // in russh's own task.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while channel.wait().await.is_some() {}
+        })
+        .await;
+        assert!(closed.is_ok(), "the cancelled session kept its channel");
+        let gone = wait_process_gone(&pid, Duration::from_secs(10)).await;
+        if !gone {
+            kill_process(&pid);
+        }
+        assert!(gone, "shell {pid} of a cancelled session survived it");
+    }
+
+    #[tokio::test]
+    async fn a_session_the_relay_cancels_before_authentication_ends_at_once() {
+        let (_silent_operator, agent_stream) = tokio::io::duplex(64 * 1024);
+        let transport = tokio::spawn(std::future::pending::<()>());
+        let (cancel, cancelled) = oneshot::channel();
+        let served = tokio::spawn(serve_stream(
+            agent_stream,
+            transport.abort_handle(),
+            server_config(ed25519_key(), SSH_TIMEOUTS),
+            allow_only(ed25519_key().public_key()),
+            TestShutdown::new().handle(),
+            SessionKind::Shell,
+            None,
+            AUTHENTICATION_LIMIT,
+            relay_cancelled(cancelled),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.send(()).expect("session still listening");
+        let served = tokio::time::timeout(Duration::from_secs(2), served)
+            .await
+            .expect("a session cancelled before authentication stayed open")
+            .expect("session task");
+
+        let error = served.expect_err("a cancelled session ended as a success");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(transport.await.is_err_and(|error| error.is_cancelled()));
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_cancel_sender_is_dropped_keeps_running() {
+        let operator = ed25519_key();
+        let shell =
+            revocable_session(&operator, &[operator.public_key()], AUTHENTICATION_LIMIT).await;
+
+        // The agent drops a sender when it stops tracking the session, not to cancel it.
+        drop(shell.cancel);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            !shell.server.is_finished(),
+            "dropping the cancel sender ended the session"
+        );
+        shell
+            .session
+            .channel_open_session()
+            .await
+            .expect("session is still usable");
+        shell.server.abort();
     }
 
     #[tokio::test]
@@ -2121,6 +2260,7 @@ mod tests {
             SessionKind::Probe(PROBE_ANSWER.to_owned()),
             Some(Duration::from_secs(30)),
             AUTHENTICATION_LIMIT,
+            std::future::pending(),
         ));
 
         let client_config = client::Config {
@@ -2338,6 +2478,7 @@ mod tests {
                 SessionKind::Probe(PROBE_ANSWER.to_owned()),
                 Some(Duration::from_millis(300)),
                 AUTHENTICATION_LIMIT,
+                std::future::pending(),
             ),
         )
         .await
@@ -2367,6 +2508,7 @@ mod tests {
             SessionKind::Probe(PROBE_ANSWER.to_owned()),
             Some(Duration::from_millis(500)),
             AUTHENTICATION_LIMIT,
+            std::future::pending(),
         ));
 
         let client_config = client::Config {
@@ -2415,6 +2557,7 @@ mod tests {
                 SessionKind::Shell,
                 None,
                 Duration::from_millis(300),
+                std::future::pending(),
             ),
         )
         .await
@@ -2448,6 +2591,7 @@ mod tests {
             SessionKind::Shell,
             None,
             Duration::from_millis(300),
+            std::future::pending(),
         ));
 
         let client_config = client::Config {
