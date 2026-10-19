@@ -14,6 +14,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::Message;
 use ssh_key::{Algorithm, HashAlg, PublicKey};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -313,6 +314,10 @@ pub async fn run() -> Result<(), RevttyError> {
     let (shutdown_signal, _) = watch::channel(false);
     let (shell_guard, mut shell_guards) = mpsc::channel::<()>(1);
     let shell_shutdown = ssh::ShellShutdown::new(shutdown_signal.subscribe(), &shell_guard);
+    // Service managers stop with SIGTERM (launchd always, systemd unless told otherwise); it
+    // takes the same path as Ctrl-C instead of killing the agent with its shells running.
+    let mut terminate = signal(SignalKind::terminate())
+        .map_err(|error| RevttyError::runtime("listen for SIGTERM", error))?;
 
     let stopped = loop {
         let control = async {
@@ -349,6 +354,7 @@ pub async fn run() -> Result<(), RevttyError> {
                 }
             }
             signal = tokio::signal::ctrl_c() => break signal,
+            _ = terminate.recv() => break Ok(()),
         }
 
         let delay = backoff.next_delay();
@@ -357,6 +363,7 @@ pub async fn run() -> Result<(), RevttyError> {
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             signal = tokio::signal::ctrl_c() => break signal,
+            _ = terminate.recv() => break Ok(()),
         }
     };
 
@@ -374,7 +381,7 @@ pub async fn run() -> Result<(), RevttyError> {
         );
     }
 
-    stopped.map_err(|error| RevttyError::runtime("wait for Ctrl-C", error))
+    stopped.map_err(|error| RevttyError::runtime("wait for a stop signal", error))
 }
 
 /// Rereads the operator list from `agent.toml` on its own schedule, independent of the relay

@@ -52,7 +52,7 @@ Design principles, scope and roadmap: [docs/BRIEF.md](docs/BRIEF.md), [docs/V1_S
 - The agent reconnects with bounded exponential backoff and jitter, including when the relay goes silent.
 - The relay drops agents that stop sending heartbeats, so `status` does not report vanished machines as online.
 - SSH keepalives on both ends: idle sessions stay open, sessions on a dead network path end and free their slot.
-- Shell teardown never injects input, reaps the shell (SIGHUP, then SIGKILL after 5 s) and releases the PTY; on SIGINT the agent waits up to 10 s for these teardowns before it exits.
+- Shell teardown never injects input, reaps the shell (SIGHUP, then SIGKILL after 5 s) and releases the PTY; on SIGINT or SIGTERM the agent waits up to 10 s for these teardowns before it exits.
 - On SIGINT or SIGTERM, `relay serve` stops accepting connections, finishes the requests in flight, ends its control connections and sessions, and writes their audit records (sessions `interrupted`) before it exits, within 5 s.
 
 **Operations**

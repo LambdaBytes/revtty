@@ -497,6 +497,58 @@ fn process_alive(pid: &str) -> bool {
 
 #[test]
 fn agent_sigint_reaps_active_shell() {
+    stopping_the_agent_reaps_its_active_shell("INT");
+}
+
+/// launchd stops a service with SIGTERM, and so does systemd without `KillSignal=SIGINT`.
+#[test]
+fn agent_sigterm_reaps_active_shell() {
+    stopping_the_agent_reaps_its_active_shell("TERM");
+}
+
+#[test]
+fn agent_sigterm_during_a_reconnect_wait_stops_it_at_once() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let mut agent_process = start_agent(&root, &agent);
+    agent_process.wait_for_log("connected to", Duration::from_secs(20));
+
+    // With the relay gone the waits double: the third is 3.2 to 4 s long.
+    drop(relay);
+    agent_process.wait_for_log_count("reconnecting in", 3, Duration::from_secs(20));
+    let agent_pid = agent_process.child.id().to_string();
+    let signalled = Command::new("kill")
+        .args(["-TERM", &agent_pid])
+        .status()
+        .expect("signal the agent");
+    assert!(signalled.success());
+
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let exited = loop {
+        if let Ok(Some(status)) = agent_process.child.try_wait() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let Some(status) = exited else {
+        panic!(
+            "agent finished its reconnect wait before it stopped:\n{}",
+            agent_process.log()
+        );
+    };
+    assert!(
+        status.success(),
+        "agent exited with {status} after SIGTERM:\n{}",
+        agent_process.log()
+    );
+}
+
+fn stopping_the_agent_reaps_its_active_shell(signal: &str) {
     let root = TempRoot::new();
     let (operator, agent, relay_role) = prepare(&root);
     let (relay, url) = start_relay(&root, &relay_role);
@@ -521,9 +573,9 @@ fn agent_sigint_reaps_active_shell() {
 
     let agent_pid = agent_process.child.id().to_string();
     let signalled = Command::new("kill")
-        .args(["-INT", &agent_pid])
+        .args([&format!("-{signal}"), &agent_pid])
         .status()
-        .expect("send SIGINT to agent");
+        .expect("signal the agent");
     assert!(signalled.success());
 
     let deadline = Instant::now() + Duration::from_secs(12);
@@ -541,9 +593,15 @@ fn agent_sigint_reaps_active_shell() {
     if shell_alive {
         let _ = Command::new("kill").args(["-9", &pid]).status();
     }
+    let Some(status) = exited else {
+        panic!(
+            "agent did not exit after SIG{signal}:\n{}",
+            agent_process.log()
+        );
+    };
     assert!(
-        exited.is_some(),
-        "agent did not exit after SIGINT:\n{}",
+        status.success(),
+        "agent exited with {status} after SIG{signal}:\n{}",
         agent_process.log()
     );
     assert!(
