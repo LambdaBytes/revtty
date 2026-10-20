@@ -32,6 +32,7 @@ Design principles, scope and roadmap: [docs/BRIEF.md](docs/BRIEF.md), [docs/V1_S
 
 - Interactive shell on a real PTY of an enrolled Linux or macOS machine: input, output, live resize, EOF, and the remote exit status as `revtty connect`'s exit code (255 when the session ended without one).
 - `exec` runs one command without a terminal, as `ssh host command` does: stdout and stderr stay apart, stdin is forwarded (`-n` closes it), and `revtty exec` exits with the command's status. It never asks for a host key, so it can run unattended; `--timeout` (exit status 124) and Ctrl-C (130) end the command too.
+- `list`, `status`, `probe` and `exec` print their result as one line of JSON with `--json`, for scripts (see [JSON output](#json-output)).
 - `probe` checks a target end to end, over SSH as a shell does: the agent checks the operator against its own list and proves its pinned host key, so the relay cannot answer for it. `list` and `status` show presence: online/offline, last seen, version, sessions in use and allowed.
 - Several concurrent sessions per agent (default 4, up to 64); extra requests get an explicit "agent is busy".
 
@@ -136,11 +137,11 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | Command | Role | What it does |
 |---|---|---|
 | `init` | operator | Create or show the operator identity. |
-| `list --relay URL` | operator | Agents enrolled for this operator key, with presence and capacity. |
-| `status NAME --relay URL [--host-key FP]` | operator | One agent's status. |
-| `probe NAME --relay URL [--host-key FP]` | operator | Round trip through the agent over SSH: name, OS, architecture, version. |
+| `list --relay URL [--json]` | operator | Agents enrolled for this operator key, with presence and capacity. |
+| `status NAME --relay URL [--host-key FP] [--json]` | operator | One agent's status. |
+| `probe NAME --relay URL [--host-key FP] [--json]` | operator | Round trip through the agent over SSH: name, OS, architecture, version. |
 | `connect NAME --relay URL [--host-key FP]` | operator | Interactive shell; exits with the remote status. |
-| `exec NAME --relay URL [--host-key FP] [--timeout SECS] [-n] -- COMMAND...` | operator | Run one command without a terminal; exits with its status (255 without one, 124 at the timeout, 130 on Ctrl-C). |
+| `exec NAME --relay URL [--host-key FP] [--timeout SECS] [-n] [--json] -- COMMAND...` | operator | Run one command without a terminal; exits with its status (255 without one, 124 at the timeout, 130 on Ctrl-C). |
 | `doctor --relay URL` | operator | Local permissions, relay reachability and signed authentication. |
 | `pair NAME --token TOKEN --relay URL` | operator | Wrap an enrollment token in a pairing code for the target; nothing is sent. |
 | `forget NAME --relay URL` | operator | Forget a machine's pinned host key, after it was reinstalled and re-enrolled, and discard a pairing pending for it. |
@@ -155,6 +156,19 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | `relay agents`, `relay sessions [--limit N]`, `relay doctor` | relay | Enrolled agents, session audit, diagnostics. |
 
 `--relay` accepts `https://` or `wss://`, and plain `http://` or `ws://` only for a relay on the same machine (`localhost`, `127.0.0.0/8` or `[::1]`), and a redirect to any other plain URL is not followed: every request carries a credential that only TLS protects. For the operator commands it defaults to `$REVTTY_RELAY`, else `ws://127.0.0.1:8787`; `agent enroll` requires it explicitly and the agent then keeps it in `agent.toml`. Relay commands take `--db`, defaulting to `$REVTTY_DB`, else `revtty.db`.
+
+## JSON output
+
+With `--json`, `list`, `status`, `probe` and `exec` print their result on stdout as one line of JSON. Every field is always there, `null` when it does not apply; times are Unix seconds; the exit status is the same as without `--json`. Errors, such as an unreachable relay or a rejected key, are still text on stderr, with no JSON.
+
+| Command | Fields |
+|---|---|
+| `list` | an array of `{name, online, active_sessions, max_sessions, last_seen, version}` |
+| `status` | `{id, name, online, active_sessions, max_sessions, created_at, last_seen, version}` |
+| `probe` | `{name, reachable, os, arch, version}`; `reachable` is always `true`, as a probe that does not get through is an error |
+| `exec` | `{target, exit_status, exit_signal, timed_out, interrupted, stdout, stdout_base64, stdout_truncated, stderr, stderr_base64, stderr_truncated}` |
+
+`max_sessions` is `null` while the agent is offline. With `exec --json`, the command's stdout and stderr are kept in memory instead of written as they arrive, up to 16 MiB each; the rest is still read, and dropped, and `stdout_truncated` or `stderr_truncated` is `true`. Each stream is UTF-8 text in `stdout` or `stderr`, or, when what was kept is not valid UTF-8 (a stream that the limit cut within a character included), standard base64 in `stdout_base64` or `stderr_base64`, with the other one `null`. The JSON itself can be larger than what it carries: base64 adds a third, and JSON escapes each control character in text with up to six bytes. `exit_signal` is the SSH name of the signal that killed the command, such as `TERM`. At `--timeout` or Ctrl-C the JSON comes too, with the output received until then and `timed_out` or `interrupted` set. It is written once the command has ended or been stopped, and that write waits for its reader like any write to a pipe; Ctrl-C during it ends `revtty exec` with 130 and the JSON cut short.
 
 ## Files
 

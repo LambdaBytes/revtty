@@ -19,6 +19,7 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
             host_key,
             timeout,
             no_stdin,
+            json,
             command,
         } => {
             return crate::client::exec(
@@ -28,21 +29,24 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
                 timeout.map(Duration::from_secs),
                 !no_stdin,
                 &command.join(" "),
+                json,
             )
             .await;
         }
         Command::Init => crate::client::init(),
-        Command::List { relay } => crate::client::list(&relay).await,
+        Command::List { relay, json } => crate::client::list(&relay, json).await,
         Command::Status {
             target,
             relay,
             host_key,
-        } => crate::client::status(&target, &relay, host_key.as_deref()).await,
+            json,
+        } => crate::client::status(&target, &relay, host_key.as_deref(), json).await,
         Command::Probe {
             target,
             relay,
             host_key,
-        } => crate::client::probe(&target, &relay, host_key.as_deref()).await,
+            json,
+        } => crate::client::probe(&target, &relay, host_key.as_deref(), json).await,
         Command::Doctor { relay } => crate::client::doctor(&relay).await,
         Command::Pair {
             target,

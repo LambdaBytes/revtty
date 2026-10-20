@@ -1,11 +1,12 @@
+mod json;
 mod ssh;
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use ssh_key::{HashAlg, LineEnding, PrivateKey};
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::config::Paths;
 use crate::error::{RevttyError, with_sources};
@@ -99,7 +100,7 @@ pub fn forget(target: &str, relay: &str) -> Result<(), RevttyError> {
     Ok(())
 }
 
-pub async fn list(relay: &str) -> Result<(), RevttyError> {
+pub async fn list(relay: &str, json: bool) -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
     let identity = crate::identity::ensure_operator(&paths)?;
     let private_key = PrivateKey::read_openssh_file(&identity.private_key_path)
@@ -129,6 +130,11 @@ pub async fn list(relay: &str) -> Result<(), RevttyError> {
         .await
         .map_err(|error| RevttyError::runtime("decode agent list", error))?;
 
+    if json {
+        println!("{}", json::agents(&response.agents)?);
+        return Ok(());
+    }
+
     if response.agents.is_empty() {
         println!("No enrolled agents.");
         return Ok(());
@@ -150,7 +156,12 @@ pub async fn list(relay: &str) -> Result<(), RevttyError> {
     Ok(())
 }
 
-pub async fn status(target: &str, relay: &str, host_key: Option<&str>) -> Result<(), RevttyError> {
+pub async fn status(
+    target: &str,
+    relay: &str,
+    host_key: Option<&str>,
+    json: bool,
+) -> Result<(), RevttyError> {
     let operator = authenticate_operator(target, relay, host_key, true).await?;
     let url = http_url(relay, &format!("/v1/status/{target}"))?;
     let response = operator
@@ -178,6 +189,11 @@ pub async fn status(target: &str, relay: &str, host_key: Option<&str>) -> Result
         .json()
         .await
         .map_err(|error| RevttyError::runtime("decode agent status", error))?;
+
+    if json {
+        println!("{}", json::status(&status)?);
+        return Ok(());
+    }
 
     println!("target    {}", status.name);
     println!(
@@ -421,7 +437,12 @@ async fn request_operator_session(
         .map_err(|error| RevttyError::runtime("decode operator authentication", error))
 }
 
-pub async fn probe(target: &str, relay: &str, host_key: Option<&str>) -> Result<(), RevttyError> {
+pub async fn probe(
+    target: &str,
+    relay: &str,
+    host_key: Option<&str>,
+    json: bool,
+) -> Result<(), RevttyError> {
     let operator = authenticate_operator(target, relay, host_key, true).await?;
     let path = format!("/v1/probe/{target}");
     let websocket =
@@ -433,6 +454,11 @@ pub async fn probe(target: &str, relay: &str, host_key: Option<&str>) -> Result<
         target,
     )
     .await?;
+
+    if json {
+        println!("{}", json::probe(&result)?);
+        return Ok(());
+    }
 
     println!("target   {}", result.name);
     println!("status   reachable");
@@ -482,7 +508,8 @@ const STOP_MESSAGE_WAIT: Duration = Duration::from_millis(200);
 /// Runs `command` on `target` and returns the code `revtty exec` exits with: the command's
 /// exit status, as with ssh. Nothing is asked at the terminal, so a host key not pinned yet
 /// needs `host_key`. `timeout` and Ctrl-C end the whole run, authentication included, and
-/// the command with it.
+/// the command with it. With `json`, the command's output is kept and printed with how it
+/// ended, as JSON, once the run is over.
 pub async fn exec(
     target: &str,
     relay: &str,
@@ -490,63 +517,71 @@ pub async fn exec(
     timeout: Option<Duration>,
     forward_stdin: bool,
     command: &str,
+    json: bool,
 ) -> Result<u8, RevttyError> {
     // Listening from the start: a Ctrl-C at any point must end the command.
     let mut interrupts = signal(SignalKind::interrupt())
         .map_err(|error| RevttyError::runtime("listen for Ctrl-C", error))?;
-    let stop = async {
-        let timed_out = async {
-            match timeout {
-                Some(timeout) => tokio::time::sleep(timeout).await,
-                None => std::future::pending().await,
+    let mut capture = json.then(ssh::Capture::default);
+
+    let end = {
+        let stop = async {
+            let timed_out = async {
+                match timeout {
+                    Some(timeout) => tokio::time::sleep(timeout).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                () = timed_out => ssh::Stop::TimedOut,
+                _ = interrupts.recv() => ssh::Stop::Interrupted,
             }
         };
+        tokio::pin!(stop);
+
+        let opened = async {
+            let operator = authenticate_operator(target, relay, host_key, false).await?;
+            let path = format!("/v1/exec/{target}");
+            let websocket = connect_websocket_or_refusal(
+                &operator.client,
+                relay,
+                &path,
+                &operator.auth.session_token,
+            )
+            .await?
+            .map_err(exec_refused)?;
+            Ok::<_, RevttyError>((operator, websocket))
+        };
         tokio::select! {
-            () = timed_out => ssh::Stop::TimedOut,
-            _ = interrupts.recv() => ssh::Stop::Interrupted,
+            opened = opened => {
+                let (operator, websocket) = opened?;
+                ssh::run_command(
+                    websocket,
+                    &operator.private_key_path,
+                    &operator.auth.host_key,
+                    command,
+                    forward_stdin,
+                    capture.as_mut(),
+                    &mut stop,
+                )
+                .await
+                .map_err(|error| {
+                    if error.to_string() == SESSION_NOT_ACCEPTED {
+                        RevttyError::message(format!(
+                            "{SESSION_NOT_ACCEPTED}; the agent may predate exec (upgrade revtty \
+                             on {target})"
+                        ))
+                    } else {
+                        error
+                    }
+                })?
+            }
+            stopped = &mut stop => ssh::CommandEnd::Stopped(stopped),
         }
     };
-    tokio::pin!(stop);
 
-    let opened = async {
-        let operator = authenticate_operator(target, relay, host_key, false).await?;
-        let path = format!("/v1/exec/{target}");
-        let websocket = connect_websocket_or_refusal(
-            &operator.client,
-            relay,
-            &path,
-            &operator.auth.session_token,
-        )
-        .await?
-        .map_err(exec_refused)?;
-        Ok::<_, RevttyError>((operator, websocket))
-    };
-    let (operator, websocket) = tokio::select! {
-        opened = opened => opened?,
-        stopped = &mut stop => return Ok(stopped_exit_code(stopped, timeout).await),
-    };
-
-    let end = ssh::run_command(
-        websocket,
-        &operator.private_key_path,
-        &operator.auth.host_key,
-        command,
-        forward_stdin,
-        &mut stop,
-    )
-    .await
-    .map_err(|error| {
-        if error.to_string() == SESSION_NOT_ACCEPTED {
-            RevttyError::message(format!(
-                "{SESSION_NOT_ACCEPTED}; the agent may predate exec (upgrade revtty on {target})"
-            ))
-        } else {
-            error
-        }
-    })?;
-
-    Ok(match end {
-        ssh::CommandEnd::Exited(status) => u8::try_from(status).unwrap_or(u8::MAX),
+    let code = match &end {
+        ssh::CommandEnd::Exited(status) => u8::try_from(*status).unwrap_or(u8::MAX),
         ssh::CommandEnd::Killed(signal) => {
             eprintln!("revtty: the remote command was killed by signal {signal}");
             UNKNOWN_EXIT_CODE
@@ -555,8 +590,42 @@ pub async fn exec(
             eprintln!("revtty: the remote command ended without an exit status");
             UNKNOWN_EXIT_CODE
         }
-        ssh::CommandEnd::Stopped(stopped) => stopped_exit_code(stopped, timeout).await,
-    })
+        ssh::CommandEnd::Stopped(stopped) => stopped_exit_code(*stopped, timeout).await,
+    };
+
+    let Some(capture) = capture else {
+        return Ok(code);
+    };
+    let result = json::exec(target, &end, &capture.stdout, &capture.stderr)?;
+    if write_unless_interrupted(result, &mut interrupts).await? {
+        Ok(code)
+    } else {
+        report_without_waiting("revtty: interrupted; the JSON result is cut short".to_owned())
+            .await;
+        Ok(INTERRUPTED_EXIT_CODE)
+    }
+}
+
+/// Writes `json` and a newline to stdout on a thread of its own, so that Ctrl-C still ends
+/// `revtty exec` while a reader that stopped reading holds that write. Returns false when
+/// Ctrl-C came first; what is not written then goes with the process.
+async fn write_unless_interrupted(
+    json: String,
+    interrupts: &mut Signal,
+) -> Result<bool, RevttyError> {
+    let (written, wrote) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut stdout = std::io::stdout().lock();
+        let _ = written.send(writeln!(stdout, "{json}").and_then(|()| stdout.flush()));
+    });
+    tokio::select! {
+        wrote = wrote => match wrote {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(error)) => Err(RevttyError::runtime("write the JSON result", error)),
+            Err(_) => Err(RevttyError::message("the writer of the JSON result stopped")),
+        },
+        _ = interrupts.recv() => Ok(false),
+    }
 }
 
 async fn stopped_exit_code(stopped: ssh::Stop, timeout: Option<Duration>) -> u8 {

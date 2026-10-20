@@ -1353,6 +1353,389 @@ fn exec_never_asks_for_a_host_key() {
     );
 }
 
+/// The JSON that `revtty args` printed on stdout; it must succeed.
+fn json_output(role: &Role, args: &[&str]) -> serde_json::Value {
+    let output = role
+        .command()
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run revtty");
+    assert!(
+        output.status.success(),
+        "revtty {args:?} failed ({}):\n{}",
+        output.status,
+        text(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "revtty {args:?} printed no JSON ({error}):\n{}",
+            text(&output.stdout)
+        )
+    })
+}
+
+fn json_keys(value: &serde_json::Value) -> Vec<&str> {
+    let mut keys: Vec<_> = value
+        .as_object()
+        .expect("a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// Reads `run`'s stdout and stderr as they come until it exits, at most `within`.
+fn read_until_exit(mut run: Child, within: Duration) -> std::process::Output {
+    fn read_all(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).expect("read revtty output");
+            bytes
+        })
+    }
+    let stdout = read_all(run.stdout.take().expect("revtty stdout"));
+    let stderr = read_all(run.stderr.take().expect("revtty stderr"));
+
+    let deadline = Instant::now() + within;
+    let status = loop {
+        if let Some(status) = run.try_wait().expect("poll revtty") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = run.kill();
+            let _ = run.wait();
+            panic!("revtty kept running");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    std::process::Output {
+        status,
+        stdout: stdout.join().expect("stdout reader"),
+        stderr: stderr.join().expect("stderr reader"),
+    }
+}
+
+fn spawn_exec(operator: &Role, url: &str, args: &[&str]) -> Child {
+    operator
+        .command()
+        .args(["exec", AGENT_NAME, "--relay", url])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn revtty exec")
+}
+
+fn exec_json(output: &std::process::Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "revtty exec printed no JSON ({error}):\n{}",
+            text(&output.stderr)
+        )
+    })
+}
+
+#[test]
+fn list_status_and_probe_print_json() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    const AGENT_FIELDS: [&str; 6] = [
+        "active_sessions",
+        "last_seen",
+        "max_sessions",
+        "name",
+        "online",
+        "version",
+    ];
+
+    assert_eq!(
+        json_output(&operator, &["list", "--relay", &url, "--json"]),
+        serde_json::json!([])
+    );
+
+    // Enrolled, not running: offline, with no capacity to report.
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let listed = json_output(&operator, &["list", "--relay", &url, "--json"]);
+    let agents = listed.as_array().expect("a JSON array");
+    assert_eq!(agents.len(), 1, "{listed}");
+    assert_eq!(json_keys(&agents[0]), AGENT_FIELDS);
+    assert_eq!(agents[0]["name"], AGENT_NAME);
+    assert_eq!(agents[0]["online"], false);
+    assert_eq!(agents[0]["max_sessions"], serde_json::Value::Null);
+    assert!(agents[0]["last_seen"].is_i64(), "{listed}");
+
+    let _agent_process = start_agent(&root, &agent);
+    let probe = json_output(
+        &operator,
+        &[
+            "probe",
+            AGENT_NAME,
+            "--relay",
+            &url,
+            "--host-key",
+            &host_key,
+            "--json",
+        ],
+    );
+    assert_eq!(
+        probe,
+        serde_json::json!({
+            "name": AGENT_NAME,
+            "reachable": true,
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+    );
+
+    let status = json_output(
+        &operator,
+        &["status", AGENT_NAME, "--relay", &url, "--json"],
+    );
+    assert_eq!(
+        json_keys(&status),
+        [
+            "active_sessions",
+            "created_at",
+            "id",
+            "last_seen",
+            "max_sessions",
+            "name",
+            "online",
+            "version"
+        ]
+    );
+    assert_eq!(status["name"], AGENT_NAME);
+    assert_eq!(status["online"], true);
+    assert_eq!(status["max_sessions"], 4);
+    assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+    assert!(status["last_seen"].is_i64(), "{status}");
+    // The same agent as the text says.
+    let said = operator.run(&["status", AGENT_NAME, "--relay", &url]);
+    assert_eq!(status["id"], field(&said, "id"), "{said}");
+    assert_eq!(status["created_at"].to_string(), field(&said, "created"));
+
+    let listed = json_output(&operator, &["list", "--relay", &url, "--json"]);
+    assert_eq!(listed[0]["online"], true, "{listed}");
+    assert_eq!(listed[0]["max_sessions"], 4, "{listed}");
+}
+
+#[test]
+fn exec_prints_its_result_as_json() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let _agent_process = start_agent(&root, &agent);
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+
+    let ran = read_until_exit(
+        spawn_exec(
+            &operator,
+            &url,
+            &["--json", "--", "printf out; printf err >&2; exit 3"],
+        ),
+        Duration::from_secs(20),
+    );
+    assert_eq!(ran.status.code(), Some(3), "{}", text(&ran.stderr));
+    assert_eq!(text(&ran.stderr), "");
+    assert_eq!(
+        text(&ran.stdout).lines().count(),
+        1,
+        "{}",
+        text(&ran.stdout)
+    );
+    assert_eq!(
+        exec_json(&ran),
+        serde_json::json!({
+            "target": AGENT_NAME,
+            "exit_status": 3,
+            "exit_signal": null,
+            "timed_out": false,
+            "interrupted": false,
+            "stdout": "out",
+            "stdout_base64": null,
+            "stdout_truncated": false,
+            "stderr": "err",
+            "stderr_base64": null,
+            "stderr_truncated": false,
+        })
+    );
+
+    // Output that is not UTF-8, from a command that a signal killed.
+    let killed = read_until_exit(
+        spawn_exec(
+            &operator,
+            &url,
+            &["--json", "--", "printf '\\377\\376'; kill -TERM $$"],
+        ),
+        Duration::from_secs(20),
+    );
+    assert_eq!(killed.status.code(), Some(255), "{}", text(&killed.stderr));
+    let result = exec_json(&killed);
+    assert_eq!(result["stdout"], serde_json::Value::Null);
+    assert_eq!(result["stdout_base64"], "//4=");
+    assert_eq!(result["exit_status"], serde_json::Value::Null);
+    assert_eq!(result["exit_signal"], "TERM");
+
+    // Past the capture limit, the output is still read, to the command's end.
+    let long = read_until_exit(
+        spawn_exec(
+            &operator,
+            &url,
+            &[
+                "--json",
+                "--",
+                "head -c 17000000 /dev/zero | tr '\\0' a; echo done >&2",
+            ],
+        ),
+        Duration::from_secs(60),
+    );
+    assert_eq!(long.status.code(), Some(0), "{}", text(&long.stderr));
+    let result = exec_json(&long);
+    assert_eq!(result["stdout_truncated"], true);
+    assert_eq!(
+        result["stdout"].as_str().map(str::len),
+        Some(16 * 1024 * 1024)
+    );
+    assert_eq!(result["stderr"], "done\n");
+    assert_eq!(result["stderr_truncated"], false);
+}
+
+#[test]
+fn exec_json_at_its_timeout_waits_for_a_late_reader() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let _agent_process = start_agent(&root, &agent);
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+
+    // Its JSON holds more than a pipe does, so it waits for this test to read it.
+    let run = spawn_exec(
+        &operator,
+        &url,
+        &[
+            "--json",
+            "--timeout",
+            "5",
+            "-n",
+            "--",
+            "printf partial; head -c 1000000 /dev/zero | tr '\\0' x; sleep 20",
+        ],
+    );
+    // Past the timeout, which also covers authentication and the connection.
+    std::thread::sleep(Duration::from_secs(7));
+    let reading = Instant::now();
+    let ran = read_until_exit(run, Duration::from_secs(15));
+    // Stopped at its timeout, before this test read anything: not when the command ended.
+    assert!(
+        reading.elapsed() < Duration::from_secs(3),
+        "exec ran past its timeout: {:?}",
+        reading.elapsed()
+    );
+    assert_eq!(ran.status.code(), Some(124), "{}", text(&ran.stderr));
+    let result = exec_json(&ran);
+    assert_eq!(result["timed_out"], true);
+    assert_eq!(result["interrupted"], false);
+    assert_eq!(result["exit_status"], serde_json::Value::Null);
+    assert!(
+        result["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.starts_with("partial")),
+        "{}",
+        result["stdout"]
+    );
+}
+
+#[test]
+fn ctrl_c_ends_exec_while_its_json_waits_for_a_reader() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let _agent_process = start_agent(&root, &agent);
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+
+    let mut run = spawn_exec(
+        &operator,
+        &url,
+        &[
+            "--json",
+            "-n",
+            "--",
+            "head -c 1000000 /dev/zero | tr '\\0' x",
+        ],
+    );
+    // The JSON comes once the command has ended: its first byte says exec is writing it.
+    // The rest, more than a pipe holds, waits for a read that this test never makes.
+    let mut stdout = run.stdout.take().expect("exec stdout");
+    let (first, read) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut byte = [0_u8; 1];
+        let got = stdout.read_exact(&mut byte).map(|()| byte[0]);
+        let _ = first.send((got, stdout));
+    });
+    let Ok((got, _unread)) = read.recv_timeout(Duration::from_secs(20)) else {
+        let _ = run.kill();
+        let _ = run.wait();
+        panic!("revtty exec wrote no JSON");
+    };
+    assert_eq!(got.expect("read the JSON"), b'{');
+
+    let pid = run.id().to_string();
+    let sent = Command::new("kill")
+        .args(["-INT", &pid])
+        .status()
+        .expect("run kill");
+    assert!(sent.success(), "SIGINT not delivered");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = run.try_wait().expect("poll revtty exec") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = run.kill();
+            let _ = run.wait();
+            panic!("exec kept writing its JSON after Ctrl-C");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(130));
+    let mut stderr = String::new();
+    run.stderr
+        .take()
+        .expect("exec stderr")
+        .read_to_string(&mut stderr)
+        .expect("read exec stderr");
+    assert!(stderr.contains("cut short"), "{stderr}");
+}
+
 #[test]
 fn relay_urls_with_credentials_are_refused() {
     let root = TempRoot::new();

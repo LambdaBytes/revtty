@@ -453,16 +453,47 @@ pub enum CommandEnd {
     Stopped(Stop),
 }
 
-/// Runs `command` on the agent over SSH: its stdout and stderr go to the local ones, and the
-/// local stdin goes to it if `forward_stdin`. `stop` ends the run at any point, writing the
-/// output here included: its transport is cut, the agent sees the session end and ends the
-/// command, and output not yet written here is dropped.
+/// Most of each output stream a `Capture` keeps: 16 MiB.
+pub const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
+
+/// One of a command's output streams, kept in memory up to `CAPTURE_LIMIT` bytes.
+#[derive(Default)]
+pub struct Captured {
+    pub bytes: Vec<u8>,
+    /// More than `CAPTURE_LIMIT` bytes arrived: the rest was read and dropped.
+    pub truncated: bool,
+}
+
+impl Captured {
+    fn keep(&mut self, chunk: &[u8]) {
+        let room = CAPTURE_LIMIT - self.bytes.len();
+        if chunk.len() > room {
+            self.truncated = true;
+        }
+        self.bytes
+            .extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+}
+
+/// A command's stdout and stderr, kept instead of written here.
+#[derive(Default)]
+pub struct Capture {
+    pub stdout: Captured,
+    pub stderr: Captured,
+}
+
+/// Runs `command` on the agent over SSH: its stdout and stderr go to the local ones, or to
+/// `capture` if there is one, and the local stdin goes to it if `forward_stdin`. `stop` ends
+/// the run at any point, writing the output here included: its transport is cut, the agent
+/// sees the session end and ends the command, and output not yet written here is dropped;
+/// what `capture` got by then stays there.
 pub async fn run_command(
     websocket: WebSocket,
     operator_key_path: &Path,
     encoded_host_key: &str,
     command: &str,
     forward_stdin: bool,
+    capture: Option<&mut Capture>,
     stop: impl Future<Output = Stop>,
 ) -> Result<CommandEnd, RevttyError> {
     let (operator_key, expected_server_key) = session_keys(operator_key_path, encoded_host_key)?;
@@ -477,6 +508,7 @@ pub async fn run_command(
             expected_server_key,
             command,
             forward_stdin,
+            capture,
         ) => result,
         stopped = &mut stop => {
             transport.abort();
@@ -500,6 +532,7 @@ async fn command_session<S>(
     expected_server_key: PublicKey,
     command: &str,
     forward_stdin: bool,
+    capture: Option<&mut Capture>,
 ) -> Result<CommandEnd, RevttyError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -531,8 +564,13 @@ where
         mpsc::channel(1).1
     };
     let mut stdin_open = true;
-    let mut stdout = OutputWriter::spawn("output", Box::new(io::stdout()));
-    let mut stderr = OutputWriter::spawn("error output", Box::new(io::stderr()));
+    let (mut stdout, mut stderr) = match capture {
+        Some(Capture { stdout, stderr }) => (Output::Captured(stdout), Output::Captured(stderr)),
+        None => (
+            Output::Local(OutputWriter::spawn("output", Box::new(io::stdout()))),
+            Output::Local(OutputWriter::spawn("error output", Box::new(io::stderr()))),
+        ),
+    };
     let mut end = CommandEnd::Unknown;
 
     loop {
@@ -551,10 +589,8 @@ where
                 Some(Err(error)) => return Err(RevttyError::runtime("read local input", error)),
             },
             message = channel.wait() => match message {
-                Some(ChannelMsg::Data { data }) => stdout.write(data.to_vec()).await?,
-                Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
-                    stderr.write(data.to_vec()).await?;
-                }
+                Some(ChannelMsg::Data { data }) => stdout.write(&data).await?,
+                Some(ChannelMsg::ExtendedData { data, ext: 1 }) => stderr.write(&data).await?,
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                     end = CommandEnd::Exited(exit_status);
                 }
@@ -574,6 +610,31 @@ where
         .disconnect(Disconnect::ByApplication, "", "English")
         .await;
     Ok(end)
+}
+
+/// Where `command_session` puts one of the command's output streams.
+enum Output<'a> {
+    Local(OutputWriter),
+    Captured(&'a mut Captured),
+}
+
+impl Output<'_> {
+    async fn write(&mut self, chunk: &[u8]) -> Result<(), RevttyError> {
+        match self {
+            Self::Local(writer) => writer.write(chunk.to_vec()).await,
+            Self::Captured(captured) => {
+                captured.keep(chunk);
+                Ok(())
+            }
+        }
+    }
+
+    async fn finish(self) -> Result<(), RevttyError> {
+        match self {
+            Self::Local(writer) => writer.finish().await,
+            Self::Captured(_) => Ok(()),
+        }
+    }
 }
 
 /// Chunks of a command's output queued for a local writer thread.
@@ -670,8 +731,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ClientHandler, client_config, ed25519_only, open_session, open_terminal_channel,
-        probe_answer,
+        CAPTURE_LIMIT, Captured, ClientHandler, client_config, ed25519_only, open_session,
+        open_terminal_channel, probe_answer,
     };
     use crate::error::RevttyError;
     use crate::protocol::ProbeResult;
@@ -1014,5 +1075,23 @@ mod tests {
             panic!("an answer for demo counted as a probe of other");
         };
         assert!(misnamed.to_string().contains("not as other"), "{misnamed}");
+    }
+
+    #[test]
+    fn a_captured_stream_keeps_its_first_bytes_up_to_the_limit() {
+        let mut captured = Captured::default();
+        captured.keep(&vec![b'a'; CAPTURE_LIMIT - 1]);
+        captured.keep(b"b");
+        assert_eq!(captured.bytes.len(), CAPTURE_LIMIT);
+        assert!(!captured.truncated, "exactly the limit is not over it");
+
+        let mut captured = Captured::default();
+        captured.keep(&vec![b'a'; CAPTURE_LIMIT - 1]);
+        // A chunk across the limit keeps what fits, and what comes after it is dropped.
+        captured.keep(b"bc");
+        captured.keep(b"d");
+        assert_eq!(captured.bytes.len(), CAPTURE_LIMIT);
+        assert_eq!(captured.bytes.last(), Some(&b'b'));
+        assert!(captured.truncated);
     }
 }

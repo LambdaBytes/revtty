@@ -19,6 +19,10 @@ pub enum Command {
         /// Relay base URL.
         #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
         relay: String,
+
+        /// Print the result as one line of JSON (see the README).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show one machine's status.
@@ -34,6 +38,10 @@ pub enum Command {
         /// `revtty agent status` on the target.
         #[arg(long)]
         host_key: Option<String>,
+
+        /// Print the result as one line of JSON (see the README).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Validate reverse connectivity to an online agent.
@@ -49,6 +57,10 @@ pub enum Command {
         /// `revtty agent status` on the target.
         #[arg(long)]
         host_key: Option<String>,
+
+        /// Print the result as one line of JSON (see the README).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Open an interactive remote terminal.
@@ -87,6 +99,11 @@ pub enum Command {
         /// Send no input: the command's stdin is closed at once.
         #[arg(short = 'n')]
         no_stdin: bool,
+
+        /// Keep the command's output and print it, with how the command ended, as one line of
+        /// JSON (see the README).
+        #[arg(long)]
+        json: bool,
 
         /// The command, after `--`. The target's shell runs its words joined with spaces, as
         /// ssh does.
