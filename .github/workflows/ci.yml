@@ -81,11 +81,49 @@ jobs:
       - name: Release build
         run: cargo build --release
 
+  # Without a cache, as after a Cargo.lock or toolchain change, this job took 597 s of
+  # its former 600 s limit on macos-26-arm64 (run 38744141526, 5m36s of it the release
+  # build); with one, 4 to 5 minutes. Its limit leaves room for a run without a cache.
   macos:
     if: github.event_name != 'push' || contains(github.event.head_commit.message, '[full ci]')
-    timeout-minutes: 10
+    timeout-minutes: 20
     name: macos-latest
     runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --all-features
+
+      - name: Release build
+        run: cargo build --release
+
+      - name: launchd smoke test
+        run: .github/scripts/launchd-smoke.sh
+
+  # The macos job's checks, with its time limit, on an Intel Mac. Its first run starts
+  # without a cache.
+  macos-intel:
+    if: github.event_name != 'push' || contains(github.event.head_commit.message, '[full ci]')
+    timeout-minutes: 20
+    name: macos-26-intel
+    runs-on: macos-26-intel
 
     steps:
       - name: Checkout
