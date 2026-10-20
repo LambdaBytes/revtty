@@ -1135,8 +1135,13 @@ pub fn operator_list() -> Result<(), RevttyError> {
 
 pub fn operator_add(key_path: &Path) -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
-    let encoded = std::fs::read_to_string(key_path)
-        .map_err(|error| RevttyError::runtime("read operator public key", error))?;
+    let encoded = if key_path == Path::new("-") {
+        std::io::read_to_string(std::io::stdin())
+            .map_err(|error| RevttyError::runtime("read operator public key from stdin", error))?
+    } else {
+        std::fs::read_to_string(key_path)
+            .map_err(|error| RevttyError::runtime("read operator public key", error))?
+    };
     let (fingerprint, revision) = AgentConfig::update(&paths, |config| {
         let fingerprint = config.add_operator(&encoded)?;
         Ok((fingerprint, config.operators_revision))

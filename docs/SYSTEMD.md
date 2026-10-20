@@ -57,7 +57,7 @@ journalctl -u "revtty-agent@$ACCOUNT.service"
 
 ## Operators and credential rotation
 
-Operator keys are managed as the same account, with the same paths: `revtty agent operator list`, `add` and `revoke`. The running agent applies a change within 2 seconds, without a restart.
+Operator keys are managed as the same account, with the same paths: `revtty agent operator list`, `add` and `revoke`. The running agent applies a change within 2 seconds, without a restart. From an operator's machine, `revtty exec` runs them as the agent's account, with the agent's paths, for example `revtty exec NAME --relay URL -- revtty agent operator add - < new.pub`; the README describes rotating an operator key that way.
 
 Rotating the agent's relay credential needs the agent stopped:
 

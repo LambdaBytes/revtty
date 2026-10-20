@@ -45,7 +45,7 @@ Design principles, scope and roadmap: [docs/BRIEF.md](docs/BRIEF.md), [docs/V1_S
 - `list` only shows agents that authorize the signing key. Challenge requests do not reveal which agents exist, and they keep no relay state: unauthenticated requests cannot use up what operators need to authenticate.
 - The agent's host key is pinned per relay and agent in revtty's own `known_hosts`. The first pin needs the operator's confirmation of the fingerprint printed on the target, or the agent's pairing proof, so the relay cannot introduce a host key; a changed key is a hard failure unless the machine was enrolled again with a new pairing code.
 - The agent authenticates the operator's key again inside SSH, against its own operator list in `agent.toml`. Only Ed25519 keys are accepted.
-- Operators are managed on the target with `revtty agent operator list|add|revoke`, locally or from an operator's `revtty connect` shell. The running agent applies a change within 2 seconds: a revoked operator's open sessions are closed and new ones refused. The last operator cannot be revoked.
+- Operators are managed on the target with `revtty agent operator list|add|revoke`, locally, from an operator's `revtty connect` shell, or with `revtty exec` (`agent operator add -` reads the key from stdin), which also rotates an operator key (see [Rotating an operator key](#rotating-an-operator-key)). The running agent applies a change within 2 seconds: a revoked operator's open sessions are closed and new ones refused. The last operator cannot be revoked.
 - The relay learns the agent's operator list from the agent, and issues session credentials only to those operators; it cannot add one, because the agent's own list decides SSH access.
 - Relay URLs with a user name or password are refused: revtty authenticates with its own credentials, and would otherwise store and print them.
 
@@ -148,7 +148,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | `agent enroll --relay URL (--token TOKEN \| --pairing-code CODE) [--max-sessions N]` | target | Consume an enrollment and store the agent configuration. |
 | `agent run` | target | Run the persistent agent. |
 | `agent status`, `agent doctor`, `agent pty-test` | target | Local configuration, full diagnostics, local PTY check. |
-| `agent operator list`, `agent operator add KEYFILE`, `agent operator revoke FINGERPRINT` | target | Show, authorize or revoke operator keys. |
+| `agent operator list`, `agent operator add KEYFILE`, `agent operator revoke FINGERPRINT` | target | Show, authorize or revoke operator keys; `add -` reads the key from stdin. |
 | `agent rotate-credential` | target | Replace the agent's relay credential; the agent must be stopped. |
 | `relay init`, `relay serve [--bind ADDR]` | relay | Create or migrate the database; serve the relay. |
 | `relay enroll NAME --operator-key FILE [--ttl SECS] [--replace]` | relay | Single-use enrollment token (default lifetime 600 s); `--replace` re-enrolls an enrolled agent. |
@@ -169,6 +169,29 @@ With `--json`, `list`, `status`, `probe` and `exec` print their result on stdout
 | `exec` | `{target, exit_status, exit_signal, timed_out, interrupted, stdout, stdout_base64, stdout_truncated, stderr, stderr_base64, stderr_truncated}` |
 
 `max_sessions` is `null` while the agent is offline. With `exec --json`, the command's stdout and stderr are kept in memory instead of written as they arrive, up to 16 MiB each; the rest is still read, and dropped, and `stdout_truncated` or `stderr_truncated` is `true`. Each stream is UTF-8 text in `stdout` or `stderr`, or, when what was kept is not valid UTF-8 (a stream that the limit cut within a character included), standard base64 in `stdout_base64` or `stderr_base64`, with the other one `null`. The JSON itself can be larger than what it carries: base64 adds a third, and JSON escapes each control character in text with up to six bytes. `exit_signal` is the SSH name of the signal that killed the command, such as `TERM`. At `--timeout` or Ctrl-C the JSON comes too, with the output received until then and `timed_out` or `interrupted` set. It is written once the command has ended or been stopped, and that write waits for its reader like any write to a pipe; Ctrl-C during it ends `revtty exec` with 130 and the JSON cut short.
+
+## Rotating an operator key
+
+An operator key is replaced target by target, the new key authorized before the old one is revoked, so that no target is left without a key that reaches it. `revtty exec` runs `revtty agent operator` as the agent's account, with the agent's configuration and `PATH`, where `revtty` must be; under the systemd unit and the launchd plist it is.
+
+```bash
+OLD="$HOME/.config/revtty"           # the operator's config directory, as `revtty doctor` shows it
+NEW="$HOME/.config/revtty-new"
+revtty init                          # note the current fingerprint, OLD_FP
+REVTTY_CONFIG_DIR="$NEW" revtty init
+cp "$OLD/known_hosts" "$NEW/"        # the new key trusts the same host keys
+revtty exec store-042 --relay URL -- revtty agent operator add - < "$NEW/id_ed25519.pub"
+REVTTY_CONFIG_DIR="$NEW" revtty probe store-042 --relay URL
+```
+
+The agent applies the change within 2 seconds and then tells the relay, so a probe with the new key right after `add` may still be refused (401); try it again. Once every target answers the new key, move it into place, where the pins stay, and revoke the old key on every target:
+
+```bash
+mv "$NEW/id_ed25519" "$NEW/id_ed25519.pub" "$OLD/"
+revtty exec store-042 --relay URL -- revtty agent operator revoke OLD_FP
+```
+
+The last operator of an agent cannot be revoked.
 
 ## Files
 

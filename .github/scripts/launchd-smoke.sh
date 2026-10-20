@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Checks packaging/launchd on a disposable macOS CI runner, with launchd itself: it starts the
 # agent as the plist's account, restarts it after a crash, and SIGTERM stops it with exit status
-# 0 and no restart. Run from the repository root after `cargo build --release`; it needs
+# 0 and no restart; commands that revtty exec runs get the plist's PATH and paths, and one still
+# running ends with the agent. Run from the repository root after `cargo build --release`; it needs
 # passwordless sudo and removes only what it installed.
 set -euo pipefail
 
@@ -18,6 +19,7 @@ work="${RUNNER_TEMP:?RUNNER_TEMP is not set}/revtty-launchd-smoke"
 relay_url="http://127.0.0.1:18787"
 target="launchd-ci"
 relay_pid=""
+exec_pid=""
 installed=false
 loaded=false
 # Deepest first, so that rmdir can remove them in order.
@@ -45,6 +47,10 @@ cleanup() {
     sudo cat "$log_file" >&2
     echo "--- relay log" >&2
     cat "$work/relay.log" >&2
+    if [[ -n "$exec_pid" ]]; then
+      echo "--- revtty exec output" >&2
+      cat "$work/exec.out" "$work/exec.err" >&2
+    fi
   fi
   if [[ "$loaded" == true ]]; then
     sudo launchctl bootout "system/$label" 2> /dev/null
@@ -55,6 +61,9 @@ cleanup() {
     if ((${#created_dirs[@]} > 0)); then
       sudo rmdir "${created_dirs[@]}" 2> /dev/null
     fi
+  fi
+  if [[ -n "$exec_pid" ]]; then
+    kill "$exec_pid" 2> /dev/null
   fi
   if [[ -n "$relay_pid" ]]; then
     kill "$relay_pid" 2> /dev/null
@@ -118,6 +127,15 @@ reachable() {
 relay_up() {
   kill -0 "$relay_pid" 2> /dev/null || fail "the relay exited"
   curl -fs -o /dev/null "$relay_url/health"
+}
+
+exec_ended() {
+  ! kill -0 "$exec_pid" 2> /dev/null
+}
+
+# The remote command printed its whole first line, its PID.
+command_started() {
+  [[ -s "$work/exec.out" && "$(tail -c 1 "$work/exec.out")" == "" ]]
 }
 
 agent_connections() {
@@ -200,3 +218,32 @@ wait_for 20 "kickstart to start the agent" running
 wait_for 30 "the agent to answer a probe after kickstart" reachable
 wait_for 10 "the agent started by kickstart to log to $log_file" logged_more_than "$connections"
 echo "kickstart started the agent again, and it logs to $log_file"
+
+# Through exec, revtty runs as the agent's account, with the plist's PATH and paths.
+operator_fingerprint="$(sed -n 's/^fingerprint[[:space:]]*//p' "$work/init.txt")"
+[[ -n "$operator_fingerprint" ]] || fail "revtty init printed no fingerprint"
+listed="$(operator exec "$target" --relay "$relay_url" -n -- revtty agent operator list)" ||
+  fail "revtty exec could not run revtty agent operator list"
+grep -q "^operator   $operator_fingerprint" <<< "$listed" ||
+  fail "revtty agent operator list through exec does not list this operator: $listed"
+echo "revtty exec runs revtty with the plist's PATH and paths"
+
+# A command still running when launchd stops the agent ends with it.
+# shellcheck disable=SC2016 # $$ is for the remote shell.
+operator exec "$target" --relay "$relay_url" -n -- 'echo $$; exec sleep 600' > "$work/exec.out" 2> "$work/exec.err" &
+exec_pid=$!
+wait_for 30 "the command to start" command_started
+command_pid="$(head -n 1 "$work/exec.out")"
+[[ "$command_pid" =~ ^[0-9]+$ ]] || fail "the command printed '$command_pid' as its PID"
+ps -p "$command_pid" > /dev/null || fail "the command $command_pid is not running"
+sudo launchctl kill SIGTERM "system/$label"
+wait_for 15 "the agent to stop on SIGTERM with a command running" stopped
+exit_code="$(job_field 'last exit code')" || fail "launchd cannot describe $label"
+[[ "$exit_code" == "0" ]] || fail "the agent exited with '$exit_code' after SIGTERM"
+# The agent reaps the command before it exits: no wait here.
+! ps -p "$command_pid" > /dev/null || fail "the command $command_pid outlived the agent"
+wait_for 10 "revtty exec to end with its session" exec_ended
+exec_status=0
+wait "$exec_pid" || exec_status=$?
+exec_pid=""
+echo "SIGTERM ended the running command with the agent, which exited with status 0 (revtty exec: $exec_status)"

@@ -213,7 +213,8 @@ pub enum OperatorCommand {
 
     /// Authorize one more operator public key (OpenSSH Ed25519).
     Add {
-        /// Operator public key file, e.g. the id_ed25519.pub printed by `revtty init`.
+        /// Operator public key file, e.g. the id_ed25519.pub printed by `revtty init`, or `-`
+        /// to read the key from stdin, as through `revtty exec`.
         key: PathBuf,
     },
 

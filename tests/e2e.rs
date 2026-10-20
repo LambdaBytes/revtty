@@ -2070,6 +2070,96 @@ fn operators_are_managed_from_a_session_and_revocation_closes_it() {
 }
 
 #[test]
+fn an_operator_key_is_rotated_with_exec() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let agent_process = start_agent(&root, &agent);
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+    let old_fingerprint = field(&operator.run(&["init"]), "fingerprint").to_owned();
+
+    // As the README rotates it: a new identity, with the pins of the current one.
+    let new = Role::new(&root, "new");
+    let new_fingerprint = field(&new.run(&["init"]), "fingerprint").to_owned();
+    std::fs::copy(
+        operator.config.join("known_hosts"),
+        new.config.join("known_hosts"),
+    )
+    .expect("copy the pins");
+    let new_key = std::fs::read(new.config.join("id_ed25519.pub")).expect("read the new key");
+
+    // The current key authorizes it on the target, with the new key on stdin.
+    let added = exec_until_exit(
+        &operator,
+        &url,
+        &["--", &format!("{REVTTY} agent operator add -")],
+        &new_key,
+        Duration::from_secs(20),
+    );
+    assert_eq!(added.status.code(), Some(0), "{}", text(&added.stderr));
+    assert_eq!(field(&text(&added.stdout), "added"), new_fingerprint);
+    agent_process.wait_for_log("operator list revision 2", Duration::from_secs(10));
+    relay.wait_for_log("operators updated to revision 2", Duration::from_secs(10));
+    new.run(&["probe", AGENT_NAME, "--relay", &url]);
+
+    // The new key revokes the old one, which then gets nothing from the relay.
+    let revoked = exec_until_exit(
+        &new,
+        &url,
+        &[
+            "-n",
+            "--",
+            &format!("{REVTTY} agent operator revoke {old_fingerprint}"),
+        ],
+        b"",
+        Duration::from_secs(20),
+    );
+    assert_eq!(revoked.status.code(), Some(0), "{}", text(&revoked.stderr));
+    assert_eq!(field(&text(&revoked.stdout), "revoked"), old_fingerprint);
+    relay.wait_for_log("operators updated to revision 3", Duration::from_secs(10));
+    let refused = exec_until_exit(
+        &operator,
+        &url,
+        &["-n", "--", "true"],
+        b"",
+        Duration::from_secs(20),
+    );
+    assert!(
+        !refused.status.success() && text(&refused.stderr).contains("401"),
+        "the revoked key still runs commands:\n{}",
+        text(&refused.stderr)
+    );
+
+    // Nor can the last operator revoke itself through exec.
+    let last = exec_until_exit(
+        &new,
+        &url,
+        &[
+            "-n",
+            "--",
+            &format!("{REVTTY} agent operator revoke {new_fingerprint}"),
+        ],
+        b"",
+        Duration::from_secs(20),
+    );
+    assert_eq!(last.status.code(), Some(1), "{}", text(&last.stderr));
+    assert!(
+        text(&last.stderr).contains("last operator"),
+        "{}",
+        text(&last.stderr)
+    );
+    new.run(&["probe", AGENT_NAME, "--relay", &url]);
+}
+
+#[test]
 fn reinstalled_agent_is_reenrolled_in_place_and_then_removed() {
     let root = TempRoot::new();
     let (operator, agent, relay_role) = prepare(&root);
