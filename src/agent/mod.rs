@@ -38,7 +38,8 @@ use crate::transport::{
 const RECONNECT_BASE_MILLIS: u64 = 1_000;
 const RECONNECT_CAP_MILLIS: u64 = 30_000;
 const RECONNECT_JITTER_PERCENT: u64 = 20;
-/// Bound on waiting for shell teardowns at shutdown; below systemd's `TimeoutStopSec=15s`.
+/// Bound on waiting for shell teardowns at shutdown; below the 15 s after which the shipped
+/// service definitions kill the agent (systemd's `TimeoutStopSec`, launchd's `ExitTimeOut`).
 const SHELL_SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 /// Writing one frame to the relay; a write that cannot complete means the path is dead.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -918,10 +919,14 @@ async fn rotate_control_credential(
     paths: &Paths,
 ) -> Result<Rotation, RevttyError> {
     let Some(_stopped) = RunLock::try_acquire(paths)? else {
-        return Err(RevttyError::message(
-            "the agent is running; stop it first (with systemd: systemctl stop \
-             revtty-agent@USER), rotate, then start it again",
-        ));
+        let stop = if cfg!(target_os = "macos") {
+            "with launchd: sudo launchctl kill SIGTERM system/io.lambdabytes.revtty-agent.USER"
+        } else {
+            "with systemd: sudo systemctl stop revtty-agent@USER"
+        };
+        return Err(RevttyError::message(format!(
+            "the agent is running; stop it first ({stop}), rotate, then start it again"
+        )));
     };
 
     // A rotation that stopped halfway is finished, or abandoned, before another starts.

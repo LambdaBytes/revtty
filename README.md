@@ -61,7 +61,7 @@ Design principles, scope and roadmap: [docs/BRIEF.md](docs/BRIEF.md), [docs/V1_S
 - The agent's relay credential is replaced with `agent rotate-credential` while the agent is stopped: the agent generates the new credential and saves it before the relay learns its hash, so an interrupted rotation is finished by the next `agent run`. Only one `agent run` runs per configuration.
 - A reinstalled machine is re-enrolled under its name with `relay enroll NAME --replace`, and an agent is retired with `relay remove NAME`. Within 5 seconds the relay closes the old agent's control connection and every session it is part of, open data tunnels included; its credential no longer works. Operators then see a host key mismatch for the new machine and clear the old pin with `revtty forget NAME`, unless the machine was enrolled with a new pairing code: its proof replaces the pin.
 - `doctor`, `agent doctor` and `relay doctor`: relay reachability with the underlying TLS or network cause, signed operator authentication, agent credential validation, file and directory permissions, relay schema version.
-- A systemd template that runs the agent as an explicit OS account ([docs/SYSTEMD.md](docs/SYSTEMD.md)).
+- Service definitions that run the agent as an explicit OS account: a systemd template on Linux ([docs/SYSTEMD.md](docs/SYSTEMD.md)) and a launchd daemon on macOS ([docs/LAUNCHD.md](docs/LAUNCHD.md)).
 
 ## Try it on one machine
 
@@ -125,7 +125,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
   ```
 
   Then use `--relay https://revtty.example.com` everywhere. Keep the relay database and its directory writable only by the relay's account: `relay doctor` fails if other users can write them, and warns about a group-writable directory.
-- **Agent**: enroll and run it as the account whose shell operators should get, ideally as a service ([docs/SYSTEMD.md](docs/SYSTEMD.md)). Enroll it with a pairing code from its first operator, or give the operators the fingerprint that `agent enroll` prints.
+- **Agent**: enroll and run it as the account whose shell operators should get, ideally as a service ([docs/SYSTEMD.md](docs/SYSTEMD.md), [docs/LAUNCHD.md](docs/LAUNCHD.md)). Enroll it with a pairing code from its first operator, or give the operators the fingerprint that `agent enroll` prints.
 - **Operator**: run `revtty init` once per operator machine; the relay administrator enrolls each agent for that operator's public key.
 - **First field test**: [docs/FIELD_TEST.md](docs/FIELD_TEST.md) sets up a relay on a VPS and a target behind NAT, and lists the recovery drills with their expected results.
 
@@ -172,7 +172,7 @@ On Linux the defaults are `~/.config/revtty` and `~/.local/share/revtty`; `REVTT
 - **Pairing codes need both ends updated**: an operator client that predates them pins the first host key by confirmation, as before. A pairing code covers the agent's first operator only; operators added later confirm the host key themselves.
 - **Probes need both ends updated**: an operator client of this version refuses a probe answered without SSH, as older agents answer it, and an older client gets no answer from a newer agent, which ends the session after 45 s.
 - **One relay process**: agent presence lives in its memory; there is no clustering or high availability.
-- **Not yet**: rate limiting, packages or signed release artifacts, a launchd service for macOS agents, Windows support.
+- **Not yet**: rate limiting, packages or signed release artifacts, Windows support.
 - **Audit is best effort**: records are written asynchronously and dropped with a warning if the queue fills up.
 - **Interactive shell only**: no `exec`, file copy or port forwarding yet.
 

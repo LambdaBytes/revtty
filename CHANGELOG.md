@@ -43,6 +43,7 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - Pairing codes: `revtty pair NAME --token TOKEN` wraps an enrollment token with a secret the relay never receives, for `agent enroll --pairing-code`. The agent refuses an operator or name the code was not made for, and proves its host key, which the operator's first contact pins without confirmation (relay schema v7). A machine enrolled again with a new code replaces its pin.
 - `docs/FIELD_TEST.md`: runbook for a first self-hosted deployment across NAT, with recovery drills and their expected results.
 - Operator lists on the agent: `agent operator list|add|revoke`. A running agent rereads its list every 2 seconds, closes the open sessions of a revoked operator and reports the list to the relay (`operators_report`), which issues session credentials only to those operators (relay schema v4).
+- launchd daemon for macOS agents (`packaging/launchd`, `docs/LAUNCHD.md`): runs the agent as an explicit account, restarts it after a crash but not after a clean stop, and gives it 15 s to stop. CI checks it with launchd on its macOS runners.
 
 ### Changed
 

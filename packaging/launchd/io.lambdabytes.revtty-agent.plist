@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd daemon for the revtty target agent. Replace ACCOUNT with the explicit OS account
+  whose shell operators get, and install it as
+  /Library/LaunchDaemons/io.lambdabytes.revtty-agent.ACCOUNT.plist (see docs/LAUNCHD.md).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.lambdabytes.revtty-agent.ACCOUNT</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/revtty</string>
+        <string>agent</string>
+        <string>run</string>
+    </array>
+    <key>UserName</key>
+    <string>ACCOUNT</string>
+    <!-- 63 is 0077: property lists have no octal integers. -->
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>REVTTY_CONFIG_DIR</key>
+        <string>/Library/Application Support/revtty/ACCOUNT/config</string>
+        <key>REVTTY_STATE_DIR</key>
+        <string>/Library/Application Support/revtty/ACCOUNT/state</string>
+        <!-- launchd's own PATH lacks /usr/local/bin; shells started by the agent inherit this. -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restarted after a crash, not after the clean exit that follows SIGTERM. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <!-- SIGKILL follows SIGTERM after this long; the agent waits up to 10 s for its shells. -->
+    <key>ExitTimeOut</key>
+    <integer>15</integer>
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/revtty/agent-ACCOUNT.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/revtty/agent-ACCOUNT.log</string>
+</dict>
+</plist>

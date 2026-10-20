@@ -110,3 +110,6 @@ jobs:
 
       - name: Release build
         run: cargo build --release
+
+      - name: launchd smoke test
+        run: .github/scripts/launchd-smoke.sh
