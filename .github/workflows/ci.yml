@@ -82,8 +82,8 @@ jobs:
         run: cargo build --release
 
   # Without a cache, as after a Cargo.lock or toolchain change, this job took 597 s of
-  # its former 600 s limit on macos-26-arm64 (run 38744141526, 5m36s of it the release
-  # build); with one, 4 to 5 minutes. Its limit leaves room for a run without a cache.
+  # its former 600 s limit on macos-26-arm64 (5m36s of it the release build); with one,
+  # 4 to 5 minutes. Its limit leaves room for a run without a cache.
   macos:
     if: github.event_name != 'push' || contains(github.event.head_commit.message, '[full ci]')
     timeout-minutes: 20

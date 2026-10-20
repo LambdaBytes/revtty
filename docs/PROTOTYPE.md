@@ -254,7 +254,7 @@ The repository currently validates these pieces on Linux and macOS:
 - end-to-end runs of the real binary: enrollment, first-pin confirmation, probe, interactive shell with exit status, relay restart recovery, agent loss, SIGINT teardown, doctors and session audit;
 - format, Clippy and release compilation.
 
-All of it, the end-to-end tests included, passes on both Linux and macOS (CI run of commit 3f73858).
+All of it, the end-to-end tests included, passes on both Linux and macOS in CI.
 
 ## Next validation gates
 
