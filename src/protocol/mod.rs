@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
 pub const OPERATOR_AUTH_NAMESPACE: &str = "revtty-control-v1";
 pub const SESSION_ERROR_PREFIX: &str = "revtty-error:";
+/// The session error a relay sends when the agent did not take the session in time, which is
+/// also what an agent that predates `ExecOffer` leads to.
+pub const SESSION_NOT_ACCEPTED: &str = "agent did not accept the session before timeout";
 /// The one command a probe session runs over SSH: the agent answers it with a `ProbeResult`
 /// in JSON and exit status 0.
 pub const PROBE_COMMAND: &str = "revtty-probe";
@@ -50,6 +53,13 @@ pub enum ControlMessage {
         tunnel_token: String,
     },
     ShellOffer {
+        version: u16,
+        session_id: String,
+        tunnel_token: String,
+    },
+    /// An operator's `revtty exec`: one command, without a PTY. An agent that predates it
+    /// ignores the message, so the relay times the offer out.
+    ExecOffer {
         version: u16,
         session_id: String,
         tunnel_token: String,
@@ -212,6 +222,21 @@ mod tests {
         };
         let json = serde_json::to_string(&message).expect("serialize shell offer");
         let decoded: ControlMessage = serde_json::from_str(&json).expect("deserialize shell offer");
+        assert!(decoded == message);
+    }
+
+    #[test]
+    fn exec_offer_round_trips_under_its_own_type() {
+        let message = ControlMessage::ExecOffer {
+            version: 1,
+            session_id: "exec-session".to_owned(),
+            tunnel_token: "rvs_exec".to_owned(),
+        };
+        let json = serde_json::to_string(&message).expect("serialize exec offer");
+        // Its own type, which an agent that predates exec cannot decode and so never takes
+        // for a shell or probe offer.
+        assert!(json.contains(r#""type":"exec_offer""#), "{json}");
+        let decoded: ControlMessage = serde_json::from_str(&json).expect("deserialize exec offer");
         assert!(decoded == message);
     }
 

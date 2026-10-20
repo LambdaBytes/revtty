@@ -66,6 +66,34 @@ pub enum Command {
         host_key: Option<String>,
     },
 
+    /// Run one command on a machine, without a terminal, and exit with its exit status.
+    Exec {
+        /// Machine name.
+        target: String,
+
+        /// Relay base URL. http(s) is converted to ws(s).
+        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
+        relay: String,
+
+        /// Agent host key fingerprint (SHA256:...) to pin on first contact, as printed by
+        /// `revtty agent status` on the target. exec never asks for it.
+        #[arg(long)]
+        host_key: Option<String>,
+
+        /// Stop after this many seconds and end the command (exit status 124).
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+
+        /// Send no input: the command's stdin is closed at once.
+        #[arg(short = 'n')]
+        no_stdin: bool,
+
+        /// The command, after `--`. The target's shell runs its words joined with spaces, as
+        /// ssh does.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+
     /// Run local connectivity and configuration checks.
     Doctor {
         /// Relay base URL.
@@ -285,6 +313,45 @@ mod tests {
     fn parses_connect_target() {
         let args = Args::try_parse_from(["revtty", "connect", "store-042"]);
         assert!(args.is_ok());
+    }
+
+    #[test]
+    fn parses_exec_with_its_command_after_the_separator() {
+        let args = Args::try_parse_from([
+            "revtty",
+            "exec",
+            "store-042",
+            "--timeout",
+            "5",
+            "-n",
+            "--",
+            "ls",
+            "-l",
+            "--all",
+        ])
+        .expect("parse exec");
+        let super::Command::Exec {
+            target,
+            timeout,
+            no_stdin,
+            command,
+            ..
+        } = args.command
+        else {
+            panic!("parsed as another command");
+        };
+        assert_eq!(target, "store-042");
+        assert_eq!(timeout, Some(5));
+        assert!(no_stdin);
+        // What follows `--` is the command's, options included.
+        assert_eq!(command, ["ls", "-l", "--all"]);
+
+        assert!(Args::try_parse_from(["revtty", "exec", "store-042"]).is_err());
+        assert!(Args::try_parse_from(["revtty", "exec", "store-042", "--"]).is_err());
+        assert!(
+            Args::try_parse_from(["revtty", "exec", "store-042", "--timeout", "0", "--", "ls"])
+                .is_err()
+        );
     }
 
     #[test]

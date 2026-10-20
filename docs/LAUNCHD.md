@@ -101,7 +101,7 @@ The plist:
 
 launchd keeps the log file open: after rotating it, for example with `newsyslog`, restart the agent (`sudo launchctl kickstart -k "system/$LABEL"`) so that it writes to the new file.
 
-When the agent stops, it ends its shells. A process that detached into a session of its own, such as a daemon started from a shell, is not tracked by the agent and keeps running; launchd does not end it either.
+When the agent stops, it ends its shells and the process groups of its `revtty exec` commands. A process that detached into a session of its own, such as a daemon started from a shell, is not tracked by the agent and keeps running; launchd does not end it either.
 
 `REVTTY_CONFIG_DIR` and `REVTTY_STATE_DIR` must be absolute paths. They are general runtime overrides and are useful for system services and containers as well as this daemon.
 

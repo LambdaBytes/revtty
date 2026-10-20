@@ -45,6 +45,7 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - Operator lists on the agent: `agent operator list|add|revoke`. A running agent rereads its list every 2 seconds, closes the open sessions of a revoked operator and reports the list to the relay (`operators_report`), which issues session credentials only to those operators (relay schema v4).
 - launchd daemon for macOS agents (`packaging/launchd`, `docs/LAUNCHD.md`): runs the agent as an explicit account, restarts it after a crash but not after a clean stop, and gives it 15 s to stop. CI checks it with launchd on its macOS runners.
 - Intel macOS CI (`macos-26-intel`): format, Clippy, tests, release build and the launchd smoke test, as on Apple Silicon.
+- `revtty exec NAME -- COMMAND`: runs one command without a terminal over a new `exec_offer` session (`/v1/exec/{name}`, audited as `exec`). Separate stdout and stderr, forwarded stdin (`-n` to close it), the command's exit status, `--timeout` and Ctrl-C; it never asks for a host key. The agent runs the command in its own process group and ends that group when the session ends first; the relay never sees the command.
 
 ### Changed
 

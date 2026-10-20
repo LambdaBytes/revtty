@@ -31,6 +31,7 @@ Design principles, scope and roadmap: [docs/BRIEF.md](docs/BRIEF.md), [docs/V1_S
 **Access**
 
 - Interactive shell on a real PTY of an enrolled Linux or macOS machine: input, output, live resize, EOF, and the remote exit status as `revtty connect`'s exit code (255 when the session ended without one).
+- `exec` runs one command without a terminal, as `ssh host command` does: stdout and stderr stay apart, stdin is forwarded (`-n` closes it), and `revtty exec` exits with the command's status. It never asks for a host key, so it can run unattended; `--timeout` (exit status 124) and Ctrl-C (130) end the command too.
 - `probe` checks a target end to end, over SSH as a shell does: the agent checks the operator against its own list and proves its pinned host key, so the relay cannot answer for it. `list` and `status` show presence: online/offline, last seen, version, sessions in use and allowed.
 - Several concurrent sessions per agent (default 4, up to 64); extra requests get an explicit "agent is busy".
 
@@ -99,6 +100,7 @@ revtty agent run
 revtty list --relay http://127.0.0.1:8787
 revtty probe store-042 --relay http://127.0.0.1:8787 --host-key <agent-host-fingerprint>
 revtty connect store-042 --relay http://127.0.0.1:8787
+revtty exec store-042 --relay http://127.0.0.1:8787 -- uname -a
 ```
 
 The first `status`, `probe` or `connect` to an agent pins its host key once the operator gives the fingerprint that `revtty agent status` (or `agent enroll`) shows on the target: with `--host-key`, or typed at the interactive prompt. revtty never shows the fingerprint the relay presents before it is pinned, so that it cannot be copied in place of the target's. Later commands verify against the pin, and a `--host-key` given later is still checked against the key presented.
@@ -138,6 +140,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | `status NAME --relay URL [--host-key FP]` | operator | One agent's status. |
 | `probe NAME --relay URL [--host-key FP]` | operator | Round trip through the agent over SSH: name, OS, architecture, version. |
 | `connect NAME --relay URL [--host-key FP]` | operator | Interactive shell; exits with the remote status. |
+| `exec NAME --relay URL [--host-key FP] [--timeout SECS] [-n] -- COMMAND...` | operator | Run one command without a terminal; exits with its status (255 without one, 124 at the timeout, 130 on Ctrl-C). |
 | `doctor --relay URL` | operator | Local permissions, relay reachability and signed authentication. |
 | `pair NAME --token TOKEN --relay URL` | operator | Wrap an enrollment token in a pairing code for the target; nothing is sent. |
 | `forget NAME --relay URL` | operator | Forget a machine's pinned host key, after it was reinstalled and re-enrolled, and discard a pairing pending for it. |
@@ -174,7 +177,8 @@ On Linux the defaults are `~/.config/revtty` and `~/.local/share/revtty`; `REVTT
 - **One relay process**: agent presence lives in its memory; there is no clustering or high availability.
 - **Not yet**: rate limiting, packages or signed release artifacts, Windows support.
 - **Audit is best effort**: records are written asynchronously and dropped with a warning if the queue fills up.
-- **Interactive shell only**: no `exec`, file copy or port forwarding yet.
+- **No file copy or port forwarding yet.**
+- **exec ends its command's process group**, not processes that leave it (daemons, `setsid`): these outlive the session, as they do with an interactive shell, until systemd stops the agent's service (its default `KillMode` ends the whole control group); launchd does not end them. A relay or agent that predates exec refuses it; the error says which to upgrade. revtty's own messages go to stderr: if the local stderr stops being read, `revtty exec` may wait for it after the remote command has ended.
 
 The remaining v1 milestones are in [docs/ROADMAP.md](docs/ROADMAP.md).
 

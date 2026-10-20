@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,9 +8,9 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use reqwest_websocket::WebSocket;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{Algorithm, PrivateKey, PublicKey, PublicKeyOrCertificate};
-use russh::{Channel, ChannelMsg, Disconnect, Preferred, client};
+use russh::{Channel, ChannelMsg, Disconnect, Preferred, Sig, client};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::RevttyError;
@@ -430,6 +430,233 @@ pub async fn connect_terminal(
     .await;
 
     finish_session(result, bridge_task).await
+}
+
+/// Why `revtty exec` stopped waiting for a command.
+#[derive(Clone, Copy)]
+pub enum Stop {
+    /// `--timeout` was over.
+    TimedOut,
+    /// Ctrl-C.
+    Interrupted,
+}
+
+/// How a command `run_command` ran ended, as far as this operator knows.
+pub enum CommandEnd {
+    /// It exited with this status.
+    Exited(u32),
+    /// The signal of this SSH name killed it.
+    Killed(String),
+    /// The session ended without saying.
+    Unknown,
+    /// This operator stopped waiting first; the agent ends a command whose session ends.
+    Stopped(Stop),
+}
+
+/// Runs `command` on the agent over SSH: its stdout and stderr go to the local ones, and the
+/// local stdin goes to it if `forward_stdin`. `stop` ends the run at any point, writing the
+/// output here included: its transport is cut, the agent sees the session end and ends the
+/// command, and output not yet written here is dropped.
+pub async fn run_command(
+    websocket: WebSocket,
+    operator_key_path: &Path,
+    encoded_host_key: &str,
+    command: &str,
+    forward_stdin: bool,
+    stop: impl Future<Output = Stop>,
+) -> Result<CommandEnd, RevttyError> {
+    let (operator_key, expected_server_key) = session_keys(operator_key_path, encoded_host_key)?;
+    let (stream, bridge_task) = websocket_byte_stream(websocket);
+    let transport = bridge_task.abort_handle();
+    tokio::pin!(stop);
+
+    let result = tokio::select! {
+        result = command_session(
+            stream,
+            operator_key,
+            expected_server_key,
+            command,
+            forward_stdin,
+        ) => result,
+        stopped = &mut stop => {
+            transport.abort();
+            return Ok(CommandEnd::Stopped(stopped));
+        }
+    };
+
+    // The wait for the transport to close counts towards the run that `stop` bounds too.
+    tokio::select! {
+        result = finish_session(result, bridge_task) => result,
+        stopped = stop => {
+            transport.abort();
+            Ok(CommandEnd::Stopped(stopped))
+        }
+    }
+}
+
+async fn command_session<S>(
+    stream: S,
+    operator_key: PrivateKey,
+    expected_server_key: PublicKey,
+    command: &str,
+    forward_stdin: bool,
+) -> Result<CommandEnd, RevttyError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let session = open_session(
+        stream,
+        client_config(SSH_TIMEOUTS),
+        expected_server_key,
+        operator_key,
+        SSH_HANDSHAKE_TIMEOUT,
+    )
+    .await?;
+
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(|error| RevttyError::runtime("open SSH command channel", error))?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|error| RevttyError::runtime("request remote command", error))?;
+    expect_channel_success(&mut channel, "run the command").await?;
+
+    // Without input to send, a receiver whose sender is gone: the command's stdin closes at
+    // once.
+    let mut stdin = if forward_stdin {
+        spawn_stdin_reader()
+    } else {
+        mpsc::channel(1).1
+    };
+    let mut stdin_open = true;
+    let mut stdout = OutputWriter::spawn("output", Box::new(io::stdout()));
+    let mut stderr = OutputWriter::spawn("error output", Box::new(io::stderr()));
+    let mut end = CommandEnd::Unknown;
+
+    loop {
+        tokio::select! {
+            read = stdin.recv(), if stdin_open => match read {
+                None => {
+                    stdin_open = false;
+                    let _ = channel.eof().await;
+                }
+                Some(Ok(input)) => {
+                    channel
+                        .data_bytes(input)
+                        .await
+                        .map_err(|error| RevttyError::runtime("send command input", error))?;
+                }
+                Some(Err(error)) => return Err(RevttyError::runtime("read local input", error)),
+            },
+            message = channel.wait() => match message {
+                Some(ChannelMsg::Data { data }) => stdout.write(data.to_vec()).await?,
+                Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                    stderr.write(data.to_vec()).await?;
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    end = CommandEnd::Exited(exit_status);
+                }
+                Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
+                    end = CommandEnd::Killed(signal_name_text(&signal_name));
+                }
+                // The exit status may follow the agent's EOF; only the close ends the command.
+                Some(ChannelMsg::Close) | None => break,
+                Some(_) => {}
+            },
+        }
+    }
+
+    stdout.finish().await?;
+    stderr.finish().await?;
+    let _ = session
+        .disconnect(Disconnect::ByApplication, "", "English")
+        .await;
+    Ok(end)
+}
+
+/// Chunks of a command's output queued for a local writer thread.
+const OUTPUT_QUEUE_DEPTH: usize = 16;
+
+/// Writes one of a command's output streams here on a thread of its own, so that a local
+/// reader that stops reading holds up only that thread, never what stops the run; what is
+/// still queued then goes with the process.
+struct OutputWriter {
+    queue: mpsc::Sender<Vec<u8>>,
+    written: oneshot::Receiver<io::Result<()>>,
+    name: &'static str,
+}
+
+impl OutputWriter {
+    fn spawn(name: &'static str, mut output: Box<dyn Write + Send>) -> Self {
+        let (queue, mut chunks) = mpsc::channel::<Vec<u8>>(OUTPUT_QUEUE_DEPTH);
+        let (done, written) = oneshot::channel();
+
+        std::thread::spawn(move || {
+            let mut write_all = || -> io::Result<()> {
+                while let Some(chunk) = chunks.blocking_recv() {
+                    output.write_all(&chunk)?;
+                    output.flush()?;
+                }
+                Ok(())
+            };
+            let _ = done.send(write_all());
+        });
+
+        Self {
+            queue,
+            written,
+            name,
+        }
+    }
+
+    async fn write(&mut self, chunk: Vec<u8>) -> Result<(), RevttyError> {
+        if self.queue.send(chunk).await.is_ok() {
+            return Ok(());
+        }
+        // The thread stops taking chunks only once a write failed.
+        Err(write_failure(self.name, (&mut self.written).await))
+    }
+
+    /// Waits until everything queued is written.
+    async fn finish(self) -> Result<(), RevttyError> {
+        drop(self.queue);
+        match self.written.await {
+            Ok(Ok(())) => Ok(()),
+            failed => Err(write_failure(self.name, failed)),
+        }
+    }
+}
+
+fn write_failure(
+    name: &str,
+    written: Result<io::Result<()>, oneshot::error::RecvError>,
+) -> RevttyError {
+    match written {
+        Ok(Err(error)) => RevttyError::runtime(&format!("write command {name}"), error),
+        _ => RevttyError::message(format!("the writer of command {name} stopped")),
+    }
+}
+
+/// A signal's SSH name (RFC 4254, section 6.10).
+fn signal_name_text(signal: &Sig) -> String {
+    match signal {
+        Sig::ABRT => "ABRT",
+        Sig::ALRM => "ALRM",
+        Sig::FPE => "FPE",
+        Sig::HUP => "HUP",
+        Sig::ILL => "ILL",
+        Sig::INT => "INT",
+        Sig::KILL => "KILL",
+        Sig::PIPE => "PIPE",
+        Sig::QUIT => "QUIT",
+        Sig::SEGV => "SEGV",
+        Sig::TERM => "TERM",
+        Sig::USR1 => "USR1",
+        Sig::Custom(name) => name,
+    }
+    .to_owned()
 }
 
 #[cfg(test)]

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::cli::{AgentCommand, Args, Command, OperatorCommand, RelayCommand};
 use crate::error::RevttyError;
 
@@ -10,6 +12,25 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
             relay,
             host_key,
         } => return crate::client::connect(&target, &relay, host_key.as_deref()).await,
+        // Exits with the remote command's status, like ssh.
+        Command::Exec {
+            target,
+            relay,
+            host_key,
+            timeout,
+            no_stdin,
+            command,
+        } => {
+            return crate::client::exec(
+                &target,
+                &relay,
+                host_key.as_deref(),
+                timeout.map(Duration::from_secs),
+                !no_stdin,
+                &command.join(" "),
+            )
+            .await;
+        }
         Command::Init => crate::client::init(),
         Command::List { relay } => crate::client::list(&relay).await,
         Command::Status {

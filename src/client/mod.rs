@@ -2,8 +2,10 @@ mod ssh;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use ssh_key::{HashAlg, LineEnding, PrivateKey};
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::config::Paths;
 use crate::error::{RevttyError, with_sources};
@@ -11,10 +13,13 @@ use crate::identity::HostKeyTrust;
 use crate::pairing::{PairingCode, PairingSecret};
 use crate::protocol::{
     AgentListResponse, AgentStatusResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
-    OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, operator_auth_message,
-    operator_list_auth_message,
+    OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, SESSION_NOT_ACCEPTED,
+    operator_auth_message, operator_list_auth_message,
 };
-use crate::transport::{check_relay_health, connect_websocket, http_url, relay_client, valid_name};
+use crate::transport::{
+    RefusedUpgrade, check_relay_health, connect_websocket, connect_websocket_or_refusal, http_url,
+    relay_client, valid_name,
+};
 
 pub fn init() -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
@@ -146,7 +151,7 @@ pub async fn list(relay: &str) -> Result<(), RevttyError> {
 }
 
 pub async fn status(target: &str, relay: &str, host_key: Option<&str>) -> Result<(), RevttyError> {
-    let operator = authenticate_operator(target, relay, host_key).await?;
+    let operator = authenticate_operator(target, relay, host_key, true).await?;
     let url = http_url(relay, &format!("/v1/status/{target}"))?;
     let response = operator
         .client
@@ -248,10 +253,13 @@ struct AuthenticatedOperator {
     auth: OperatorAuthResponse,
 }
 
+/// With `prompt` false, a host key that is neither pinned nor proven by a pairing code needs
+/// `expected_host_key`: nothing is asked at the terminal.
 async fn authenticate_operator(
     target: &str,
     relay: &str,
     expected_host_key: Option<&str>,
+    prompt: bool,
 ) -> Result<AuthenticatedOperator, RevttyError> {
     if !valid_name(target) {
         return Err(RevttyError::message(
@@ -295,7 +303,7 @@ async fn authenticate_operator(
                 eprintln!("pinned host key {fingerprint}, verified by pairing code");
             }
             HostKeyTrust::Unknown { fingerprint } => {
-                confirm_host_key(target, relay, &fingerprint)?;
+                confirm_host_key(target, relay, &fingerprint, prompt)?;
                 crate::identity::pin_agent_host_key(&paths, relay, target, &auth.host_key)?;
                 eprintln!("pinned host key {fingerprint}");
 
@@ -324,10 +332,15 @@ async fn authenticate_operator(
 
 /// The relay only relays the agent's host key, so without a pairing code a first pin needs the
 /// fingerprint from the target itself (`revtty agent status`): given with --host-key, or typed
-/// at the terminal here. The fingerprint the relay presented is never shown, so that it cannot
-/// be copied back in place of the target's.
-fn confirm_host_key(target: &str, relay: &str, fingerprint: &str) -> Result<(), RevttyError> {
-    if !std::io::stdin().is_terminal() {
+/// at the terminal here when `prompt` allows it. The fingerprint the relay presented is never
+/// shown, so that it cannot be copied back in place of the target's.
+fn confirm_host_key(
+    target: &str,
+    relay: &str,
+    fingerprint: &str,
+    prompt: bool,
+) -> Result<(), RevttyError> {
+    if !prompt || !std::io::stdin().is_terminal() {
         return Err(RevttyError::message(format!(
             "host key of {target} is not pinned yet; pass --host-key with the fingerprint \
              `revtty agent status` shows on the target"
@@ -409,7 +422,7 @@ async fn request_operator_session(
 }
 
 pub async fn probe(target: &str, relay: &str, host_key: Option<&str>) -> Result<(), RevttyError> {
-    let operator = authenticate_operator(target, relay, host_key).await?;
+    let operator = authenticate_operator(target, relay, host_key, true).await?;
     let path = format!("/v1/probe/{target}");
     let websocket =
         connect_websocket(&operator.client, relay, &path, &operator.auth.session_token).await?;
@@ -434,7 +447,7 @@ const UNKNOWN_EXIT_CODE: u8 = 255;
 
 /// Returns the code `revtty connect` exits with: the remote shell's exit status.
 pub async fn connect(target: &str, relay: &str, host_key: Option<&str>) -> Result<u8, RevttyError> {
-    let operator = authenticate_operator(target, relay, host_key).await?;
+    let operator = authenticate_operator(target, relay, host_key, true).await?;
     let path = format!("/v1/connect/{target}");
     let websocket =
         connect_websocket(&operator.client, relay, &path, &operator.auth.session_token).await?;
@@ -456,6 +469,141 @@ pub async fn connect(target: &str, relay: &str, host_key: Option<&str>) -> Resul
             Ok(UNKNOWN_EXIT_CODE)
         }
     }
+}
+
+/// Exit code when `revtty exec` stopped waiting after `--timeout`, as timeout(1) has it.
+const TIMED_OUT_EXIT_CODE: u8 = 124;
+/// Exit code when `revtty exec` was interrupted with Ctrl-C, as shells report SIGINT.
+const INTERRUPTED_EXIT_CODE: u8 = 130;
+/// How long `revtty exec` waits for its own message about a stop to reach stderr: a local
+/// stderr that nobody reads must not hold it past its timeout or Ctrl-C.
+const STOP_MESSAGE_WAIT: Duration = Duration::from_millis(200);
+
+/// Runs `command` on `target` and returns the code `revtty exec` exits with: the command's
+/// exit status, as with ssh. Nothing is asked at the terminal, so a host key not pinned yet
+/// needs `host_key`. `timeout` and Ctrl-C end the whole run, authentication included, and
+/// the command with it.
+pub async fn exec(
+    target: &str,
+    relay: &str,
+    host_key: Option<&str>,
+    timeout: Option<Duration>,
+    forward_stdin: bool,
+    command: &str,
+) -> Result<u8, RevttyError> {
+    // Listening from the start: a Ctrl-C at any point must end the command.
+    let mut interrupts = signal(SignalKind::interrupt())
+        .map_err(|error| RevttyError::runtime("listen for Ctrl-C", error))?;
+    let stop = async {
+        let timed_out = async {
+            match timeout {
+                Some(timeout) => tokio::time::sleep(timeout).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            () = timed_out => ssh::Stop::TimedOut,
+            _ = interrupts.recv() => ssh::Stop::Interrupted,
+        }
+    };
+    tokio::pin!(stop);
+
+    let opened = async {
+        let operator = authenticate_operator(target, relay, host_key, false).await?;
+        let path = format!("/v1/exec/{target}");
+        let websocket = connect_websocket_or_refusal(
+            &operator.client,
+            relay,
+            &path,
+            &operator.auth.session_token,
+        )
+        .await?
+        .map_err(exec_refused)?;
+        Ok::<_, RevttyError>((operator, websocket))
+    };
+    let (operator, websocket) = tokio::select! {
+        opened = opened => opened?,
+        stopped = &mut stop => return Ok(stopped_exit_code(stopped, timeout).await),
+    };
+
+    let end = ssh::run_command(
+        websocket,
+        &operator.private_key_path,
+        &operator.auth.host_key,
+        command,
+        forward_stdin,
+        &mut stop,
+    )
+    .await
+    .map_err(|error| {
+        if error.to_string() == SESSION_NOT_ACCEPTED {
+            RevttyError::message(format!(
+                "{SESSION_NOT_ACCEPTED}; the agent may predate exec (upgrade revtty on {target})"
+            ))
+        } else {
+            error
+        }
+    })?;
+
+    Ok(match end {
+        ssh::CommandEnd::Exited(status) => u8::try_from(status).unwrap_or(u8::MAX),
+        ssh::CommandEnd::Killed(signal) => {
+            eprintln!("revtty: the remote command was killed by signal {signal}");
+            UNKNOWN_EXIT_CODE
+        }
+        ssh::CommandEnd::Unknown => {
+            eprintln!("revtty: the remote command ended without an exit status");
+            UNKNOWN_EXIT_CODE
+        }
+        ssh::CommandEnd::Stopped(stopped) => stopped_exit_code(stopped, timeout).await,
+    })
+}
+
+async fn stopped_exit_code(stopped: ssh::Stop, timeout: Option<Duration>) -> u8 {
+    let (message, code) = match stopped {
+        ssh::Stop::TimedOut => (
+            format!(
+                "revtty: timed out after {}s; ending the remote command",
+                timeout.unwrap_or_default().as_secs()
+            ),
+            TIMED_OUT_EXIT_CODE,
+        ),
+        ssh::Stop::Interrupted => (
+            "revtty: interrupted; ending the remote command".to_owned(),
+            INTERRUPTED_EXIT_CODE,
+        ),
+    };
+    report_without_waiting(message).await;
+    code
+}
+
+/// Writes `message` to stderr on a thread of its own and waits `STOP_MESSAGE_WAIT` at most:
+/// a message stderr has not taken by then goes with the process.
+async fn report_without_waiting(message: String) {
+    let (written, wrote) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        eprintln!("{message}");
+        let _ = written.send(());
+    });
+    let _ = tokio::time::timeout(STOP_MESSAGE_WAIT, wrote).await;
+}
+
+/// A relay that predates exec does not know its route, and answers as for any unknown path.
+fn exec_refused(refused: RefusedUpgrade) -> RevttyError {
+    if refused.status == reqwest::StatusCode::NOT_FOUND && refused.body.is_empty() {
+        return RevttyError::message(
+            "the relay does not support exec; upgrade revtty on the relay",
+        );
+    }
+    RevttyError::message(format!(
+        "relay refused the command ({}){}",
+        refused.status,
+        if refused.body.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", refused.body)
+        }
+    ))
 }
 
 pub async fn doctor(relay: &str) -> Result<(), RevttyError> {
@@ -508,4 +656,28 @@ pub async fn doctor(relay: &str) -> Result<(), RevttyError> {
     println!("config     {}", paths.config_dir.display());
     println!("state      {}", paths.state_dir.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exec_refused;
+    use crate::transport::RefusedUpgrade;
+
+    #[test]
+    fn exec_refusals_tell_an_old_relay_from_an_offline_agent() {
+        let old_relay = exec_refused(RefusedUpgrade {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: String::new(),
+        })
+        .to_string();
+        assert!(old_relay.contains("does not support exec"), "{old_relay}");
+
+        let offline = exec_refused(RefusedUpgrade {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "agent is offline".to_owned(),
+        })
+        .to_string();
+        assert!(offline.ends_with(": agent is offline"), "{offline}");
+        assert!(!offline.contains("does not support"), "{offline}");
+    }
 }

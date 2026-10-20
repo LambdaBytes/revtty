@@ -205,15 +205,8 @@ async fn connect_websocket_within(
     let url = websocket_url(relay, path)?;
 
     let handshake = async {
-        let response = client
-            .get(url)
-            .bearer_auth(token)
-            .upgrade()
-            .send()
-            .await
-            .map_err(|error| RevttyError::runtime("websocket handshake", websocket_error(error)))?;
-
-        response
+        send_upgrade(client, url, token)
+            .await?
             .into_websocket()
             .await
             .map_err(|error| RevttyError::runtime("websocket upgrade", websocket_error(error)))
@@ -226,6 +219,64 @@ async fn connect_websocket_within(
                 "websocket handshake with the relay timed out after {limit:?}"
             )))
         })
+}
+
+/// A WebSocket upgrade the relay answered with something else, and what it said.
+pub struct RefusedUpgrade {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+/// As `connect_websocket`, except that an upgrade the relay refuses comes back with its
+/// answer, which tells a relay that does not know `path` from one that refuses the request.
+pub async fn connect_websocket_or_refusal(
+    client: &Client,
+    relay: &str,
+    path: &str,
+    token: &str,
+) -> Result<Result<WebSocket, RefusedUpgrade>, RevttyError> {
+    let url = websocket_url(relay, path)?;
+    let limit = WEBSOCKET_HANDSHAKE_TIMEOUT;
+
+    let handshake = async {
+        let response = send_upgrade(client, url, token).await?;
+        let status = response.status();
+        if status != reqwest::StatusCode::SWITCHING_PROTOCOLS {
+            // Unread, an empty body would pass for that of a relay that does not know `path`.
+            let body = response.into_inner().text().await.map_err(|error| {
+                RevttyError::runtime("read the relay's refusal", with_sources(&error))
+            })?;
+            return Ok(Err(RefusedUpgrade { status, body }));
+        }
+
+        response
+            .into_websocket()
+            .await
+            .map(Ok)
+            .map_err(|error| RevttyError::runtime("websocket upgrade", websocket_error(error)))
+    };
+
+    tokio::time::timeout(limit, handshake)
+        .await
+        .unwrap_or_else(|_| {
+            Err(RevttyError::message(format!(
+                "websocket handshake with the relay timed out after {limit:?}"
+            )))
+        })
+}
+
+async fn send_upgrade(
+    client: &Client,
+    url: String,
+    token: &str,
+) -> Result<reqwest_websocket::UpgradeResponse, RevttyError> {
+    client
+        .get(url)
+        .bearer_auth(token)
+        .upgrade()
+        .send()
+        .await
+        .map_err(|error| RevttyError::runtime("websocket handshake", websocket_error(error)))
 }
 
 /// reqwest-websocket's own messages ("reqwest error", "websocket upgrade failed", "tungstenite
@@ -771,6 +822,50 @@ mod tests {
         .to_string();
 
         assert!(error.contains("401"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_upgrade_comes_back_with_what_the_relay_said() {
+        let app = axum::Router::new().route(
+            "/v1/exec/offline",
+            axum::routing::get(|| async {
+                (axum::http::StatusCode::NOT_FOUND, "agent is offline")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refusing relay");
+        let address = listener.local_addr().expect("refusing relay address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve refusing relay");
+        });
+        let client = super::relay_client().expect("relay client");
+        let relay = format!("http://{address}");
+
+        let refused = |path: &'static str| {
+            let client = client.clone();
+            let relay = relay.clone();
+            async move {
+                match super::connect_websocket_or_refusal(&client, &relay, path, "rvo_test")
+                    .await
+                    .expect("the relay answered")
+                {
+                    Ok(_) => panic!("the relay upgraded {path}"),
+                    Err(refused) => refused,
+                }
+            }
+        };
+
+        // A route the relay has.
+        let offline = refused("/v1/exec/offline").await;
+        assert_eq!(offline.status, reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(offline.body, "agent is offline");
+        // One it does not have, as a relay that predates it answers.
+        let unknown = refused("/v1/exec/other").await;
+        assert_eq!(unknown.status, reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(unknown.body, "");
     }
 
     #[tokio::test]

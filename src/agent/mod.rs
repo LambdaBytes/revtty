@@ -589,11 +589,28 @@ async fn run_control_once(
                                     .await
                                     .insert(session_id, SessionTask { task, cancel });
                             }
-                            ControlMessage::ShellOffer {
-                                version,
-                                session_id,
-                                tunnel_token,
-                            } => {
+                            offer @ (ControlMessage::ShellOffer { .. }
+                            | ControlMessage::ExecOffer { .. }) => {
+                                // The two differ only in what their SSH session runs.
+                                let (kind, label) =
+                                    if matches!(offer, ControlMessage::ExecOffer { .. }) {
+                                        (ssh::SessionKind::Exec, "exec")
+                                    } else {
+                                        (ssh::SessionKind::Shell, "shell")
+                                    };
+                                let (ControlMessage::ShellOffer {
+                                    version,
+                                    session_id,
+                                    tunnel_token,
+                                }
+                                | ControlMessage::ExecOffer {
+                                    version,
+                                    session_id,
+                                    tunnel_token,
+                                }) = offer
+                                else {
+                                    continue;
+                                };
                                 if version != CONTROL_PROTOCOL_VERSION {
                                     reject_incompatible_offer(&mut sender, session_id).await?;
                                     continue;
@@ -621,12 +638,12 @@ async fn run_control_once(
                                         &task_session_id,
                                         allowlist,
                                         shell_shutdown,
-                                        ssh::SessionKind::Shell,
+                                        kind,
                                         cancelled,
                                     )
                                     .await
                                     {
-                                        eprintln!("shell {task_session_id} failed: {error}");
+                                        eprintln!("{label} {task_session_id} failed: {error}");
                                     }
                                 });
 
@@ -1268,6 +1285,8 @@ mod tests {
         OfferingDeadTunnel,
         /// As `OfferingDeadTunnel`, and cancels the session shortly after the offer.
         CancellingDeadTunnel,
+        /// As `OfferingDeadTunnel`, with an exec offer.
+        OfferingDeadExecTunnel,
     }
 
     async fn fake_relay(behaviour: FakeRelay) -> String {
@@ -1280,7 +1299,7 @@ mod tests {
                         return;
                     }
                     if let FakeRelay::Deaf = behaviour {
-                        let future = r#"{"type":"exec_offer","version":1,"session_id":"s"}"#;
+                        let future = r#"{"type":"future_offer","version":1,"session_id":"s"}"#;
                         for _ in 0..16 {
                             if socket
                                 .send(RelayMessage::Text(future.into()))
@@ -1294,15 +1313,25 @@ mod tests {
                         let _ = socket.send(RelayMessage::Close(None)).await;
                         return;
                     }
-                    if let FakeRelay::OfferingDeadTunnel | FakeRelay::CancellingDeadTunnel =
-                        behaviour
+                    if let FakeRelay::OfferingDeadTunnel
+                    | FakeRelay::CancellingDeadTunnel
+                    | FakeRelay::OfferingDeadExecTunnel = behaviour
                     {
-                        let offer = serde_json::to_string(&ControlMessage::ProbeOffer {
-                            version: CONTROL_PROTOCOL_VERSION,
-                            session_id: "dead-tunnel".to_owned(),
-                            tunnel_token: "rvs_test".to_owned(),
+                        let session_id = "dead-tunnel".to_owned();
+                        let tunnel_token = "rvs_test".to_owned();
+                        let offer = serde_json::to_string(&match behaviour {
+                            FakeRelay::OfferingDeadExecTunnel => ControlMessage::ExecOffer {
+                                version: CONTROL_PROTOCOL_VERSION,
+                                session_id,
+                                tunnel_token,
+                            },
+                            _ => ControlMessage::ProbeOffer {
+                                version: CONTROL_PROTOCOL_VERSION,
+                                session_id,
+                                tunnel_token,
+                            },
                         })
-                        .expect("encode probe offer");
+                        .expect("encode session offer");
                         let _ = socket.send(RelayMessage::Text(offer.into())).await;
                         if let FakeRelay::CancellingDeadTunnel = behaviour {
                             // Not reading meanwhile leaves the agent's pings unanswered: well
@@ -1326,7 +1355,7 @@ mod tests {
                         let _ = socket.send(RelayMessage::Text(rejection.into())).await;
                     }
                     if let FakeRelay::Extending = behaviour {
-                        let future = r#"{"type":"exec_offer","version":1,"session_id":"s"}"#;
+                        let future = r#"{"type":"future_offer","version":1,"session_id":"s"}"#;
                         let _ = socket.send(RelayMessage::Text(future.into())).await;
                         // Keep reading, which answers the agent's pings, for a while.
                         let _ = tokio::time::timeout(Duration::from_millis(800), async {
@@ -1590,6 +1619,32 @@ mod tests {
         assert!(
             released,
             "a tunnel stuck in its handshake kept its session slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exec_offer_is_accepted_as_a_session() {
+        let relay = fake_relay(FakeRelay::OfferingDeadExecTunnel).await;
+        let slots = Arc::new(Semaphore::new(1));
+        let control = tokio::spawn({
+            let slots = slots.clone();
+            async move {
+                run_with_slots(
+                    &relay,
+                    &mut ReconnectBackoff::default(),
+                    slots,
+                    Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+
+        // A slot is taken only for an offer the agent accepts.
+        let reserved = wait_until(Duration::from_secs(5), || slots.available_permits() == 0).await;
+        control.abort();
+        assert!(
+            reserved,
+            "the agent did not take a session slot for an exec offer"
         );
     }
 

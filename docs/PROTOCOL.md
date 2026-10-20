@@ -59,6 +59,18 @@ Fields:
 - `session_id`
 - `tunnel_token`
 
+### exec_offer
+
+Relay asks the agent to open the data side of an SSH rendezvous for one command (`revtty exec`). The agent serves SSH on it and runs the one `exec` request of its session channel with the agent account's shell and `-c`, in that account's home directory, without a PTY: the command's stdout goes as channel data, its stderr as extended data of type 1, and the operator's data to its stdin, which the operator's EOF closes. Once the command exits, the agent forwards the rest of its output, leaving a pipe that stays silent for 1 s (a background job may hold it open), then sends `exit-status` or `exit-signal`, EOF and close. A PTY, a shell, a second `exec` or anything else is refused. When the session ends first, the agent ends the command's process group (SIGTERM, then SIGKILL within 5 s). The command travels only inside SSH: the relay never sees it and audits the session as `exec`.
+
+Fields:
+
+- `version`
+- `session_id`
+- `tunnel_token`
+
+An agent that predates this message cannot decode it and ignores it, so the relay ends the session at its acceptance deadline ("agent did not accept the session before timeout").
+
 The `tunnel_token` is generated independently for each rendezvous, delivered only over the authenticated agent control channel, stored by the relay only as a hash while pending and consumed at most once. A pending rendezvous is also bounded by the relay's session wait timeout.
 
 The long-lived agent control credential is not accepted by the persistent `/v1/session/{session_id}` data endpoint.
@@ -119,7 +131,7 @@ The flow is:
 2. sign the canonical `revtty-control-v1` message with the operator Ed25519 key;
 3. submit the SSHSIG;
 4. receive a short-lived opaque operator session credential plus the enrolled agent host key; the relay takes the key from the signature and accepts it only if it is one of the agent's reported operators;
-5. consume that credential once when opening `/v1/probe/{name}` or `/v1/connect/{name}`; it is refused if the operator was revoked, or the agent re-enrolled, in between;
+5. consume that credential once when opening `/v1/probe/{name}`, `/v1/connect/{name}` or `/v1/exec/{name}`; it is refused if the operator was revoked, or the agent re-enrolled, in between (a relay that predates exec answers `/v1/exec/{name}` with a 404 and an empty body);
 6. the relay generates a separate one-time agent `tunnel_token` and sends the corresponding offer over the agent control channel.
 
 The operator and agent rendezvous credentials are therefore distinct.

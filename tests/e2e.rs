@@ -289,6 +289,15 @@ struct Terminal {
 
 impl Terminal {
     fn connect(operator: &Role, url: &str, host_key: Option<&str>) -> Self {
+        let mut args = vec!["connect", AGENT_NAME, "--relay", url];
+        if let Some(host_key) = host_key {
+            args.extend(["--host-key", host_key]);
+        }
+        Self::spawn(operator, &args)
+    }
+
+    /// Runs `revtty` with `args` in the PTY.
+    fn spawn(operator: &Role, args: &[&str]) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -299,10 +308,7 @@ impl Terminal {
             .expect("open operator PTY");
 
         let mut command = CommandBuilder::new(REVTTY);
-        command.args(["connect", AGENT_NAME, "--relay", url]);
-        if let Some(host_key) = host_key {
-            command.args(["--host-key", host_key]);
-        }
+        command.args(args);
         command.env("REVTTY_CONFIG_DIR", &operator.config);
         command.env("REVTTY_STATE_DIR", &operator.state);
         command.env("TERM", "xterm");
@@ -311,7 +317,7 @@ impl Terminal {
         let child = pair
             .slave
             .spawn_command(command)
-            .expect("spawn revtty connect");
+            .expect("spawn revtty in a PTY");
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().expect("PTY reader");
@@ -1088,6 +1094,263 @@ fn run_until_exit(role: &Role, args: &[&str], within: Duration) -> std::process:
         std::thread::sleep(Duration::from_millis(50));
     }
     run.wait_with_output().expect("revtty output")
+}
+
+/// Runs `revtty exec` against the e2e agent with `args`, `input` on its stdin, and waits at
+/// most `within` for it to exit.
+fn exec_until_exit(
+    operator: &Role,
+    url: &str,
+    args: &[&str],
+    input: &[u8],
+    within: Duration,
+) -> std::process::Output {
+    let mut run = operator
+        .command()
+        .args(["exec", AGENT_NAME, "--relay", url])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn revtty exec");
+    let mut stdin = run.stdin.take().expect("exec stdin");
+    // A command that does not read its input may let it go unwritten.
+    let _ = stdin.write_all(input);
+    drop(stdin);
+
+    let deadline = Instant::now() + within;
+    while run.try_wait().expect("poll revtty exec").is_none() {
+        if Instant::now() >= deadline {
+            let _ = run.kill();
+            let _ = run.wait();
+            panic!("revtty exec {args:?} kept running");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    run.wait_with_output().expect("revtty exec output")
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[test]
+fn exec_runs_a_command_with_its_streams_input_and_exit_status() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let agent_process = start_agent(&root, &agent);
+    // Pinned first, so that exec has nothing of its own to say.
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+
+    let ran = exec_until_exit(
+        &operator,
+        &url,
+        &["--", "echo out; echo err >&2; : REVTTY_EXEC_MARKER; exit 7"],
+        b"",
+        Duration::from_secs(20),
+    );
+    assert_eq!(ran.status.code(), Some(7), "{}", text(&ran.stderr));
+    assert_eq!(text(&ran.stdout), "out\n");
+    assert_eq!(text(&ran.stderr), "err\n");
+
+    // Its words are joined, as ssh does, and its input reaches it.
+    let piped = exec_until_exit(
+        &operator,
+        &url,
+        &["--", "tr", "a-z", "A-Z"],
+        b"from the operator\n",
+        Duration::from_secs(20),
+    );
+    assert_eq!(piped.status.code(), Some(0), "{}", text(&piped.stderr));
+    assert_eq!(text(&piped.stdout), "FROM THE OPERATOR\n");
+
+    // With -n, none does.
+    let without_input = exec_until_exit(
+        &operator,
+        &url,
+        &["-n", "--", "cat"],
+        b"not for the command\n",
+        Duration::from_secs(20),
+    );
+    assert_eq!(
+        without_input.status.code(),
+        Some(0),
+        "{}",
+        text(&without_input.stderr)
+    );
+    assert_eq!(text(&without_input.stdout), "");
+
+    // The relay audits each as an exec, and neither it nor the agent logs what ran.
+    let db = root.path("relay.db");
+    let db = db.to_str().expect("utf-8 path");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let sessions = loop {
+        let sessions = relay_role.run(&["relay", "sessions", "--db", db]);
+        let completed = sessions
+            .lines()
+            .filter(|line| line.contains("\texec\t") && line.contains("outcome=completed"))
+            .count();
+        if completed == 3 {
+            break sessions;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "exec sessions not audited as completed:\n{sessions}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    for (what, said) in [
+        ("relay sessions", sessions),
+        ("relay log", relay.log()),
+        ("agent log", agent_process.log()),
+    ] {
+        assert!(
+            !said.contains("REVTTY_EXEC_MARKER"),
+            "the {what} shows the command:\n{said}"
+        );
+    }
+}
+
+#[test]
+fn exec_gives_up_at_its_timeout() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let _agent_process = start_agent(&root, &agent);
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+
+    let started = Instant::now();
+    let ran = exec_until_exit(
+        &operator,
+        &url,
+        &["--timeout", "1", "-n", "--", "sleep 5"],
+        b"",
+        Duration::from_secs(20),
+    );
+
+    assert_eq!(ran.status.code(), Some(124), "{}", text(&ran.stderr));
+    assert!(
+        text(&ran.stderr).contains("timed out after 1s"),
+        "{}",
+        text(&ran.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "exec waited for the command: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn exec_stops_on_time_while_its_local_output_is_not_read() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let _agent_process = start_agent(&root, &agent);
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+
+    // More than a pipe holds, to an output this test reads only once exec has exited.
+    const TO_STDOUT: &str = "dd if=/dev/zero bs=1000 count=1000 2>/dev/null; sleep 10";
+    const TO_STDERR: &str = "dd if=/dev/zero bs=1000 count=1000 >&2 2>/dev/null; sleep 10";
+    for (stream, command) in [("stdout", TO_STDOUT), ("stderr", TO_STDERR)] {
+        let started = Instant::now();
+        let ran = exec_until_exit(
+            &operator,
+            &url,
+            &["--timeout", "2", "-n", "--", command],
+            b"",
+            Duration::from_secs(15),
+        );
+        assert_eq!(ran.status.code(), Some(124), "with {stream} not read");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "exec outlived its timeout with {stream} not read: {:?}",
+            started.elapsed()
+        );
+    }
+
+    // Ctrl-C, with stdout not read.
+    let mut run = operator
+        .command()
+        .args(["exec", AGENT_NAME, "--relay", &url, "-n", "--", TO_STDOUT])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn revtty exec");
+    std::thread::sleep(Duration::from_secs(2));
+    let interrupted = Instant::now();
+    let pid = run.id().to_string();
+    let sent = Command::new("kill")
+        .args(["-INT", &pid])
+        .status()
+        .expect("run kill");
+    assert!(sent.success(), "SIGINT not delivered");
+    let deadline = interrupted + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = run.try_wait().expect("poll revtty exec") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = run.kill();
+            let _ = run.wait();
+            panic!("exec kept running after Ctrl-C with stdout not read");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(130));
+}
+
+#[test]
+fn exec_never_asks_for_a_host_key() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let _agent_process = start_agent(&root, &agent);
+
+    // At a terminal, where connect would ask for the fingerprint, exec fails at once.
+    let mut terminal = Terminal::spawn(
+        &operator,
+        &["exec", AGENT_NAME, "--relay", &url, "--", "true"],
+    );
+    let status = terminal.wait_exit(Duration::from_secs(15));
+    let output = terminal.text();
+    let Some(status) = status else {
+        panic!("revtty exec waited at the terminal:\n{output}");
+    };
+    assert!(!status.success(), "exec ran without a pinned host key");
+    assert!(output.contains("pass --host-key"), "{output}");
+    assert!(
+        !operator.config.join("known_hosts").exists(),
+        "a host key was pinned without approval"
+    );
 }
 
 #[test]

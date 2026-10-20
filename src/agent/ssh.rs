@@ -1,7 +1,11 @@
 use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -10,7 +14,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair, PtySize, native_pt
 use reqwest::Client;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{self, Msg, Session};
-use russh::{Channel, ChannelId, Preferred, Pty};
+use russh::{Channel, ChannelId, Preferred, Pty, Sig};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -39,6 +43,12 @@ const HANGUP_GRACE: Duration = Duration::from_secs(5);
 const KILL_REAP_WAIT: Duration = Duration::from_secs(5);
 /// Output still forwarded after the shell exits; a background job may keep the PTY open.
 const OUTPUT_DRAIN_WAIT: Duration = Duration::from_secs(1);
+/// Once a command has exited, how long each of its output pipes may stay silent before it is
+/// left: a process the command left behind may keep it open. Only silence counts, so an
+/// operator that reads slowly still gets the whole output.
+const COMMAND_OUTPUT_SILENCE: Duration = Duration::from_secs(1);
+/// The extended data type of a command's stderr (RFC 4254, section 5.2).
+const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 /// Time the SSH session of a revoked operator gets to end once its transport is cut.
 const REVOKED_SESSION_WAIT: Duration = Duration::from_secs(5);
 /// A probe session ends after this long whatever the operator does: longer than the
@@ -57,6 +67,8 @@ const AUTHENTICATION_LIMIT: Duration = Duration::from_secs(45);
 pub enum SessionKind {
     /// An interactive shell in a PTY.
     Shell,
+    /// One command, which the operator's `exec` request names, without a PTY.
+    Exec,
     /// Only `exec` of `PROBE_COMMAND`, answered with this encoded `ProbeResult`.
     Probe(String),
 }
@@ -178,13 +190,15 @@ struct PendingPty {
     pair: PtyPair,
 }
 
+/// Operator input for a shell's PTY or a command's stdin.
 enum PtyInput {
     Data(Vec<u8>),
     Eof,
 }
 
-/// Handler-side view of a running shell. Dropping it (channel close, session end or
-/// handler drop) closes `close`, which tells the shell supervisor to tear the shell down.
+/// Handler-side view of a running shell or command; a command has no PTY `master`. Dropping
+/// it (channel close, session end or handler drop) closes `close`, which tells the supervisor
+/// to tear the shell or the command down.
 struct ActiveShell {
     channel: ChannelId,
     master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
@@ -236,8 +250,8 @@ impl AgentSshHandler {
         }
     }
 
-    /// Refuses the terminal and closes its channel, so the operator gets an answer instead of
-    /// a silent terminal.
+    /// Refuses the terminal or command and closes its channel, so the operator gets an answer
+    /// instead of a silent terminal.
     fn refuse_terminal(
         &mut self,
         channel: ChannelId,
@@ -269,6 +283,91 @@ impl AgentSshHandler {
         if self.open_channel == Some(channel) {
             self.open_channel = None;
         }
+    }
+
+    /// Runs the command of an exec session's `exec` request: one per channel, and none once
+    /// the agent has started shutting down. The command itself is never logged.
+    fn start_command(
+        &mut self,
+        channel: ChannelId,
+        command: &[u8],
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        if self.open_channel != Some(channel) || self.active_shell.is_some() {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+
+        let guard = match self.shutdown.guard.upgrade() {
+            Some(guard) if !*self.shutdown.signal.borrow() => guard,
+            _ => {
+                self.refuse_terminal(channel, session)?;
+                return Ok(());
+            }
+        };
+
+        let SpawnedCommand {
+            child,
+            stdin,
+            stdout,
+            stderr,
+        } = match spawn_command(command) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                eprintln!("command spawn failed: {error}");
+                self.refuse_terminal(channel, session)?;
+                return Ok(());
+            }
+        };
+
+        let handle = session.handle();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let pending_input = Arc::new(AtomicUsize::new(0));
+        let (close_tx, close_rx) = oneshot::channel();
+        let (exited_tx, exited_rx) = watch::channel(false);
+
+        let stdout_task = tokio::spawn(forward_command_output(
+            stdout,
+            handle.clone(),
+            channel,
+            None,
+            exited_rx.clone(),
+        ));
+        let stderr_task = tokio::spawn(forward_command_output(
+            stderr,
+            handle.clone(),
+            channel,
+            Some(SSH_EXTENDED_DATA_STDERR),
+            exited_rx,
+        ));
+        let input_task = tokio::spawn(forward_command_input(
+            stdin,
+            input_rx,
+            Arc::clone(&pending_input),
+        ));
+
+        tokio::spawn(supervise_command(CommandSupervisor {
+            child,
+            stdout_task,
+            stderr_task,
+            input_task,
+            exited: exited_tx,
+            handle,
+            channel,
+            close: close_rx,
+            shutdown: self.shutdown.signal.clone(),
+            _guard: guard,
+        }));
+
+        self.active_shell = Some(ActiveShell {
+            channel,
+            master: Arc::new(Mutex::new(None)),
+            input: Some(input_tx),
+            pending_input,
+            _close: close_tx,
+        });
+        session.channel_success(channel)?;
+        Ok(())
     }
 }
 
@@ -319,8 +418,8 @@ impl server::Handler for AgentSshHandler {
         _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // A probe has no terminal, and without a PTY no shell starts either.
-        if matches!(self.kind, SessionKind::Probe(_))
+        // A probe or a command has no terminal, and without a PTY no shell starts either.
+        if !matches!(self.kind, SessionKind::Shell)
             || self.open_channel != Some(channel)
             || self.pending_pty.is_some()
             || self.active_shell.is_some()
@@ -354,6 +453,9 @@ impl server::Handler for AgentSshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if matches!(self.kind, SessionKind::Exec) {
+            return self.start_command(channel, data, session);
+        }
         // A shell session runs no command.
         let SessionKind::Probe(answer) = &self.kind else {
             session.channel_failure(channel)?;
@@ -598,15 +700,20 @@ fn open_pty_io(master: &dyn MasterPty) -> io::Result<AsyncFd<File>> {
 
     // O_NONBLOCK lives on the shared open file description, so the master becomes
     // non-blocking too; it is only used for resize and termios, which are unaffected.
-    // SAFETY: `duplicate` is a valid, owned file descriptor.
-    let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFL) };
+    register_nonblocking(duplicate)
+}
+
+/// Makes `descriptor` non-blocking and registers it with the runtime for async I/O.
+fn register_nonblocking(descriptor: OwnedFd) -> io::Result<AsyncFd<File>> {
+    // SAFETY: `descriptor` is a valid, owned file descriptor.
+    let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: as above.
     if unsafe {
         libc::fcntl(
-            duplicate.as_raw_fd(),
+            descriptor.as_raw_fd(),
             libc::F_SETFL,
             flags | libc::O_NONBLOCK,
         )
@@ -617,7 +724,7 @@ fn open_pty_io(master: &dyn MasterPty) -> io::Result<AsyncFd<File>> {
 
     // SAFETY: the `File` owns the descriptor, which stays open and unchanged for as long as
     // the `AsyncFd` owns the `File`.
-    unsafe { AsyncFd::register(File::from(duplicate)) }.map_err(|error| error.into_parts().1)
+    unsafe { AsyncFd::register(File::from(descriptor)) }.map_err(|error| error.into_parts().1)
 }
 
 async fn read_pty(pty: &AsyncFd<File>, buffer: &mut [u8]) -> io::Result<usize> {
@@ -836,6 +943,326 @@ async fn wait_for_exit(child: &mut (dyn Child + Send + Sync), within: Duration) 
             return false;
         }
         tokio::time::sleep(CHILD_POLL_INTERVAL).await;
+    }
+}
+
+/// A command's process, the leader of a process group of its own, and its pipes, set up for
+/// async I/O.
+struct SpawnedCommand {
+    child: std::process::Child,
+    stdin: AsyncFd<File>,
+    stdout: AsyncFd<File>,
+    stderr: AsyncFd<File>,
+}
+
+/// Starts `command` as sshd does, with the account's shell and `-c`, in the home directory
+/// the interactive shell starts in, and in a process group of its own, so that cancelling it
+/// can end what it started.
+fn spawn_command(command: &[u8]) -> io::Result<SpawnedCommand> {
+    let shell = CommandBuilder::new_default_prog().get_shell();
+    let mut process = std::process::Command::new(&shell);
+    process
+        .arg("-c")
+        .arg(OsStr::from_bytes(command))
+        .env("SHELL", &shell)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    if let Some(dirs) = directories::BaseDirs::new() {
+        process.current_dir(dirs.home_dir());
+    }
+
+    let mut child = process.spawn()?;
+    match command_pipes(&mut child) {
+        Ok((stdin, stdout, stderr)) => Ok(SpawnedCommand {
+            child,
+            stdin,
+            stdout,
+            stderr,
+        }),
+        Err(error) => {
+            // Not left running unwatched; reaping it may take a moment, so off the runtime.
+            signal_group(&child, libc::SIGKILL);
+            tokio::task::spawn_blocking(move || child.wait());
+            Err(error)
+        }
+    }
+}
+
+fn command_pipes(
+    child: &mut std::process::Child,
+) -> io::Result<(AsyncFd<File>, AsyncFd<File>, AsyncFd<File>)> {
+    let missing = || io::Error::other("command pipe was not set up");
+    let stdin = child.stdin.take().ok_or_else(missing)?;
+    let stdout = child.stdout.take().ok_or_else(missing)?;
+    let stderr = child.stderr.take().ok_or_else(missing)?;
+    Ok((
+        register_nonblocking(stdin.into())?,
+        register_nonblocking(stdout.into())?,
+        register_nonblocking(stderr.into())?,
+    ))
+}
+
+/// Forwards one of a command's output pipes to the channel until the pipe's EOF: as data or,
+/// with `ext`, as extended data of that type. Once the command has exited (`exited`), a pipe
+/// silent for `COMMAND_OUTPUT_SILENCE` is left.
+async fn forward_command_output(
+    pipe: AsyncFd<File>,
+    handle: server::Handle,
+    channel: ChannelId,
+    ext: Option<u32>,
+    mut exited: watch::Receiver<bool>,
+) {
+    let mut buffer = vec![0_u8; PTY_IO_CHUNK];
+
+    loop {
+        let read = tokio::select! {
+            read = read_pty(&pipe, &mut buffer) => read,
+            () = silent_after_exit(&mut exited) => return,
+        };
+        let read = match read {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+
+        let data = buffer[..read].to_vec();
+        let sent = match ext {
+            Some(ext) => handle.extended_data(channel, ext, data).await,
+            None => handle.data(channel, data).await,
+        };
+        if sent.is_err() {
+            return;
+        }
+    }
+}
+
+/// Resolves `COMMAND_OUTPUT_SILENCE` after it starts, once the command has exited; never
+/// while it runs.
+async fn silent_after_exit(exited: &mut watch::Receiver<bool>) {
+    if exited.wait_for(|exited| *exited).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    tokio::time::sleep(COMMAND_OUTPUT_SILENCE).await;
+}
+
+/// Writes the operator's input to a command's stdin, and closes it at the operator's EOF.
+/// Once the command has closed its stdin, input is discarded, as sshd does, so that it does
+/// not count towards `INPUT_PENDING_LIMIT`.
+async fn forward_command_input(
+    stdin: AsyncFd<File>,
+    mut input: mpsc::UnboundedReceiver<PtyInput>,
+    pending: Arc<AtomicUsize>,
+) {
+    let mut stdin = Some(stdin);
+
+    while let Some(message) = input.recv().await {
+        match message {
+            PtyInput::Data(data) => {
+                if let Some(pipe) = &stdin
+                    && write_pty(pipe, &data).await.is_err()
+                {
+                    stdin = None;
+                }
+                pending.fetch_sub(data.len(), Ordering::AcqRel);
+            }
+            // Dropping the pipe closes the command's stdin.
+            PtyInput::Eof => return,
+        }
+    }
+}
+
+/// Single owner of a command's process, as `ShellSupervisor` is of a shell: the only code
+/// that reaps its leader and the only code that signals its process group, and only while
+/// the leader is unreaped, so that the group's ID, the leader's PID, cannot have been reused.
+struct CommandSupervisor {
+    child: std::process::Child,
+    stdout_task: JoinHandle<()>,
+    stderr_task: JoinHandle<()>,
+    input_task: JoinHandle<()>,
+    /// Set once the leader has exited: from then on, the output pipes' silence counts.
+    exited: watch::Sender<bool>,
+    handle: server::Handle,
+    channel: ChannelId,
+    close: oneshot::Receiver<()>,
+    shutdown: watch::Receiver<bool>,
+    _guard: mpsc::Sender<()>,
+}
+
+enum CommandEnd {
+    /// The leader exited and the command's output was forwarded.
+    Exited,
+    /// The channel or the session closed first.
+    SessionClosed,
+    /// The agent is shutting down, or can no longer watch the command.
+    Stopped,
+}
+
+async fn supervise_command(supervisor: CommandSupervisor) {
+    let CommandSupervisor {
+        mut child,
+        mut stdout_task,
+        mut stderr_task,
+        input_task,
+        exited,
+        handle,
+        channel,
+        mut close,
+        mut shutdown,
+        _guard,
+    } = supervisor;
+    let mut poll = tokio::time::interval(CHILD_POLL_INTERVAL);
+
+    let mut end = loop {
+        tokio::select! {
+            _ = poll.tick() => match leader_exited(&child) {
+                Ok(false) => {}
+                Ok(true) => break CommandEnd::Exited,
+                Err(error) => {
+                    eprintln!("command wait failed: {error}");
+                    break CommandEnd::Stopped;
+                }
+            },
+            // Resolves when the handler drops its side: channel closed or session ended.
+            _ = &mut close => break CommandEnd::SessionClosed,
+            () = shutdown_requested(&mut shutdown) => break CommandEnd::Stopped,
+        }
+    };
+
+    // The leader stays unreaped while its output is forwarded, so that its group can still
+    // be ended if the session goes first.
+    if matches!(end, CommandEnd::Exited) {
+        exited.send_replace(true);
+        let forwarded = async {
+            let _ = (&mut stdout_task).await;
+            let _ = (&mut stderr_task).await;
+        };
+        tokio::select! {
+            () = forwarded => {}
+            _ = &mut close => end = CommandEnd::SessionClosed,
+            () = shutdown_requested(&mut shutdown) => end = CommandEnd::Stopped,
+        }
+    }
+
+    input_task.abort();
+    match end {
+        CommandEnd::Exited => {
+            // Reaps the leader. What it left running in its group stays, as with a shell.
+            match child.try_wait() {
+                Ok(Some(status)) => report_exit(&handle, channel, status).await,
+                Ok(None) => eprintln!("command {} exited but cannot be reaped", child.id()),
+                Err(error) => eprintln!("command wait failed: {error}"),
+            }
+            let _ = handle.eof(channel).await;
+            let _ = handle.close(channel).await;
+        }
+        CommandEnd::SessionClosed => {
+            end_process_group(&mut child, [&stdout_task, &stderr_task]).await;
+        }
+        CommandEnd::Stopped => {
+            end_process_group(&mut child, [&stdout_task, &stderr_task]).await;
+            let _ = handle.close(channel).await;
+        }
+    }
+    stdout_task.abort();
+    stderr_task.abort();
+}
+
+/// Whether the command's leader has exited, leaving it unreaped: until it is reaped, neither
+/// its PID nor its process group's ID can be reused.
+fn leader_exited(leader: &std::process::Child) -> io::Result<bool> {
+    // SAFETY: zeroed siginfo_t is a valid out-parameter for waitid.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `leader` is our own child, and WNOWAIT leaves it unreaped.
+    let waited = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            leader.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if waited != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // With WNOHANG, `si_pid` stays zero while the leader is still running.
+    // SAFETY: waitid filled `info` in, or left it zeroed.
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+/// Sends `signal` to the command's process group, whose ID is its leader's PID. Only while
+/// the leader is unreaped: no other process or group can have that ID before then. When
+/// `leader_exited` cannot tell, nothing is sent.
+fn signal_group(leader: &std::process::Child, signal: libc::c_int) {
+    if leader_exited(leader).is_err() {
+        return;
+    }
+    let Ok(group) = libc::pid_t::try_from(leader.id()) else {
+        return;
+    };
+    // SAFETY: `group` is the process group our own unreaped child leads.
+    unsafe { libc::kill(-group, signal) };
+}
+
+/// Ends a command still running, or whose output was not all forwarded: SIGTERM to its
+/// process group, then, once its leader has exited and its output pipes are closed or
+/// `HANGUP_GRACE` is over, SIGKILL to the group, so that a process that ignores SIGTERM goes
+/// too, even when the leader is gone. Processes that left the group, as daemons do, are not
+/// reached. Then reaps the leader.
+async fn end_process_group(leader: &mut std::process::Child, output: [&JoinHandle<()>; 2]) {
+    signal_group(leader, libc::SIGTERM);
+
+    let deadline = tokio::time::Instant::now() + HANGUP_GRACE;
+    // A leader that cannot be watched gets no more time than one that exited.
+    while tokio::time::Instant::now() < deadline
+        && (matches!(leader_exited(leader), Ok(false))
+            || !output.iter().all(|task| task.is_finished()))
+    {
+        tokio::time::sleep(CHILD_POLL_INTERVAL).await;
+    }
+
+    signal_group(leader, libc::SIGKILL);
+    if !wait_for_exit(leader, KILL_REAP_WAIT).await {
+        eprintln!("command {} did not exit after SIGKILL", leader.id());
+    }
+}
+
+/// Reports how the command's leader ended: its exit status, or the signal that killed it.
+async fn report_exit(handle: &server::Handle, channel: ChannelId, status: ExitStatus) {
+    if let Some(code) = status.code().and_then(|code| u32::try_from(code).ok()) {
+        let _ = handle.exit_status_request(channel, code).await;
+    } else if let Some(signal) = status.signal() {
+        let _ = handle
+            .exit_signal_request(
+                channel,
+                ssh_signal(signal),
+                status.core_dumped(),
+                String::new(),
+                String::new(),
+            )
+            .await;
+    }
+}
+
+/// A signal by its SSH name (RFC 4254, section 6.10), or by its number when SSH names none.
+fn ssh_signal(signal: libc::c_int) -> Sig {
+    match signal {
+        libc::SIGABRT => Sig::ABRT,
+        libc::SIGALRM => Sig::ALRM,
+        libc::SIGFPE => Sig::FPE,
+        libc::SIGHUP => Sig::HUP,
+        libc::SIGILL => Sig::ILL,
+        libc::SIGINT => Sig::INT,
+        libc::SIGKILL => Sig::KILL,
+        libc::SIGPIPE => Sig::PIPE,
+        libc::SIGQUIT => Sig::QUIT,
+        libc::SIGSEGV => Sig::SEGV,
+        libc::SIGTERM => Sig::TERM,
+        libc::SIGUSR1 => Sig::USR1,
+        // Named by RFC 4254, though not by russh.
+        libc::SIGUSR2 => Sig::Custom("USR2".to_owned()),
+        other => Sig::Custom(other.to_string()),
     }
 }
 
@@ -1068,9 +1495,9 @@ mod tests {
     use tokio::sync::{mpsc, oneshot, watch};
 
     use super::{
-        AUTHENTICATION_LIMIT, AgentSshHandler, OperatorAllowlist, SessionKind, ShellShutdown,
-        authorize, ed25519_only, operator_revoked, relay_cancelled, serve_stream, server_config,
-        signal_if_running,
+        AUTHENTICATION_LIMIT, AgentSshHandler, COMMAND_OUTPUT_SILENCE, INPUT_PENDING_LIMIT,
+        OperatorAllowlist, SessionKind, ShellShutdown, authorize, ed25519_only, operator_revoked,
+        relay_cancelled, serve_stream, server_config, signal_if_running,
     };
     use crate::error::RevttyError;
     use crate::protocol::PROBE_COMMAND;
@@ -1919,6 +2346,16 @@ mod tests {
         allowed: &[&PublicKey],
         authentication_limit: Duration,
     ) -> RevocableSession {
+        agent_session(operator, allowed, authentication_limit, SessionKind::Shell).await
+    }
+
+    /// A session of `kind` as the agent serves it, which `operator` authenticated to.
+    async fn agent_session(
+        operator: &PrivateKey,
+        allowed: &[&PublicKey],
+        authentication_limit: Duration,
+        kind: SessionKind,
+    ) -> RevocableSession {
         let server_key = ed25519_key();
         let expected_server_key = server_key.public_key().clone();
         let (allowlist, allowlist_rx) = watch::channel(allowlist_of(allowed));
@@ -1939,7 +2376,7 @@ mod tests {
             server_config(server_key, SSH_TIMEOUTS),
             allowlist_rx,
             shutdown.handle(),
-            SessionKind::Shell,
+            kind,
             None,
             authentication_limit,
             relay_cancelled(cancelled),
@@ -2639,5 +3076,269 @@ mod tests {
             .await
             .expect("session is still usable");
         shell.server.abort();
+    }
+
+    /// What a command's channel got, up to its close or for at most `within`.
+    #[derive(Default)]
+    struct CommandOutput {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_status: Option<u32>,
+        eof: bool,
+        closed: bool,
+    }
+
+    async fn command_output(
+        channel: &mut russh::Channel<client::Msg>,
+        within: Duration,
+    ) -> CommandOutput {
+        let mut output = CommandOutput::default();
+        let _ = tokio::time::timeout(within, async {
+            while let Some(message) = channel.wait().await {
+                match message {
+                    ChannelMsg::Data { data } => output.stdout.extend_from_slice(&data),
+                    ChannelMsg::ExtendedData { data, ext: 1 } => {
+                        output.stderr.extend_from_slice(&data);
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => {
+                        output.exit_status = Some(exit_status);
+                    }
+                    ChannelMsg::Eof => output.eof = true,
+                    ChannelMsg::Close => {
+                        output.closed = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        output
+    }
+
+    /// An exec session as the agent serves it, and the channel `command` started on.
+    async fn exec_session(command: &str) -> (RevocableSession, russh::Channel<client::Msg>) {
+        let operator = ed25519_key();
+        let session = agent_session(
+            &operator,
+            &[operator.public_key()],
+            AUTHENTICATION_LIMIT,
+            SessionKind::Exec,
+        )
+        .await;
+        let mut channel = session
+            .session
+            .channel_open_session()
+            .await
+            .expect("open command channel");
+        channel.exec(true, command).await.expect("request command");
+        let replies = channel_replies(&mut channel, 1).await;
+        assert!(
+            matches!(replies[..], [ChannelMsg::Success]),
+            "the agent did not start the command: {replies:?}"
+        );
+        (session, channel)
+    }
+
+    #[tokio::test]
+    async fn an_exec_session_runs_its_command_with_separate_streams_and_exit_status() {
+        let (session, mut channel) = exec_session("echo out; echo err >&2; exit 7").await;
+
+        let output = command_output(&mut channel, Duration::from_secs(10)).await;
+
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
+        assert_eq!(output.exit_status, Some(7));
+        assert!(output.eof, "the command's output had no EOF");
+        assert!(output.closed, "the command's channel stayed open");
+        session.server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_exec_session_gives_the_command_its_input_and_eof() {
+        let (session, mut channel) = exec_session("cat").await;
+
+        channel
+            .data_bytes(b"line one\nline two\n".to_vec())
+            .await
+            .expect("send input");
+        channel.eof().await.expect("send EOF");
+        let output = command_output(&mut channel, Duration::from_secs(10)).await;
+
+        // cat ends only once its stdin reaches EOF.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "line one\nline two\n"
+        );
+        assert_eq!(output.exit_status, Some(0));
+        session.server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_exec_session_runs_one_command_and_no_terminal() {
+        let operator = ed25519_key();
+        let session = agent_session(
+            &operator,
+            &[operator.public_key()],
+            AUTHENTICATION_LIMIT,
+            SessionKind::Exec,
+        )
+        .await;
+        let mut channel = session
+            .session
+            .channel_open_session()
+            .await
+            .expect("open channel");
+
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .expect("request PTY");
+        channel.request_shell(true).await.expect("request shell");
+        channel
+            .exec(true, "sleep 2")
+            .await
+            .expect("request command");
+        channel
+            .exec(true, "echo second")
+            .await
+            .expect("request a second command");
+        request_unsupported(&channel).await;
+        let replies = channel_replies(&mut channel, 7).await;
+
+        assert!(
+            matches!(
+                replies[..],
+                [
+                    ChannelMsg::Failure,
+                    ChannelMsg::Failure,
+                    ChannelMsg::Success,
+                    ChannelMsg::Failure,
+                    ChannelMsg::Failure,
+                    ChannelMsg::Failure,
+                    ChannelMsg::Failure
+                ]
+            ),
+            "an exec session ran something besides its one command: {replies:?}"
+        );
+        session.server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_operator_that_reads_late_gets_all_of_the_command_output() {
+        const SIZE: usize = 3_000_000;
+        let (session, mut channel) =
+            exec_session("dd if=/dev/zero bs=1000 count=3000 2>/dev/null").await;
+
+        // Well past the command's exit and the silence that may follow it.
+        tokio::time::sleep(COMMAND_OUTPUT_SILENCE * 3).await;
+        let output = command_output(&mut channel, Duration::from_secs(20)).await;
+
+        assert_eq!(output.stdout.len(), SIZE, "the command's output was cut");
+        assert_eq!(output.exit_status, Some(0));
+        session.server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_background_job_that_keeps_the_output_open_does_not_hold_the_channel() {
+        // The job keeps the command's stdout open, and writes nothing to it, after the
+        // command has exited; it ends on its own later.
+        let (session, mut channel) = exec_session("sleep 4 & echo started").await;
+        let started = tokio::time::Instant::now();
+
+        let output = command_output(&mut channel, Duration::from_secs(10)).await;
+
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "started\n");
+        assert_eq!(output.exit_status, Some(0));
+        assert!(output.closed, "the command's channel stayed open");
+        assert!(
+            started.elapsed() < COMMAND_OUTPUT_SILENCE * 3,
+            "the channel waited for the background job: {:?}",
+            started.elapsed()
+        );
+        session.server.abort();
+    }
+
+    #[tokio::test]
+    async fn unread_command_input_over_limit_closes_the_channel() {
+        let (session, channel) = exec_session("sleep 5").await;
+        let (mut reader, writer) = channel.split();
+        let flood = tokio::spawn(async move {
+            let _ = writer
+                .data_bytes(vec![b'x'; INPUT_PENDING_LIMIT + 1024 * 1024])
+                .await;
+        });
+
+        let mut stderr = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(message) = reader.wait().await {
+                match message {
+                    ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
+                    ChannelMsg::Close => return true,
+                    _ => {}
+                }
+            }
+            false
+        })
+        .await;
+
+        flood.abort();
+        assert!(
+            matches!(closed, Ok(true)),
+            "the channel stayed open past the input limit"
+        );
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("input buffer limit"),
+            "the operator was not told why: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        session.server.abort();
+    }
+
+    #[tokio::test]
+    async fn input_after_the_command_closed_its_stdin_is_discarded() {
+        let (session, channel) = exec_session("exec 0<&-; sleep 1; echo done").await;
+        let (mut reader, writer) = channel.split();
+        // More than the agent keeps for a command that does not read, after it closed stdin.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        writer
+            .data_bytes(vec![b'x'; INPUT_PENDING_LIMIT + 1024 * 1024])
+            .await
+            .expect("send input");
+
+        let mut stdout = Vec::new();
+        let mut exit_status = None;
+        let _ = tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(message) = reader.wait().await {
+                match message {
+                    ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                    ChannelMsg::ExitStatus {
+                        exit_status: status,
+                    } => exit_status = Some(status),
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(String::from_utf8_lossy(&stdout), "done\n");
+        assert_eq!(exit_status, Some(0), "the command did not end on its own");
+        session.server.abort();
+    }
+
+    #[test]
+    fn signals_are_reported_by_their_ssh_names() {
+        assert!(matches!(super::ssh_signal(libc::SIGTERM), russh::Sig::TERM));
+        assert!(matches!(super::ssh_signal(libc::SIGKILL), russh::Sig::KILL));
+        assert!(matches!(
+            super::ssh_signal(libc::SIGUSR2),
+            russh::Sig::Custom(name) if name == "USR2"
+        ));
+        // SSH names no more than its list: the number stands in for the name.
+        assert!(matches!(
+            super::ssh_signal(libc::SIGWINCH),
+            russh::Sig::Custom(name) if name == libc::SIGWINCH.to_string()
+        ));
     }
 }

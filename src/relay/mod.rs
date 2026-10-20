@@ -27,7 +27,7 @@ use crate::protocol::{
     AgentListResponse, AgentRotateRequest, AgentStatusResponse, CONTROL_PROTOCOL_VERSION,
     ControlMessage, EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
     OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, SESSION_ERROR_PREFIX,
-    SessionRejectReason, operator_auth_message, operator_list_auth_message,
+    SESSION_NOT_ACCEPTED, SessionRejectReason, operator_auth_message, operator_list_auth_message,
 };
 use crate::storage::{OperatorsReportOutcome, ReportedOperator, RotationConfirmation, Store};
 use crate::token::{SecretToken, hash_token};
@@ -363,6 +363,7 @@ enum AgentDecision {
 enum SessionKind {
     Probe,
     Shell,
+    Exec,
 }
 
 impl SessionKind {
@@ -378,13 +379,20 @@ impl SessionKind {
                 session_id,
                 tunnel_token,
             },
+            Self::Exec => ControlMessage::ExecOffer {
+                version: CONTROL_PROTOCOL_VERSION,
+                session_id,
+                tunnel_token,
+            },
         }
     }
 
+    /// The session's kind in the audit; the command an exec runs travels only inside SSH.
     fn label(self) -> &'static str {
         match self {
             Self::Probe => "probe",
             Self::Shell => "shell",
+            Self::Exec => "exec",
         }
     }
 }
@@ -730,6 +738,7 @@ fn router(state: RelayState) -> Router {
         .route("/v1/status/{name}", get(operator_status))
         .route("/v1/probe/{name}", get(persistent_probe_upgrade))
         .route("/v1/connect/{name}", get(persistent_connect_upgrade))
+        .route("/v1/exec/{name}", get(persistent_exec_upgrade))
         .route("/v1/session/{session_id}", get(persistent_session_upgrade))
         .with_state(state)
 }
@@ -1097,6 +1106,15 @@ async fn persistent_connect_upgrade(
     ws: WebSocketUpgrade,
 ) -> Response {
     persistent_operator_upgrade(state, name, headers, ws, SessionKind::Shell).await
+}
+
+async fn persistent_exec_upgrade(
+    State(state): State<RelayState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    persistent_operator_upgrade(state, name, headers, ws, SessionKind::Exec).await
 }
 
 async fn persistent_operator_upgrade(
@@ -1794,11 +1812,7 @@ async fn run_operator_session(
         Err(_) => {
             state.pending.lock().await.remove(&session_id);
             state.audit.ended(&session_id, "agent_unresponsive");
-            send_operator_session_error(
-                &mut operator_socket,
-                "agent did not accept the session before timeout",
-            )
-            .await;
+            send_operator_session_error(&mut operator_socket, SESSION_NOT_ACCEPTED).await;
             eprintln!(
                 "{} offer could not be queued for {agent_name}: {session_id}",
                 kind.label()
@@ -1838,11 +1852,7 @@ async fn run_operator_session(
             state.pending.lock().await.remove(&session_id);
             state.audit.ended(&session_id, "accept_timeout");
             send_session_cancel(&control, &session_id).await;
-            send_operator_session_error(
-                &mut operator_socket,
-                "agent did not accept the session before timeout",
-            )
-            .await;
+            send_operator_session_error(&mut operator_socket, SESSION_NOT_ACCEPTED).await;
             eprintln!(
                 "{} acceptance timed out for {agent_name}: {session_id}",
                 kind.label()
@@ -3369,6 +3379,38 @@ mod tests {
         let session = audited_outcome(&relay.state, "agent_unresponsive").await;
         assert_eq!(session.kind, "shell");
         assert_eq!(session.operator_fingerprint, relay.operator_fingerprint);
+
+        relay.server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_exec_request_is_offered_and_audited_as_exec() {
+        const NAME: &str = "exec-agent";
+        let relay = fast_relay(NAME).await;
+        let (mut agent, _operator) = connect_agent_and_operator(&relay, NAME, "exec").await;
+
+        let offered_as_exec = loop {
+            let message = tokio::time::timeout(Duration::from_secs(3), agent.next())
+                .await
+                .expect("session offer")
+                .expect("control connection open")
+                .expect("control message");
+            if let ClientMessage::Text(text) = message {
+                match serde_json::from_str::<ControlMessage>(&text) {
+                    Ok(ControlMessage::ExecOffer { .. }) => break true,
+                    Ok(ControlMessage::ProbeOffer { .. } | ControlMessage::ShellOffer { .. }) => {
+                        break false;
+                    }
+                    _ => {}
+                }
+            }
+        };
+        assert!(
+            offered_as_exec,
+            "an exec request was offered as another kind"
+        );
+        let session = audited_outcome_stage(&relay.state, |_| true).await;
+        assert_eq!(session.kind, "exec");
 
         relay.server.abort();
     }
