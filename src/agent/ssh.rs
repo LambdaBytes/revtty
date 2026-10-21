@@ -1495,9 +1495,10 @@ mod tests {
     use tokio::sync::{mpsc, oneshot, watch};
 
     use super::{
-        AUTHENTICATION_LIMIT, AgentSshHandler, COMMAND_OUTPUT_SILENCE, INPUT_PENDING_LIMIT,
-        OperatorAllowlist, SessionKind, ShellShutdown, authorize, ed25519_only, operator_revoked,
-        relay_cancelled, serve_stream, server_config, signal_if_running,
+        AUTHENTICATION_LIMIT, AgentSshHandler, COMMAND_OUTPUT_SILENCE, HANGUP_GRACE,
+        INPUT_PENDING_LIMIT, KILL_REAP_WAIT, OperatorAllowlist, SessionKind, ShellShutdown,
+        authorize, ed25519_only, operator_revoked, relay_cancelled, serve_stream, server_config,
+        signal_if_running,
     };
     use crate::error::RevttyError;
     use crate::protocol::PROBE_COMMAND;
@@ -3325,6 +3326,136 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&stdout), "done\n");
         assert_eq!(exit_status, Some(0), "the command did not end on its own");
         session.server.abort();
+    }
+
+    /// How long ending a command's group may take: SIGTERM, up to `HANGUP_GRACE` while
+    /// something holds its output open, SIGKILL and the reap, plus a margin.
+    const GROUP_TEARDOWN: Duration =
+        Duration::from_secs(HANGUP_GRACE.as_secs() + KILL_REAP_WAIT.as_secs() + 2);
+
+    /// A command that ignores SIGTERM, printing its PID.
+    const TERM_IGNORING_COMMAND: &str = "trap '' TERM; echo PID=$$ END_$((3+4)); exec sleep 30";
+
+    async fn assert_gone(pid: &str, what: &str) {
+        let gone = wait_process_gone(pid, GROUP_TEARDOWN).await;
+        if !gone {
+            kill_process(pid);
+        }
+        assert!(gone, "{what} {pid} survived");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_exec_ends_a_child_that_ignores_sigterm() {
+        // The leader ends on SIGTERM; its child ignores it, and keeps the output open. The
+        // child prints its PID only once it ignores SIGTERM: before, SIGTERM would end it.
+        let (mut session, mut channel) = exec_session(
+            "sh -c 'trap \"\" TERM; echo CHILD=$$ END_$((3+4)); exec sleep 30' & wait",
+        )
+        .await;
+        let text = read_until(&mut channel, "END_7", Duration::from_secs(10)).await;
+        let child = marker_value(&text, "CHILD=");
+
+        session.cancel.send(()).expect("session still listening");
+        let ended = tokio::time::timeout(Duration::from_secs(10), &mut session.server)
+            .await
+            .expect("a cancelled exec session stayed open")
+            .expect("session task");
+        let error = ended.expect_err("cancelled session ended as if completed");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+
+        assert_gone(
+            &child,
+            "a child that ignores SIGTERM, of a cancelled command,",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn revoking_the_operator_of_a_running_exec_ends_its_command() {
+        let (session, mut channel) = exec_session(TERM_IGNORING_COMMAND).await;
+        let text = read_until(&mut channel, "END_7", Duration::from_secs(10)).await;
+        let pid = marker_value(&text, "PID=");
+
+        session
+            .allowlist
+            .send_replace(allowlist_of(&[ed25519_key().public_key()]));
+        let ended = tokio::time::timeout(Duration::from_secs(10), session.server)
+            .await
+            .expect("the exec session of a revoked operator stayed open")
+            .expect("session task");
+        let error = ended.expect_err("revoked session ended as if completed");
+        assert!(error.to_string().contains("revoked"), "{error}");
+
+        assert_gone(&pid, "the command of a revoked operator").await;
+    }
+
+    #[tokio::test]
+    async fn agent_shutdown_waits_for_an_exec_teardown() {
+        let (mut session, mut channel) = exec_session(TERM_IGNORING_COMMAND).await;
+        let text = read_until(&mut channel, "END_7", Duration::from_secs(10)).await;
+        let pid = marker_value(&text, "PID=");
+
+        // What `agent run` does on a stop signal: signal, drop its own guard, wait for the rest.
+        session._shutdown.signal.send_replace(true);
+        let (closed, _) = mpsc::channel(1);
+        drop(std::mem::replace(&mut session._shutdown.guard, closed));
+        let waited = tokio::time::timeout(Duration::from_secs(10), session._shutdown.guards.recv())
+            .await
+            .is_ok();
+
+        let alive = process_alive(&pid);
+        if alive {
+            kill_process(&pid);
+        }
+        assert!(
+            waited,
+            "exec teardown did not finish within the shutdown bound"
+        );
+        assert!(
+            !alive,
+            "shutdown finished while command {pid} was still running"
+        );
+        session.server.abort();
+    }
+
+    /// A process that started a session of its own, as a daemon does, is not in the
+    /// command's group, which is all that ending the command reaches (see the README).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_process_that_left_the_command_group_outlives_its_cancellation() {
+        let (mut session, mut channel) = exec_session(
+            "setsid sh -c 'exec sleep 30' </dev/null >/dev/null 2>&1 & \
+             echo DAEMON=$! LEADER=$$ END_$((3+4)); exec sleep 30",
+        )
+        .await;
+        let text = read_until(&mut channel, "END_7", Duration::from_secs(10)).await;
+        let daemon = marker_value(&text, "DAEMON=");
+        let leader = marker_value(&text, "LEADER=");
+        // Once it runs sleep, it has left the group: setsid came before.
+        let detached = tokio::time::timeout(Duration::from_secs(5), async {
+            while !std::fs::read_to_string(format!("/proc/{daemon}/comm"))
+                .is_ok_and(|comm| comm.trim() == "sleep")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(detached.is_ok(), "{daemon} did not start its own session");
+
+        session.cancel.send(()).expect("session still listening");
+        let _ = tokio::time::timeout(Duration::from_secs(10), &mut session.server).await;
+        let leader_gone = wait_process_gone(&leader, GROUP_TEARDOWN).await;
+        let daemon_alive = process_alive(&daemon);
+        kill_process(&daemon);
+        if !leader_gone {
+            kill_process(&leader);
+        }
+
+        assert!(leader_gone, "the cancelled command {leader} survived");
+        assert!(
+            daemon_alive,
+            "{daemon}, which left the command's group, was ended with it"
+        );
     }
 
     #[test]

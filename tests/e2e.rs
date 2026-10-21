@@ -1736,6 +1736,181 @@ fn ctrl_c_ends_exec_while_its_json_waits_for_a_reader() {
     assert!(stderr.contains("cut short"), "{stderr}");
 }
 
+/// The PID the remote command wrote to `pid_file`, at most `within` after it started.
+fn remote_pid(pid_file: &std::path::Path, within: Duration) -> String {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Ok(written) = std::fs::read_to_string(pid_file)
+            && let Some(pid) = written.strip_suffix('\n')
+        {
+            assert!(pid.bytes().all(|byte| byte.is_ascii_digit()), "{written:?}");
+            return pid.to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the remote command did not start"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_process_gone(pid: &str, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while process_alive(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+#[test]
+fn exec_ends_its_remote_command_at_its_timeout_and_on_ctrl_c() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let _agent_process = start_agent(&root, &agent);
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+
+    for json in [false, true] {
+        for interrupt in [false, true] {
+            let case = format!("json={json} interrupt={interrupt}");
+            let pid_file = root.path(&format!("command-{json}-{interrupt}.pid"));
+            let command = format!(
+                "echo started; echo $$ > '{}'; exec sleep 600",
+                pid_file.display()
+            );
+            let mut args = vec!["-n"];
+            if json {
+                args.push("--json");
+            }
+            if !interrupt {
+                args.extend(["--timeout", "3"]);
+            }
+            args.extend(["--", &command]);
+
+            let run = spawn_exec(&operator, &url, &args);
+            let pid = remote_pid(&pid_file, Duration::from_secs(20));
+            if interrupt {
+                // Long enough for `started` to reach exec, which then has output to report.
+                std::thread::sleep(Duration::from_secs(1));
+                let sent = Command::new("kill")
+                    .args(["-INT", &run.id().to_string()])
+                    .status()
+                    .expect("run kill");
+                assert!(sent.success(), "SIGINT not delivered ({case})");
+            }
+            let ran = read_until_exit(run, Duration::from_secs(15));
+            // Before any assertion, so that a failing one leaves no remote command behind.
+            let gone = wait_process_gone(&pid, Duration::from_secs(15));
+            if !gone {
+                let _ = Command::new("kill").args(["-9", &pid]).status();
+            }
+
+            let expected = if interrupt { 130 } else { 124 };
+            assert_eq!(
+                ran.status.code(),
+                Some(expected),
+                "{case}: {}",
+                text(&ran.stderr)
+            );
+            if json {
+                let result = exec_json(&ran);
+                assert_eq!(result["interrupted"], interrupt, "{case}: {result}");
+                assert_eq!(result["timed_out"], !interrupt, "{case}: {result}");
+                assert_eq!(result["exit_status"], serde_json::Value::Null, "{case}");
+                assert_eq!(result["stdout"], "started\n", "{case}: {result}");
+            } else {
+                assert_eq!(text(&ran.stdout), "started\n", "{case}");
+            }
+            assert!(
+                gone,
+                "{case}: the remote command {pid} outlived revtty exec"
+            );
+        }
+    }
+}
+
+/// Stands in for an agent that predates exec on its control connection: it says hello and
+/// then lets every offer go unanswered, as an older agent does with an `exec_offer` it cannot
+/// decode.
+fn ignore_session_offers(url: &str, control_token: &str) {
+    use futures_util::{SinkExt, StreamExt};
+    use reqwest_websocket::{Message, Upgrade};
+
+    let relay = url.replace("http://", "ws://");
+    let token = control_token.to_owned();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fake agent runtime");
+        runtime.block_on(async move {
+            let mut control = reqwest::Client::new()
+                .get(format!("{relay}/v1/agent/{AGENT_NAME}"))
+                .bearer_auth(&token)
+                .upgrade()
+                .send()
+                .await
+                .expect("fake agent control upgrade")
+                .into_websocket()
+                .await
+                .expect("fake agent control connection");
+            let hello = serde_json::json!({
+                "type": "hello",
+                "version": 1,
+                "name": AGENT_NAME,
+                "agent_version": "0.1.0",
+                "active_sessions": 0,
+                "max_sessions": 4,
+            });
+            control
+                .send(Message::Text(hello.to_string()))
+                .await
+                .expect("send fake hello");
+            while let Some(Ok(_)) = control.next().await {}
+        });
+    });
+}
+
+#[test]
+fn exec_on_an_agent_that_predates_it_says_so() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (relay, url) = start_relay(&root, &relay_role);
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+
+    let config = std::fs::read_to_string(agent.config.join("agent.toml")).expect("read agent.toml");
+    let config: toml::Table = toml::from_str(&config).expect("parse agent.toml");
+    let control_token = config["control_token"].as_str().expect("control token");
+    ignore_session_offers(&url, control_token);
+    relay.wait_for_log("agent online", Duration::from_secs(10));
+
+    let ran = exec_until_exit(
+        &operator,
+        &url,
+        &["--host-key", &host_key, "-n", "--", "true"],
+        b"",
+        Duration::from_secs(20),
+    );
+    assert_eq!(ran.status.code(), Some(1), "{}", text(&ran.stderr));
+    let stderr = text(&ran.stderr);
+    assert!(stderr.contains("did not accept the session"), "{stderr}");
+    assert!(
+        stderr.contains("the agent may predate exec"),
+        "no hint to upgrade the agent: {stderr}"
+    );
+}
+
 #[test]
 fn relay_urls_with_credentials_are_refused() {
     let root = TempRoot::new();
