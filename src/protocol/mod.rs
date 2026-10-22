@@ -6,6 +6,15 @@ pub const SESSION_ERROR_PREFIX: &str = "revtty-error:";
 /// The session error a relay sends when the agent did not take the session in time, which is
 /// also what an agent that predates `ExecOffer` leads to.
 pub const SESSION_NOT_ACCEPTED: &str = "agent did not accept the session before timeout";
+/// The session error a relay sends when the agent accepted the session and its data tunnel
+/// did not arrive in time.
+pub const SESSION_TUNNEL_TIMED_OUT: &str =
+    "agent accepted the session but its data tunnel timed out";
+/// The session error a relay sends when the agent refused the offer's protocol version.
+pub const SESSION_INCOMPATIBLE: &str = "agent rejected an incompatible protocol version";
+/// The body of the relay's 404 to a session request for an agent without a control
+/// connection.
+pub const AGENT_OFFLINE: &str = "agent is offline";
 /// The one command a probe session runs over SSH: the agent answers it with a `ProbeResult`
 /// in JSON and exit status 0.
 pub const PROBE_COMMAND: &str = "revtty-probe";

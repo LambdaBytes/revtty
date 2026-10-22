@@ -24,7 +24,10 @@ async fn main() -> ExitCode {
     match app::run(args).await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            eprintln!("error: {error}");
+            match error.kind().label() {
+                Some(kind) => eprintln!("error ({kind}): {error}"),
+                None => eprintln!("error: {error}"),
+            }
             ExitCode::FAILURE
         }
     }

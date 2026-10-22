@@ -2026,6 +2026,68 @@ fn service_logs_keep_credentials_and_session_data_out_even_at_trace_level() {
     }
 }
 
+/// Runs `revtty` as `role` and returns its exit status and the last line it wrote to stderr.
+fn failure(role: &Role, args: &[&str]) -> (Option<i32>, String) {
+    let output = role
+        .command()
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run revtty");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let last = stderr.lines().last().unwrap_or_default().to_owned();
+    (output.status.code(), last)
+}
+
+#[test]
+fn errors_name_their_kind_and_keep_their_exit_status() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    enroll_agent(&root, &relay_role, &operator, &agent, &url);
+
+    // A key of its own, which the agent does not list: its signature is good.
+    let stranger = Role::new(&root, "stranger");
+    stranger.run(&["init"]);
+    let (status, line) = failure(&stranger, &["status", AGENT_NAME, "--relay", &url]);
+    assert_eq!(status, Some(1), "{line}");
+    assert!(
+        line.starts_with(&format!(
+            "error (authorization): this operator key is not authorized for {AGENT_NAME}"
+        )),
+        "{line}"
+    );
+    // The same for a name nobody enrolled.
+    let (status, unknown) = failure(&stranger, &["status", "nobody", "--relay", &url]);
+    assert_eq!(status, Some(1), "{unknown}");
+    assert_eq!(
+        unknown,
+        line.replace(AGENT_NAME, "nobody"),
+        "an unknown name is answered as a forbidden one"
+    );
+
+    let (status, line) = failure(
+        &operator,
+        &[
+            "status",
+            AGENT_NAME,
+            "--relay",
+            &url,
+            "--host-key",
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ],
+    );
+    assert_eq!(status, Some(1), "{line}");
+    assert!(line.starts_with("error (host key): "), "{line}");
+
+    let (status, line) = failure(
+        &operator,
+        &["status", AGENT_NAME, "--relay", "https://revtty.invalid"],
+    );
+    assert_eq!(status, Some(1), "{line}");
+    assert!(line.starts_with("error (DNS): "), "{line}");
+}
+
 #[test]
 fn exec_on_an_agent_that_predates_it_says_so() {
     let root = TempRoot::new();
@@ -2356,7 +2418,7 @@ fn operators_are_managed_from_a_session_and_revocation_closes_it() {
     relay.wait_for_log("operators updated to revision 3", Duration::from_secs(10));
     let refused = second.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
     assert!(
-        refused.contains("401"),
+        refused.contains("error (authorization)") && refused.contains("403"),
         "revoked operator still authenticated:\n{refused}"
     );
 
@@ -2452,7 +2514,7 @@ fn an_operator_key_is_rotated_with_exec() {
         Duration::from_secs(20),
     );
     assert!(
-        !refused.status.success() && text(&refused.stderr).contains("401"),
+        !refused.status.success() && text(&refused.stderr).contains("error (authorization)"),
         "the revoked key still runs commands:\n{}",
         text(&refused.stderr)
     );
@@ -2536,7 +2598,7 @@ fn reinstalled_agent_is_reenrolled_in_place_and_then_removed() {
     );
     let log = old_agent.wait_for_log_count("control connection lost", 2, Duration::from_secs(20));
     assert!(
-        log.contains("websocket upgrade failed"),
+        log.contains("the relay refused the WebSocket upgrade (401 Unauthorized)"),
         "old agent reconnected:\n{log}"
     );
     drop(old_agent);
@@ -2576,7 +2638,10 @@ fn reinstalled_agent_is_reenrolled_in_place_and_then_removed() {
         Duration::from_secs(10),
     );
     let gone = operator.run_failing(&["probe", AGENT_NAME, "--relay", &url]);
-    assert!(gone.contains("401"), "{gone}");
+    assert!(
+        gone.contains("error (authorization)") && gone.contains("403"),
+        "{gone}"
+    );
     drop(new_agent);
 }
 

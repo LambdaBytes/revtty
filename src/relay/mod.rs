@@ -24,10 +24,12 @@ use uuid::Uuid;
 
 use crate::error::RevttyError;
 use crate::protocol::{
-    AgentListResponse, AgentRotateRequest, AgentStatusResponse, CONTROL_PROTOCOL_VERSION,
-    ControlMessage, EnrollRequest, EnrollResponse, OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest,
-    OperatorAuthResponse, OperatorChallengeResponse, OperatorListRequest, SESSION_ERROR_PREFIX,
-    SESSION_NOT_ACCEPTED, SessionRejectReason, operator_auth_message, operator_list_auth_message,
+    AGENT_OFFLINE, AgentListResponse, AgentRotateRequest, AgentStatusResponse,
+    CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse,
+    OPERATOR_AUTH_NAMESPACE, OperatorAuthRequest, OperatorAuthResponse, OperatorChallengeResponse,
+    OperatorListRequest, SESSION_ERROR_PREFIX, SESSION_INCOMPATIBLE, SESSION_NOT_ACCEPTED,
+    SESSION_TUNNEL_TIMED_OUT, SessionRejectReason, operator_auth_message,
+    operator_list_auth_message,
 };
 use crate::storage::{OperatorsReportOutcome, ReportedOperator, RotationConfirmation, Store};
 use crate::token::{SecretToken, hash_token};
@@ -887,35 +889,35 @@ async fn operator_auth(
         Ok(signature) => signature,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    // The signature names its key; it counts only if that key is one of the agent's
-    // operators, and only once it verifies.
+    // The signature names its key, and counts once it verifies with that key: 401 until
+    // then, whatever the name.
     let operator_key = PublicKey::from(signature.public_key().clone());
     if operator_key.algorithm() != Algorithm::Ed25519 {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let operator_fingerprint = operator_key.fingerprint(HashAlg::Sha256).to_string();
-
-    let agent = match state.store.get_agent(&name).await {
-        Ok(Some(agent)) => agent,
-        // Same answer as a bad signature: agent names stay private.
-        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(error) => {
-            tracing::error!("operator auth lookup failed: {error}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    if !agent.operators.contains(&operator_fingerprint) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
     let message = operator_auth_message(&name, &request.challenge);
-
     if operator_key
         .verify(OPERATOR_AUTH_NAMESPACE, message.as_bytes(), &signature)
         .is_err()
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let operator_fingerprint = operator_key.fingerprint(HashAlg::Sha256).to_string();
+
+    // Anyone can make a key that signs, so the same 403 answers an unknown name and one this
+    // key may not use: agent names stay private.
+    let agent = match state
+        .store
+        .authorized_agent(&name, &operator_fingerprint)
+        .await
+    {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return StatusCode::FORBIDDEN.into_response(),
+        Err(error) => {
+            tracing::error!("operator auth lookup failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     if let Err(status) = spend_challenge(&state, &request.challenge, expires_at).await {
         return status.into_response();
@@ -1051,15 +1053,16 @@ async fn operator_status(
         return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
     }
 
-    let Some(session) = consume_operator_session(&state, &name, &headers).await else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let session = match consume_operator_session(&state, &name, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
     };
 
     let agent = match state.store.get_agent(&name).await {
         // Re-enrolled since the credential was checked: another instance, which this
         // operator may not be authorized for.
         Ok(Some(agent)) if agent.id != session.agent_id => {
-            return StatusCode::UNAUTHORIZED.into_response();
+            return StatusCode::FORBIDDEN.into_response();
         }
         Ok(Some(agent)) => agent,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -1128,8 +1131,9 @@ async fn persistent_operator_upgrade(
         return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
     }
 
-    let Some(session) = consume_operator_session(&state, &name, &headers).await else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let session = match consume_operator_session(&state, &name, &headers).await {
+        Ok(session) => session,
+        Err(status) => return status.into_response(),
     };
 
     let control = {
@@ -1141,7 +1145,7 @@ async fn persistent_operator_upgrade(
     };
 
     let Some(control) = control else {
-        return (StatusCode::NOT_FOUND, "agent is offline").into_response();
+        return (StatusCode::NOT_FOUND, AGENT_OFFLINE).into_response();
     };
 
     ws.max_message_size(MAX_MESSAGE_SIZE)
@@ -1161,21 +1165,24 @@ async fn persistent_operator_upgrade(
 }
 
 /// Spends the operator credential in `headers`, which is valid once and only for `agent_name`,
-/// and only while the operator is still one of that agent instance's operators.
+/// and only while the operator is still one of that agent instance's operators: 401 without a
+/// valid one; 403 when its operator may no longer use that agent instance, revoked since, or
+/// the agent removed or enrolled again, which takes its operators with it.
 async fn consume_operator_session(
     state: &RelayState,
     agent_name: &str,
     headers: &HeaderMap,
-) -> Option<OperatorSession> {
-    let token = bearer_token(headers)?;
+) -> Result<OperatorSession, StatusCode> {
+    let token = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
 
     let session = {
         let mut sessions = state.operator_sessions.lock().await;
         sessions.remove(&hash_token(token))
-    }?;
+    }
+    .ok_or(StatusCode::UNAUTHORIZED)?;
 
     if session.agent_name != agent_name || session.expires_at <= Instant::now() {
-        return None;
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     match state
@@ -1183,11 +1190,11 @@ async fn consume_operator_session(
         .operator_authorized(&session.agent_id, &session.operator_fingerprint)
         .await
     {
-        Ok(true) => Some(session),
-        Ok(false) => None,
+        Ok(true) => Ok(session),
+        Ok(false) => Err(StatusCode::FORBIDDEN),
         Err(error) => {
             tracing::error!("operator session check failed: {error}");
-            None
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -1838,9 +1845,7 @@ async fn run_operator_session(
             );
             let detail = match reason {
                 SessionRejectReason::Busy => "agent is busy",
-                SessionRejectReason::IncompatibleVersion => {
-                    "agent rejected an incompatible protocol version"
-                }
+                SessionRejectReason::IncompatibleVersion => SESSION_INCOMPATIBLE,
                 SessionRejectReason::InternalError => "agent could not start the session",
             };
             send_operator_session_error(&mut operator_socket, detail).await;
@@ -1875,11 +1880,7 @@ async fn run_operator_session(
             state.pending.lock().await.remove(&session_id);
             state.audit.ended(&session_id, "tunnel_timeout");
             send_session_cancel(&control, &session_id).await;
-            send_operator_session_error(
-                &mut operator_socket,
-                "agent accepted the session but its data tunnel timed out",
-            )
-            .await;
+            send_operator_session_error(&mut operator_socket, SESSION_TUNNEL_TIMED_OUT).await;
             tracing::warn!(
                 "{} data tunnel timed out for {agent_name}: {session_id}",
                 kind.label()
@@ -3633,12 +3634,124 @@ mod tests {
         let http = reqwest::Client::new();
         let stranger = ed25519_key();
 
+        // A valid signature by a key the agent does not list, and one that does not verify:
+        // the same answer for a name that exists and one that does not.
+        let mut answers = Vec::new();
         for name in ["real-agent", "no-such-agent"] {
             let challenge =
                 fetch_challenge(&http, format!("{base}/v1/operator/challenge/{name}")).await;
             let auth = post_auth(&http, &base, name, &stranger, &challenge).await;
-            assert_eq!(auth.status(), reqwest::StatusCode::UNAUTHORIZED, "{name}");
+            let status = auth.status();
+            answers.push((status, auth.text().await.expect("auth answer")));
+
+            let challenge =
+                fetch_challenge(&http, format!("{base}/v1/operator/challenge/{name}")).await;
+            let forged = http
+                .post(format!("{base}/v1/operator/auth/{name}"))
+                .json(&OperatorAuthRequest {
+                    challenge,
+                    signature: sign(&stranger, "not the challenge"),
+                })
+                .send()
+                .await
+                .expect("authenticate with a signature over something else");
+            assert_eq!(forged.status(), reqwest::StatusCode::UNAUTHORIZED, "{name}");
         }
+        assert_eq!(answers[0], answers[1]);
+        assert_eq!(answers[0].0, reqwest::StatusCode::FORBIDDEN);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn refused_operators_spend_no_challenge() {
+        // The spent challenges are shared by every operator and bounded: a key of one's own
+        // that signs correctly must not be able to fill them and lock operators out.
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let operator = ed25519_key();
+        enroll(
+            &store,
+            "guarded",
+            &operator.public_key().to_openssh().expect("operator key"),
+        )
+        .await;
+        let (state, base, server) = http_relay(store).await;
+        let http = reqwest::Client::new();
+        let stranger = ed25519_key();
+
+        for name in ["guarded", "no-such-agent"] {
+            for _ in 0..3 {
+                let refused = auth_status(&http, &base, name, &stranger).await;
+                assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN, "{name}");
+            }
+        }
+        assert!(state.spent_challenges.lock().await.is_empty());
+
+        let accepted = auth_status(&http, &base, "guarded", &operator).await;
+        assert_eq!(accepted.status(), reqwest::StatusCode::CREATED);
+        assert_eq!(state.spent_challenges.lock().await.len(), 1);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_session_of_an_agent_removed_before_its_use_is_forbidden() {
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let operator = ed25519_key();
+        enroll(
+            &store,
+            "short-lived",
+            &operator.public_key().to_openssh().expect("operator key"),
+        )
+        .await;
+        let (_state, base, server) = http_relay(store.clone()).await;
+        let http = reqwest::Client::new();
+        let issued = auth_status(&http, &base, "short-lived", &operator).await;
+        assert_eq!(issued.status(), reqwest::StatusCode::CREATED);
+        let issued: OperatorAuthResponse = issued.json().await.expect("decode auth response");
+
+        store
+            .remove_agent("short-lived")
+            .await
+            .expect("remove agent")
+            .expect("agent was enrolled");
+        let status = http
+            .get(format!("{base}/v1/status/short-lived"))
+            .bearer_auth(&issued.session_token)
+            .send()
+            .await
+            .expect("use the credential");
+        assert_eq!(status.status(), reqwest::StatusCode::FORBIDDEN);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn store_failures_in_operator_checks_are_errors_not_refusals() {
+        let store = Store::open_in_memory().await.expect("open relay store");
+        let operator = ed25519_key();
+        enroll(
+            &store,
+            "fragile",
+            &operator.public_key().to_openssh().expect("operator key"),
+        )
+        .await;
+        let (_state, base, server) = http_relay(store.clone()).await;
+        let http = reqwest::Client::new();
+        let issued = auth_status(&http, &base, "fragile", &operator).await;
+        assert_eq!(issued.status(), reqwest::StatusCode::CREATED);
+        let issued: OperatorAuthResponse = issued.json().await.expect("decode auth response");
+
+        store.lose_operator_lists().await;
+        let status = http
+            .get(format!("{base}/v1/status/fragile"))
+            .bearer_auth(&issued.session_token)
+            .send()
+            .await
+            .expect("use the credential");
+        assert_eq!(status.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        let auth = auth_status(&http, &base, "fragile", &operator).await;
+        assert_eq!(auth.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
 
         server.abort();
     }
@@ -3941,7 +4054,7 @@ mod tests {
         // Until the agent says otherwise, only the enrolled operator is accepted.
         assert_eq!(
             auth_status(&http, &base, NAME, &second).await.status(),
-            reqwest::StatusCode::UNAUTHORIZED
+            reqwest::StatusCode::FORBIDDEN
         );
         assert!(listed_names(&http, &base, &second).await.is_empty());
 
@@ -3978,10 +4091,10 @@ mod tests {
             .send()
             .await
             .expect("use revoked operator credential");
-        assert_eq!(status.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(status.status(), reqwest::StatusCode::FORBIDDEN);
         assert_eq!(
             auth_status(&http, &base, NAME, &second).await.status(),
-            reqwest::StatusCode::UNAUTHORIZED
+            reqwest::StatusCode::FORBIDDEN
         );
         assert!(listed_names(&http, &base, &second).await.is_empty());
 

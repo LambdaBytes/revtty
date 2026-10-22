@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::error::RevttyError;
+use crate::error::{ErrorKind, RevttyError};
 use crate::protocol::{PROBE_COMMAND, ProbeResult};
 use crate::transport::{SSH_TIMEOUTS, SshTimeouts, finish_byte_stream, websocket_byte_stream};
 
@@ -179,7 +179,14 @@ where
             },
         )
         .await
-        .map_err(|error| RevttyError::runtime("establish SSH transport", error))?;
+        .map_err(|error| match error {
+            // The key the agent proved in the key exchange is not the one pinned for it.
+            russh::Error::UnknownKey => RevttyError::new(
+                ErrorKind::HostKey,
+                format!("establish SSH transport: {error}"),
+            ),
+            error => RevttyError::runtime("establish SSH transport", error),
+        })?;
 
         let auth = session
             .authenticate_publickey(
@@ -190,15 +197,19 @@ where
             .map_err(|error| RevttyError::runtime("authenticate SSH operator key", error))?;
 
         if !auth.success() {
-            return Err(RevttyError::message("SSH public-key authentication failed"));
+            // The agent checks the key against its own operator list.
+            return Err(RevttyError::new(
+                ErrorKind::Authorization,
+                "SSH public-key authentication failed",
+            ));
         }
 
         Ok(session)
     };
 
-    tokio::time::timeout(within, handshake)
-        .await
-        .map_err(|_| RevttyError::message("SSH handshake with the agent timed out"))?
+    tokio::time::timeout(within, handshake).await.map_err(|_| {
+        RevttyError::new(ErrorKind::Timeout, "SSH handshake with the agent timed out")
+    })?
 }
 
 /// The operator's private key and the pinned agent host key a session authenticates with.
@@ -212,7 +223,8 @@ fn session_keys(
         .map_err(|error| RevttyError::runtime("parse pinned agent host key", error))?;
 
     if expected_server_key.algorithm() != Algorithm::Ed25519 {
-        return Err(RevttyError::message(
+        return Err(RevttyError::new(
+            ErrorKind::HostKey,
             "v1 requires an Ed25519 agent host key",
         ));
     }
@@ -258,10 +270,13 @@ pub async fn run_probe(
         let answer = tokio::time::timeout(PROBE_ANSWER_TIMEOUT, probe_answer(&session, target))
             .await
             .unwrap_or_else(|_| {
-                Err(RevttyError::message(format!(
-                    "the agent did not answer the probe within {}s",
-                    PROBE_ANSWER_TIMEOUT.as_secs()
-                )))
+                Err(RevttyError::new(
+                    ErrorKind::Timeout,
+                    format!(
+                        "the agent did not answer the probe within {}s",
+                        PROBE_ANSWER_TIMEOUT.as_secs()
+                    ),
+                ))
             });
         // Hanging up ends the agent's session and gives its slot back.
         let _ = session
@@ -734,7 +749,7 @@ mod tests {
         CAPTURE_LIMIT, Captured, ClientHandler, client_config, ed25519_only, open_session,
         open_terminal_channel, probe_answer,
     };
-    use crate::error::RevttyError;
+    use crate::error::{ErrorKind, RevttyError};
     use crate::protocol::ProbeResult;
     use crate::transport::test_support::{ControlledStream, StreamControl};
     use crate::transport::{SSH_TIMEOUTS, SshTimeouts};
@@ -1068,6 +1083,7 @@ mod tests {
         let Err(refused) = probe_through(ed25519_key(), pinned_key.clone(), "demo").await else {
             panic!("a server without the pinned key answered the probe");
         };
+        assert_eq!(refused.kind(), ErrorKind::HostKey, "{refused}");
         assert!(refused.to_string().contains("SSH transport"), "{refused}");
 
         // Nor does the pinned key's answer count for another target.

@@ -247,6 +247,22 @@ pub enum OperatorsReportOutcome {
     NotCurrent,
 }
 
+/// The agent `?2` among those operator `?1` may use. Its work must not tell whether a name
+/// exists: it walks the operator's own memberships (`CROSS JOIN` keeps that order), reaches
+/// each of those agents by its id and compares the name last (the unary `+` keeps the name's
+/// index out). An unknown name and one the operator may not use then cost the same.
+const AUTHORIZED_AGENT: &str = "SELECT a.id, a.host_key, a.host_key_proof
+     FROM agent_operators o CROSS JOIN agents a ON a.id = o.agent_id
+     WHERE o.fingerprint = ?1 AND +a.name = ?2";
+
+/// The agent instance an operator was authorized for, with the keys handed to that operator.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuthorizedAgent {
+    pub id: String,
+    pub host_key: String,
+    pub host_key_proof: Option<String>,
+}
+
 const AGENT_COLUMNS: &str = "SELECT a.id, a.name, a.host_key, a.created_at, a.last_seen, a.version,
             COALESCE(group_concat(o.fingerprint, ','), ''), a.host_key_proof
      FROM agents a
@@ -320,6 +336,18 @@ impl Store {
                 Ok::<_, StoreError>(())
             })
             .await;
+    }
+
+    /// Every lookup of an agent's operators fails from now on.
+    #[cfg(test)]
+    pub(crate) async fn lose_operator_lists(&self) {
+        self.conn
+            .call(|conn| {
+                conn.execute_batch("DROP TABLE agent_operators")?;
+                Ok::<_, StoreError>(())
+            })
+            .await
+            .expect("drop the operator lists");
     }
 
     /// Every write fails from now on, as on a database that has gone read-only.
@@ -716,6 +744,33 @@ impl Store {
             .map_err(|error| RevttyError::runtime("look up enrolled agents", error))
     }
 
+    /// The agent named `agent_name`, if operator `fingerprint` is among its operators, read in
+    /// one statement so that the keys handed out are those of the instance authorized.
+    pub async fn authorized_agent(
+        &self,
+        agent_name: &str,
+        fingerprint: &str,
+    ) -> Result<Option<AuthorizedAgent>, RevttyError> {
+        let name = agent_name.to_owned();
+        let fingerprint = fingerprint.to_owned();
+
+        self.conn
+            .call(move |conn| {
+                conn.prepare_cached(AUTHORIZED_AGENT)?
+                    .query_row(params![fingerprint, name], |row| {
+                        Ok(AuthorizedAgent {
+                            id: row.get(0)?,
+                            host_key: row.get(1)?,
+                            host_key_proof: row.get(2)?,
+                        })
+                    })
+                    .optional()
+                    .map_err(StoreError::from)
+            })
+            .await
+            .map_err(|error| RevttyError::runtime("check operator authorization", error))
+    }
+
     /// Whether agent `agent_id` still exists and lists the operator `fingerprint`.
     pub async fn operator_authorized(
         &self,
@@ -1080,11 +1135,14 @@ pub fn unix_now() -> Result<i64, RevttyError> {
 mod tests {
     use std::time::Duration;
 
-    use tokio_rusqlite::rusqlite::{Connection as SqliteConnection, params};
+    use tokio_rusqlite::rusqlite::{
+        Connection as SqliteConnection, OptionalExtension, StatementStatus, params,
+    };
 
     use super::{
-        OperatorsReportOutcome, ReportedOperator, RotationConfirmation, SCHEMA_V1, SCHEMA_V2,
-        SCHEMA_V3, Store, migrations, operator_fingerprint,
+        AUTHORIZED_AGENT, AgentCredential, AuthorizedAgent, OperatorsReportOutcome,
+        ReportedOperator, RotationConfirmation, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, Store, StoreError,
+        migrations, operator_fingerprint,
     };
     use crate::token::SecretToken;
 
@@ -1092,6 +1150,103 @@ mod tests {
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB operator";
     const HOST_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC host";
+
+    async fn enroll(store: &Store, name: &str, operator_key: &str) -> AgentCredential {
+        let enrollment = store
+            .create_enrollment(name, operator_key, Duration::from_secs(60))
+            .await
+            .expect("create enrollment");
+        store
+            .consume_enrollment(enrollment.token.expose(), HOST_KEY, None, None)
+            .await
+            .expect("consume enrollment")
+    }
+
+    #[tokio::test]
+    async fn authorization_costs_the_same_for_an_unknown_name_and_a_forbidden_one() {
+        // A key that operates other agents, and an agent operated by another key only.
+        let other_key = OPERATOR_KEY.replace('B', "F");
+        let store = Store::open_in_memory().await.expect("open store");
+        for index in 0..16 {
+            enroll(&store, &format!("store-{index:03}"), OPERATOR_KEY).await;
+        }
+        enroll(&store, "elsewhere", &other_key).await;
+        let fingerprint = operator_fingerprint(OPERATOR_KEY).expect("fingerprint");
+
+        let mut runs = Vec::new();
+        for name in ["elsewhere", "no-such-agent", "store-007"] {
+            let fingerprint = fingerprint.clone();
+            let run = store
+                .conn
+                .call(move |conn| {
+                    let mut statement = conn.prepare_cached(AUTHORIZED_AGENT)?;
+                    statement.reset_status(StatementStatus::VmStep);
+                    let found = statement
+                        .query_row(params![fingerprint, name], |_| Ok(()))
+                        .optional()?;
+                    Ok::<_, StoreError>((
+                        found.is_some(),
+                        statement.get_status(StatementStatus::VmStep),
+                    ))
+                })
+                .await
+                .expect("run the authorization statement");
+            runs.push(run);
+        }
+
+        assert_eq!(runs[0], (false, runs[1].1), "{runs:?}");
+        assert!(!runs[1].0, "{runs:?}");
+        assert!(runs[2].0, "{runs:?}");
+    }
+
+    #[tokio::test]
+    async fn authorization_names_the_instance_its_operator_may_use() {
+        let replacement_key = OPERATOR_KEY.replace('B', "E");
+        let replacement_host = HOST_KEY.replace('C', "D");
+        let store = Store::open_in_memory().await.expect("open store");
+        let original = enroll(&store, "store-042", OPERATOR_KEY).await;
+        let first = operator_fingerprint(OPERATOR_KEY).expect("first fingerprint");
+        let second = operator_fingerprint(&replacement_key).expect("second fingerprint");
+        assert_eq!(
+            store
+                .authorized_agent("store-042", &first)
+                .await
+                .expect("authorize"),
+            Some(AuthorizedAgent {
+                id: original.id.clone(),
+                host_key: HOST_KEY.to_owned(),
+                host_key_proof: None,
+            })
+        );
+
+        let replacement = store
+            .create_replacement_enrollment("store-042", &replacement_key, Duration::from_secs(60))
+            .await
+            .expect("create replacement");
+        let replaced = store
+            .consume_enrollment(replacement.token.expose(), &replacement_host, None, None)
+            .await
+            .expect("consume replacement");
+
+        assert_eq!(
+            store
+                .authorized_agent("store-042", &first)
+                .await
+                .expect("authorize"),
+            None
+        );
+        assert_eq!(
+            store
+                .authorized_agent("store-042", &second)
+                .await
+                .expect("authorize"),
+            Some(AuthorizedAgent {
+                id: replaced.id,
+                host_key: replacement_host,
+                host_key_proof: None,
+            })
+        );
+    }
 
     #[test]
     fn migrations_validate() {

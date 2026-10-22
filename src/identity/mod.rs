@@ -12,7 +12,7 @@ use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, HashAlg, KnownHosts, LineEnding, PrivateKey, PublicKey};
 
 use crate::config::Paths;
-use crate::error::RevttyError;
+use crate::error::{ErrorKind, RevttyError};
 use crate::pairing::PairingSecret;
 
 const OPERATOR_KEY_FILE: &str = "id_ed25519";
@@ -214,11 +214,14 @@ pub fn trust_agent_host_key(
     if !proven {
         return Err(match state {
             PinState::Mismatch(pinned) => host_key_mismatch(relay, agent_name, &pinned, true),
-            _ => RevttyError::message(format!(
-                "the relay did not prove the host key of {agent_name} with the pairing code made \
+            _ => RevttyError::new(
+                ErrorKind::HostKey,
+                format!(
+                    "the relay did not prove the host key of {agent_name} with the pairing code made \
                  for it; nothing was pinned. If the relay predates pairing codes, pass --host-key \
                  with the fingerprint `revtty agent status` shows on the target"
-            )),
+                ),
+            ),
         });
     }
 
@@ -369,9 +372,10 @@ fn pin_state(
         .iter()
         .any(|entry| entry_matches_alias(entry, alias) && entry.marker().is_some())
     {
-        return Err(RevttyError::message(format!(
-            "host key for {agent_name} is marked revoked"
-        )));
+        return Err(RevttyError::new(
+            ErrorKind::HostKey,
+            format!("host key for {agent_name} is marked revoked"),
+        ));
     }
 
     for entry in entries {
@@ -391,17 +395,20 @@ fn pin_state(
 /// The key received is not shown: its fingerprint is the relay's word, and an operator
 /// recovering from a reinstall must take the new one from the machine.
 fn host_key_mismatch(relay: &str, agent_name: &str, pinned: &str, paired: bool) -> RevttyError {
-    RevttyError::message(format!(
-        "HOST KEY MISMATCH for {agent_name}: the relay presented a key other than the pinned \
+    RevttyError::new(
+        ErrorKind::HostKey,
+        format!(
+            "HOST KEY MISMATCH for {agent_name}: the relay presented a key other than the pinned \
          {pinned}{}. If the machine was reinstalled and re-enrolled, run `revtty forget \
          {agent_name} --relay {relay}` and connect with the --host-key that `revtty agent \
          status` shows on it",
-        if paired {
-            ", and did not prove it with the pairing code pending for it"
-        } else {
-            ""
-        }
-    ))
+            if paired {
+                ", and did not prove it with the pairing code pending for it"
+            } else {
+                ""
+            }
+        ),
+    )
 }
 
 /// The `known_hosts` line pinning `public_key` for `alias`. Only the key material: the
@@ -554,7 +561,8 @@ fn parse_agent_host_key(encoded_key: &str) -> Result<PublicKey, RevttyError> {
         .map_err(|error| RevttyError::runtime("parse enrolled agent host key", error))?;
 
     if public_key.algorithm() != Algorithm::Ed25519 {
-        return Err(RevttyError::message(
+        return Err(RevttyError::new(
+            ErrorKind::HostKey,
             "v1 requires an Ed25519 agent host key",
         ));
     }

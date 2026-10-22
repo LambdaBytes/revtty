@@ -71,6 +71,8 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - WebSocket errors show their cause, such as the status of a refused upgrade or the TLS or connection failure, instead of only `websocket upgrade failed`, `reqwest error` or `tungstenite error`.
 - Operator and agent commands refuse a plain `http://` or `ws://` relay URL unless its host is `localhost`, `127.0.0.0/8` or `[::1]`, and do not follow a relay's redirect to one, since enrollment, control and session credentials would cross the network unencrypted. An agent enrolled with such a URL stops at `agent run`; change `relay` in its `agent.toml` to the `https://` URL.
 - `agent run` and `relay serve` log through `tracing`: each line starts with its UTC time, its level and the module, and keeps the message it had. `RUST_LOG` selects what is logged, `info` by default, as a list of levels and `module=level` pairs such as `warn,revtty=debug`; any other value stops the service at start. Requests the relay refuses are never logged, since their text can hold a credential.
+- Errors name their kind when revtty knows it, as in `error (DNS): …`: DNS, TLS, connection, timeout, authentication, authorization, host key, offline, protocol or I/O. Exit statuses do not change. A refused WebSocket upgrade, such as that of a session to an offline agent, shows what the relay answered.
+- The relay answers 403 instead of 401 to an operator whose signature verifies, for a target that is not enrolled and for one that does not list its key alike, and to a session credential whose operator was revoked, or whose agent was removed or re-enrolled, since it was issued. A database failure while such a credential is checked answers 500 instead of 401.
 
 ### Removed
 

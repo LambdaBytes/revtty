@@ -131,10 +131,16 @@ The flow is:
 2. sign the canonical `revtty-control-v1` message with the operator Ed25519 key;
 3. submit the SSHSIG;
 4. receive a short-lived opaque operator session credential plus the enrolled agent host key; the relay takes the key from the signature and accepts it only if it is one of the agent's reported operators;
-5. consume that credential once when opening `/v1/probe/{name}`, `/v1/connect/{name}` or `/v1/exec/{name}`; it is refused if the operator was revoked, or the agent re-enrolled, in between (a relay that predates exec answers `/v1/exec/{name}` with a 404 and an empty body);
+5. consume that credential once when opening `/v1/probe/{name}`, `/v1/connect/{name}` or `/v1/exec/{name}`; it is refused if the operator was revoked, or the agent removed or re-enrolled, in between (a relay that predates exec answers `/v1/exec/{name}` with a 404 and an empty body);
 6. the relay generates a separate one-time agent `tunnel_token` and sends the corresponding offer over the agent control channel.
 
 The operator and agent rendezvous credentials are therefore distinct.
+
+Refusals:
+
+- `POST /v1/operator/auth/{name}` answers 401 when the challenge is not valid for that name or has expired, or the signature does not verify with the key it names. Once it verifies, the identity is proven: 403, with an empty body, for a name that is not enrolled and for one whose agent does not list that key, so that a key of one's own tells nothing about which names exist. Only an authorized request uses its challenge up, so that keys that may not use the relay cannot fill its bounded set of spent challenges: an authorized request with a challenge already used gets 401, and 429 while that set is full.
+- The endpoints that consume an operator session credential answer 401 without a valid one (missing, unknown, expired, or for another name) and 403 when its operator may no longer use that agent instance.
+- A relay that predates 403 answers 401 in each of these cases: the operator client reads 401 as an authentication failure that may also be one of them.
 
 `revtty status <name>` reuses this target-scoped authentication flow and consumes the resulting operator session credential once on `GET /v1/status/{name}`. It returns persisted identity/presence metadata plus the relay's current online/offline view without opening a data tunnel.
 

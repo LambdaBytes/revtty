@@ -9,7 +9,7 @@ use ssh_key::{HashAlg, LineEnding, PrivateKey};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::config::Paths;
-use crate::error::{RevttyError, with_sources};
+use crate::error::{ErrorKind, RevttyError};
 use crate::identity::HostKeyTrust;
 use crate::pairing::{PairingCode, PairingSecret};
 use crate::protocol::{
@@ -19,7 +19,7 @@ use crate::protocol::{
 };
 use crate::transport::{
     RefusedUpgrade, check_relay_health, connect_websocket, connect_websocket_or_refusal, http_url,
-    relay_client, valid_name,
+    refusal_kind, relay_client, valid_name,
 };
 
 pub fn init() -> Result<(), RevttyError> {
@@ -120,9 +120,10 @@ pub async fn list(relay: &str, json: bool) -> Result<(), RevttyError> {
 
     let status = response.status();
     if !status.is_success() {
-        return Err(RevttyError::message(format!(
-            "operator list rejected ({status})"
-        )));
+        return Err(RevttyError::new(
+            refusal_kind(status, ""),
+            format!("operator list rejected ({status})"),
+        ));
     }
 
     let response: AgentListResponse = response
@@ -170,19 +171,22 @@ pub async fn status(
         .bearer_auth(&operator.auth.session_token)
         .send()
         .await
-        .map_err(|error| RevttyError::runtime("request agent status", with_sources(&error)))?;
+        .map_err(|error| RevttyError::request("request agent status", &error))?;
 
     let response_status = response.status();
     if !response_status.is_success() {
         let detail = response.text().await.unwrap_or_default();
-        return Err(RevttyError::message(format!(
-            "agent status rejected ({response_status}){}",
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        )));
+        return Err(RevttyError::new(
+            refusal_kind(response_status, &detail),
+            format!(
+                "agent status rejected ({response_status}){}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            ),
+        ));
     }
 
     let status: AgentStatusResponse = response
@@ -220,15 +224,18 @@ async fn request_agent_list(
     relay: &str,
 ) -> Result<reqwest::Response, RevttyError> {
     let challenge_url = http_url(relay, "/v1/operator/list/challenge")?;
-    let challenge_response = client.post(challenge_url).send().await.map_err(|error| {
-        RevttyError::runtime("request operator list challenge", with_sources(&error))
-    })?;
+    let challenge_response = client
+        .post(challenge_url)
+        .send()
+        .await
+        .map_err(|error| RevttyError::request("request operator list challenge", &error))?;
 
     let challenge_status = challenge_response.status();
     if !challenge_status.is_success() {
-        return Err(RevttyError::message(format!(
-            "operator list challenge rejected ({challenge_status})"
-        )));
+        return Err(RevttyError::new(
+            refusal_kind(challenge_status, ""),
+            format!("operator list challenge rejected ({challenge_status})"),
+        ));
     }
 
     let challenge: OperatorChallengeResponse = challenge_response
@@ -253,7 +260,7 @@ async fn request_agent_list(
         })
         .send()
         .await
-        .map_err(|error| RevttyError::runtime("request agent list", with_sources(&error)))
+        .map_err(|error| RevttyError::request("request agent list", &error))
 }
 
 fn session_capacity(status: &AgentStatusResponse) -> String {
@@ -296,10 +303,13 @@ async fn authenticate_operator(
         // Checked even against a pin: the operator obtained it independently, and it names
         // the key this connection must reach.
         if expected != check.fingerprint {
-            return Err(RevttyError::message(format!(
-                "the host key the relay presented for {target} does not match --host-key \
+            return Err(RevttyError::new(
+                ErrorKind::HostKey,
+                format!(
+                    "the host key the relay presented for {target} does not match --host-key \
                  {expected}; nothing was pinned"
-            )));
+                ),
+            ));
         }
         // No time passed since the credential was issued, so it is still for this key.
         crate::identity::pin_agent_host_key(&paths, relay, target, &auth.host_key)?;
@@ -330,10 +340,13 @@ async fn authenticate_operator(
                 let approved = auth.host_key.clone();
                 auth = request_operator_session(&client, &private_key, target, relay).await?;
                 if !crate::identity::same_agent_host_key(&approved, &auth.host_key)? {
-                    return Err(RevttyError::message(format!(
-                        "the relay presented another host key for {target} after it was \
+                    return Err(RevttyError::new(
+                        ErrorKind::HostKey,
+                        format!(
+                            "the relay presented another host key for {target} after it was \
                          confirmed; the session was not opened"
-                    )));
+                        ),
+                    ));
                 }
             }
         }
@@ -357,10 +370,13 @@ fn confirm_host_key(
     prompt: bool,
 ) -> Result<(), RevttyError> {
     if !prompt || !std::io::stdin().is_terminal() {
-        return Err(RevttyError::message(format!(
-            "host key of {target} is not pinned yet; pass --host-key with the fingerprint \
+        return Err(RevttyError::new(
+            ErrorKind::HostKey,
+            format!(
+                "host key of {target} is not pinned yet; pass --host-key with the fingerprint \
              `revtty agent status` shows on the target"
-        )));
+            ),
+        ));
     }
 
     eprint!(
@@ -376,7 +392,8 @@ fn confirm_host_key(
     if answer.trim() == fingerprint {
         Ok(())
     } else {
-        Err(RevttyError::message(
+        Err(RevttyError::new(
+            ErrorKind::HostKey,
             "the fingerprint entered does not match the host key the relay presented; nothing \
              was pinned",
         ))
@@ -390,15 +407,18 @@ async fn request_operator_session(
     relay: &str,
 ) -> Result<OperatorAuthResponse, RevttyError> {
     let challenge_url = http_url(relay, &format!("/v1/operator/challenge/{target}"))?;
-    let challenge_response = client.post(challenge_url).send().await.map_err(|error| {
-        RevttyError::runtime("request operator challenge", with_sources(&error))
-    })?;
+    let challenge_response = client
+        .post(challenge_url)
+        .send()
+        .await
+        .map_err(|error| RevttyError::request("request operator challenge", &error))?;
 
     let challenge_status = challenge_response.status();
     if !challenge_status.is_success() {
-        return Err(RevttyError::message(format!(
-            "operator challenge rejected ({challenge_status})"
-        )));
+        return Err(RevttyError::new(
+            refusal_kind(challenge_status, ""),
+            format!("operator challenge rejected ({challenge_status})"),
+        ));
     }
 
     let challenge: OperatorChallengeResponse = challenge_response
@@ -422,13 +442,11 @@ async fn request_operator_session(
         })
         .send()
         .await
-        .map_err(|error| RevttyError::runtime("authenticate operator", with_sources(&error)))?;
+        .map_err(|error| RevttyError::request("authenticate operator", &error))?;
 
     let auth_status = auth_response.status();
     if !auth_status.is_success() {
-        return Err(RevttyError::message(format!(
-            "operator authentication rejected ({auth_status})"
-        )));
+        return Err(operator_auth_refused(target, auth_status));
     }
 
     auth_response
@@ -567,7 +585,7 @@ pub async fn exec(
                 .await
                 .map_err(|error| {
                     if error.to_string() == SESSION_NOT_ACCEPTED {
-                        RevttyError::message(format!(
+                        error.reworded(format!(
                             "{SESSION_NOT_ACCEPTED}; the agent may predate exec (upgrade revtty \
                              on {target})"
                         ))
@@ -660,19 +678,45 @@ async fn report_without_waiting(message: String) {
 /// A relay that predates exec does not know its route, and answers as for any unknown path.
 fn exec_refused(refused: RefusedUpgrade) -> RevttyError {
     if refused.status == reqwest::StatusCode::NOT_FOUND && refused.body.is_empty() {
-        return RevttyError::message(
+        return RevttyError::new(
+            ErrorKind::Protocol,
             "the relay does not support exec; upgrade revtty on the relay",
         );
     }
-    RevttyError::message(format!(
-        "relay refused the command ({}){}",
-        refused.status,
-        if refused.body.is_empty() {
-            String::new()
-        } else {
-            format!(": {}", refused.body)
-        }
-    ))
+    RevttyError::new(
+        refusal_kind(refused.status, &refused.body),
+        format!(
+            "relay refused the command ({}){}",
+            refused.status,
+            if refused.body.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", refused.body)
+            }
+        ),
+    )
+}
+
+/// A relay that predates 403 answers 401 to a key it does not authorize for the target, and
+/// for a target that is not enrolled, as well as to a signature it does not accept.
+fn operator_auth_refused(target: &str, status: reqwest::StatusCode) -> RevttyError {
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED => RevttyError::new(
+            ErrorKind::Authentication,
+            format!("the relay refused the operator's authentication for {target} ({status})"),
+        ),
+        reqwest::StatusCode::FORBIDDEN => RevttyError::new(
+            ErrorKind::Authorization,
+            format!(
+                "this operator key is not authorized for {target} on this relay, or {target} is \
+                 not enrolled ({status})"
+            ),
+        ),
+        status => RevttyError::new(
+            refusal_kind(status, ""),
+            format!("operator authentication rejected ({status})"),
+        ),
+    }
 }
 
 pub async fn doctor(relay: &str) -> Result<(), RevttyError> {
@@ -703,10 +747,13 @@ pub async fn doctor(relay: &str) -> Result<(), RevttyError> {
         .map_err(|error| RevttyError::runtime("encode operator public key", error))?;
     let response = request_agent_list(&client, &private_key, &operator_key, relay).await?;
     if !response.status().is_success() {
-        return Err(RevttyError::message(format!(
-            "relay rejected the signed operator list ({})",
-            response.status()
-        )));
+        return Err(RevttyError::new(
+            refusal_kind(response.status(), ""),
+            format!(
+                "relay rejected the signed operator list ({})",
+                response.status()
+            ),
+        ));
     }
     let listed: AgentListResponse = response
         .json()
@@ -729,23 +776,43 @@ pub async fn doctor(relay: &str) -> Result<(), RevttyError> {
 
 #[cfg(test)]
 mod tests {
-    use super::exec_refused;
+    use super::{exec_refused, operator_auth_refused};
+    use crate::error::ErrorKind;
     use crate::transport::RefusedUpgrade;
+
+    #[test]
+    fn operator_auth_refusals_tell_a_refused_key_from_a_refused_signature() {
+        let unauthorized = operator_auth_refused("store-042", reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(unauthorized.kind(), ErrorKind::Authorization);
+        assert!(
+            unauthorized
+                .to_string()
+                .starts_with("this operator key is not authorized for store-042"),
+            "{unauthorized}"
+        );
+
+        // Also what a relay that predates 403 answers to a key it does not authorize.
+        let refused = operator_auth_refused("store-042", reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(refused.kind(), ErrorKind::Authentication);
+        assert!(refused.to_string().contains("401"), "{refused}");
+    }
 
     #[test]
     fn exec_refusals_tell_an_old_relay_from_an_offline_agent() {
         let old_relay = exec_refused(RefusedUpgrade {
             status: reqwest::StatusCode::NOT_FOUND,
             body: String::new(),
-        })
-        .to_string();
+        });
+        assert_eq!(old_relay.kind(), ErrorKind::Protocol);
+        let old_relay = old_relay.to_string();
         assert!(old_relay.contains("does not support exec"), "{old_relay}");
 
         let offline = exec_refused(RefusedUpgrade {
             status: reqwest::StatusCode::NOT_FOUND,
             body: "agent is offline".to_owned(),
-        })
-        .to_string();
+        });
+        assert_eq!(offline.kind(), ErrorKind::Offline);
+        let offline = offline.to_string();
         assert!(offline.ends_with(": agent is offline"), "{offline}");
         assert!(!offline.contains("does not support"), "{offline}");
     }

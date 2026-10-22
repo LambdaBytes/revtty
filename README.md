@@ -185,7 +185,7 @@ revtty exec store-042 --relay URL -- revtty agent operator add - < "$NEW/id_ed25
 REVTTY_CONFIG_DIR="$NEW" revtty probe store-042 --relay URL
 ```
 
-The agent applies the change within 2 seconds and then tells the relay, so a probe with the new key right after `add` may still be refused (401); try it again. Once every target answers the new key, move it into place, where the pins stay, and revoke the old key on every target:
+The agent applies the change within 2 seconds and then tells the relay, so a probe with the new key right after `add` may still be refused (403, or 401 from an older relay); try it again. Once every target answers the new key, move it into place, where the pins stay, and revoke the old key on every target:
 
 ```bash
 mv "$NEW/id_ed25519" "$NEW/id_ed25519.pub" "$OLD/"

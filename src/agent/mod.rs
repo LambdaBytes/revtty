@@ -24,7 +24,7 @@ use self::ssh::OperatorAllowlist;
 use crate::config::Paths;
 use crate::identity::ensure_agent;
 
-use crate::error::RevttyError;
+use crate::error::{ErrorKind, RevttyError};
 use crate::pairing::PairingCode;
 use crate::protocol::{
     AgentRotateRequest, CONTROL_PROTOCOL_VERSION, ControlMessage, EnrollRequest, EnrollResponse,
@@ -201,24 +201,22 @@ async fn enroll_with(
         .json(&request)
         .send()
         .await
-        .map_err(|error| {
-            RevttyError::runtime(
-                "send enrollment request",
-                crate::error::with_sources(&error),
-            )
-        })?;
+        .map_err(|error| RevttyError::request("send enrollment request", &error))?;
 
     let status = response.status();
     if !status.is_success() {
         let detail = response.text().await.unwrap_or_default();
-        return Err(RevttyError::message(format!(
-            "enrollment rejected ({status}){}",
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        )));
+        return Err(RevttyError::new(
+            crate::transport::refusal_kind(status, &detail),
+            format!(
+                "enrollment rejected ({status}){}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            ),
+        ));
     }
 
     let enrolled: EnrollResponse = response
@@ -328,7 +326,7 @@ pub async fn run() -> Result<(), RevttyError> {
                 finish_pending_rotation(&client, &paths)
                     .await
                     .map_err(|error| {
-                        RevttyError::message(format!(
+                        error.reworded(format!(
                             "finishing an interrupted credential rotation: {error}"
                         ))
                     })?;
@@ -968,7 +966,8 @@ async fn rotate_control_credential(
         CredentialAnswer::Accepted => {}
         CredentialAnswer::Unsupported => return Ok(Rotation::Unsupported),
         CredentialAnswer::Rejected => {
-            return Err(RevttyError::message(
+            return Err(RevttyError::new(
+                ErrorKind::Authentication,
                 "the relay rejected this agent's credential; re-enroll the agent",
             ));
         }
@@ -1006,7 +1005,8 @@ async fn rotate_control_credential(
             })?;
             return match begun {
                 CredentialAnswer::Unsupported => Ok(Rotation::Unsupported),
-                _ => Err(RevttyError::message(
+                _ => Err(RevttyError::new(
+                    ErrorKind::Authentication,
                     "the relay rejected this agent's credential; re-enroll the agent",
                 )),
             };
@@ -1025,7 +1025,7 @@ async fn rotate_control_credential(
 }
 
 fn unfinished_rotation(error: RevttyError) -> RevttyError {
-    RevttyError::message(format!(
+    error.reworded(format!(
         "{error}; the next `revtty agent run` or `revtty agent rotate-credential` finishes the \
          rotation"
     ))
@@ -1067,7 +1067,8 @@ async fn finish_pending_rotation(
         {
             CredentialAnswer::Accepted => PendingRotation::Abandoned { unsupported: false },
             _ => {
-                return Err(RevttyError::message(
+                return Err(RevttyError::new(
+                    ErrorKind::Authentication,
                     "the relay accepts neither this agent's credential nor the one it was \
                      rotating to; re-enroll the agent",
                 ));
@@ -1102,9 +1103,10 @@ async fn post_with_credential(
     if let Some(body) = body {
         request = request.json(body);
     }
-    let response = request.send().await.map_err(|error| {
-        RevttyError::runtime("reach the relay", crate::error::with_sources(&error))
-    })?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| RevttyError::request("reach the relay", &error))?;
 
     match response.status() {
         status if status.is_success() => Ok(CredentialAnswer::Accepted),
@@ -1226,13 +1228,12 @@ async fn check_agent_credential(
         .bearer_auth(&config.control_token)
         .send()
         .await
-        .map_err(|error| {
-            RevttyError::runtime("check agent credential", crate::error::with_sources(&error))
-        })?;
+        .map_err(|error| RevttyError::request("check agent credential", &error))?;
 
     match response.status() {
         status if status.is_success() => Ok(()),
-        reqwest::StatusCode::UNAUTHORIZED => Err(RevttyError::message(
+        reqwest::StatusCode::UNAUTHORIZED => Err(RevttyError::new(
+            ErrorKind::Authentication,
             "the relay rejected this agent's credential; re-enroll the agent",
         )),
         status => Err(RevttyError::message(format!(
@@ -1260,12 +1261,28 @@ mod tests {
         ReconnectBackoff, Rotation, SessionTask, SessionTasks, cancel_session,
         describe_undecodable, enroll_with, finish_pending_rotation, pty_test,
         reconnect_base_millis, reconnect_delay_millis, rotate_control_credential, run_control_once,
-        ssh, watch_operators,
+        ssh, unfinished_rotation, watch_operators,
     };
     use crate::config::Paths;
+    use crate::error::{ErrorKind, RevttyError};
     use crate::pairing::{PairingCode, PairingSecret};
     use crate::protocol::{CONTROL_PROTOCOL_VERSION, ControlMessage, SESSION_ERROR_PREFIX};
     use crate::token::SecretToken;
+
+    #[test]
+    fn an_unfinished_rotation_keeps_the_kind_of_its_failure() {
+        let failed = RevttyError::new(ErrorKind::Dns, "reach the relay: dns error");
+
+        let unfinished = unfinished_rotation(failed);
+
+        assert_eq!(unfinished.kind(), ErrorKind::Dns);
+        assert!(
+            unfinished
+                .to_string()
+                .starts_with("reach the relay: dns error; the next `revtty agent run`"),
+            "{unfinished}"
+        );
+    }
 
     const FAST_CONTROL_TIMEOUTS: ControlTimeouts = ControlTimeouts {
         heartbeat: Duration::from_millis(50),
