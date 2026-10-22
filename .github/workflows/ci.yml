@@ -81,6 +81,38 @@ jobs:
       - name: Release build
         run: cargo build --release
 
+  # The Linux checks on aarch64, the other Linux architecture v1 supports. Its first
+  # run, like any after a Cargo.lock or toolchain change, starts without a cache: its
+  # limit is the macOS jobs' one, which leaves room for that.
+  linux-arm:
+    timeout-minutes: 20
+    name: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --all-features
+
+      - name: Release build
+        run: cargo build --release
+
   # Without a cache, as after a Cargo.lock or toolchain change, this job took 597 s of
   # its former 600 s limit on macos-26-arm64 (5m36s of it the release build); with one,
   # 4 to 5 minutes. Its limit leaves room for a run without a cache.
