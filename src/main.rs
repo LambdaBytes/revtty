@@ -5,6 +5,7 @@ mod client;
 mod config;
 mod error;
 mod identity;
+mod logging;
 mod pairing;
 mod protocol;
 mod relay;

@@ -34,6 +34,10 @@ thiserror = "2"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rusqlite = { version = "0.8", features = ["bundled"] }
 toml = "1.1"
+tracing = "0.1"
+# Without its default `tracing-log`: no bridge from the `log` crate. Through it, tungstenite
+# would log whole WebSocket frames at trace level, session offers and their tokens included.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "fmt", "std"] }
 uuid = { version = "1", features = ["v4"] }
 
 [profile.release]

@@ -64,6 +64,7 @@ Design principles, scope and roadmap: [docs/BRIEF.md](docs/BRIEF.md), [docs/V1_S
 - A reinstalled machine is re-enrolled under its name with `relay enroll NAME --replace`, and an agent is retired with `relay remove NAME`. Within 5 seconds the relay closes the old agent's control connection and every session it is part of, open data tunnels included; its credential no longer works. Operators then see a host key mismatch for the new machine and clear the old pin with `revtty forget NAME`, unless the machine was enrolled with a new pairing code: its proof replaces the pin.
 - `doctor`, `agent doctor` and `relay doctor`: relay reachability with the underlying TLS or network cause, signed operator authentication, agent credential validation, file and directory permissions, relay schema version.
 - Service definitions that run the agent as an explicit OS account: a systemd template on Linux ([docs/SYSTEMD.md](docs/SYSTEMD.md)) and a launchd daemon on macOS ([docs/LAUNCHD.md](docs/LAUNCHD.md)).
+- `agent run` and `relay serve` log to stderr, where journald and launchd collect it, each line with its time and level. `RUST_LOG` selects what is logged (`info` by default, `RUST_LOG=debug` for more); credentials, Authorization headers and what goes through a session stay out of the logs, at `trace` too.
 
 ## Try it on one machine
 

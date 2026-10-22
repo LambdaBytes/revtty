@@ -42,6 +42,7 @@ impl Drop for TempRoot {
 struct Running {
     child: Child,
     log: Arc<Mutex<String>>,
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Running {
@@ -56,7 +57,7 @@ impl Running {
         let log = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&log);
 
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
                 let mut log = sink.lock().expect("log lock");
@@ -65,7 +66,33 @@ impl Running {
             }
         });
 
-        Self { child, log }
+        Self {
+            child,
+            log,
+            reader: Some(reader),
+        }
+    }
+
+    /// Stops the process with SIGTERM and returns all it logged, up to its end of stderr.
+    fn terminate(mut self, within: Duration) -> String {
+        let signalled = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .expect("send SIGTERM");
+        assert!(signalled.success());
+        let deadline = Instant::now() + within;
+        while self.child.try_wait().expect("poll process").is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "process did not stop within {within:?} of SIGTERM:\n{}",
+                self.log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(reader) = self.reader.take() {
+            reader.join().expect("log reader");
+        }
+        self.log()
     }
 
     fn log(&self) -> String {
@@ -103,6 +130,8 @@ impl Drop for Running {
 struct Role {
     config: PathBuf,
     state: PathBuf,
+    /// `RUST_LOG` for what this role runs; without one, the developer's own does not apply.
+    log_filter: Option<&'static str>,
 }
 
 impl Role {
@@ -110,6 +139,7 @@ impl Role {
         Self {
             config: root.path(&format!("{name}/config")),
             state: root.path(&format!("{name}/state")),
+            log_filter: None,
         }
     }
 
@@ -120,6 +150,10 @@ impl Role {
             .env("REVTTY_STATE_DIR", &self.state)
             .env_remove("REVTTY_RELAY")
             .env_remove("REVTTY_DB");
+        match self.log_filter {
+            Some(filter) => command.env("RUST_LOG", filter),
+            None => command.env_remove("RUST_LOG"),
+        };
         command
     }
 
@@ -1880,6 +1914,116 @@ fn ignore_session_offers(url: &str, control_token: &str) {
             while let Some(Ok(_)) = control.next().await {}
         });
     });
+}
+
+/// Sends `body` as JSON to `path` of the plain-HTTP relay at `url`; returns its status line.
+fn post_json(url: &str, path: &str, body: &str) -> String {
+    let address = url.strip_prefix("http://").expect("plain-HTTP relay URL");
+    let mut stream = std::net::TcpStream::connect(address).expect("connect to relay");
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("send request");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    response.lines().next().unwrap_or_default().to_owned()
+}
+
+/// The first token-shaped string in `log`: a revtty credential prefix and the 43 base64url
+/// characters of a generated token.
+fn token_in(log: &str) -> Option<&str> {
+    ["rve_", "rva_", "rvo_", "rvs_", "rvk_"]
+        .iter()
+        .find_map(|prefix| {
+            log.match_indices(prefix).find_map(|(at, _)| {
+                let candidate = log.get(at..at + prefix.len() + 43)?;
+                candidate[prefix.len()..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                    .then_some(candidate)
+            })
+        })
+}
+
+#[test]
+fn service_logs_keep_credentials_and_session_data_out_even_at_trace_level() {
+    let root = TempRoot::new();
+    let (operator, mut agent, mut relay_role) = prepare(&root);
+    agent.log_filter = Some("trace");
+    relay_role.log_filter = Some("trace");
+    let (relay, url) = start_relay(&root, &relay_role);
+    let token = enrollment_token(&root, &relay_role, &operator, false);
+    let enrolled = agent.run(&["agent", "enroll", "--relay", &url, "--token", &token]);
+    let host_key = field(&enrolled, "host").to_owned();
+    let config = std::fs::read_to_string(agent.config.join("agent.toml")).expect("read agent.toml");
+    let config: toml::Table = toml::from_str(&config).expect("parse agent.toml");
+    let control_token = config["control_token"].as_str().expect("control token");
+    let agent_process = start_agent(&root, &agent);
+    // At trace level the agent's "connected to" can be a dependency's, written before the
+    // relay registered it.
+    relay.wait_for_log("agent online", Duration::from_secs(10));
+
+    // A probe, a command with input and a shell. The marker is computed remotely, and
+    // every byte that carries it travels inside SSH.
+    operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+    let ran = exec_until_exit(
+        &operator,
+        &url,
+        &["--", "read line; echo REVTTY_LOG_$((6*7)) $line"],
+        b"REVTTY_LOG_INPUT\n",
+        Duration::from_secs(20),
+    );
+    assert_eq!(
+        text(&ran.stdout),
+        "REVTTY_LOG_42 REVTTY_LOG_INPUT\n",
+        "{}",
+        text(&ran.stderr)
+    );
+    let mut terminal = Terminal::connect(&operator, &url, None);
+    let logs = [&relay, &agent_process];
+    terminal.wait_ready(Duration::from_secs(20), &logs);
+    terminal.send("echo REVTTY_LOG_$((6*7)); exit\r");
+    terminal.wait_for("REVTTY_LOG_42", Duration::from_secs(20), &logs);
+    terminal
+        .wait_exit(Duration::from_secs(10))
+        .expect("revtty connect kept running after its shell exited");
+
+    // A request the relay refuses, made of a credential: the refusal does not quote it.
+    let body = serde_json::to_string(&token).expect("encode token");
+    let refused = post_json(&url, "/v1/enroll", &body);
+    assert!(refused.starts_with("HTTP/1.1 422 "), "{refused}");
+
+    // Stopped, so that their logs hold everything they wrote.
+    let relay_log = relay.terminate(Duration::from_secs(10));
+    let agent_log = agent_process.terminate(Duration::from_secs(15));
+    for (service, log) in [("relay", relay_log), ("agent", agent_log)] {
+        // Lines from tracing, with dependencies' trace events among them.
+        assert!(log.contains(" INFO "), "{service} log:\n{log}");
+        assert!(log.contains("TRACE "), "{service} log:\n{log}");
+        for secret in [token.as_str(), control_token, "REVTTY_LOG_"] {
+            assert!(
+                !log.contains(secret),
+                "{secret} in the {service} log:\n{log}"
+            );
+        }
+        for header in ["authorization", "bearer"] {
+            assert!(
+                !log.to_ascii_lowercase().contains(header),
+                "{header} in the {service} log:\n{log}"
+            );
+        }
+        assert_eq!(token_in(&log), None, "token in the {service} log:\n{log}");
+    }
 }
 
 #[test]

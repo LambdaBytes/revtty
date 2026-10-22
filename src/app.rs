@@ -69,7 +69,10 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
                 )
                 .await
             }
-            AgentCommand::Run => crate::agent::run().await,
+            AgentCommand::Run => {
+                crate::logging::init_service_logging()?;
+                crate::agent::run().await
+            }
             AgentCommand::PtyTest => crate::agent::pty_test(),
             AgentCommand::Status => crate::agent::status(),
             AgentCommand::Doctor => crate::agent::doctor().await,
@@ -94,7 +97,10 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
             RelayCommand::Remove { name, db } => crate::relay::remove_agent(&db, &name).await,
             RelayCommand::Agents { db } => crate::relay::list_agents(&db).await,
             RelayCommand::Sessions { limit, db } => crate::relay::list_sessions(&db, limit).await,
-            RelayCommand::Serve { bind, db } => crate::relay::serve(&bind, &db).await,
+            RelayCommand::Serve { bind, db } => {
+                crate::logging::init_service_logging()?;
+                crate::relay::serve(&bind, &db).await
+            }
             RelayCommand::Doctor { db } => crate::relay::doctor(&db).await,
         },
     };

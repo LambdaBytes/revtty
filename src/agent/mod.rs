@@ -351,7 +351,7 @@ pub async fn run() -> Result<(), RevttyError> {
         tokio::select! {
             result = control => {
                 if let Err(error) = result {
-                    eprintln!("control connection lost: {error}");
+                    tracing::warn!("control connection lost: {error}");
                 }
             }
             signal = tokio::signal::ctrl_c() => break signal,
@@ -359,7 +359,7 @@ pub async fn run() -> Result<(), RevttyError> {
         }
 
         let delay = backoff.next_delay();
-        eprintln!("reconnecting in {:.1}s", delay.as_secs_f64());
+        tracing::info!("reconnecting in {:.1}s", delay.as_secs_f64());
 
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
@@ -376,7 +376,7 @@ pub async fn run() -> Result<(), RevttyError> {
         .await
         .is_err()
     {
-        eprintln!(
+        tracing::warn!(
             "shell teardown did not finish within {}s",
             SHELL_SHUTDOWN_WAIT.as_secs()
         );
@@ -414,14 +414,14 @@ fn watch_operators(paths: Paths, initial: OperatorAllowlist) -> watch::Receiver<
                         changed
                     });
                     if published {
-                        eprintln!("operator list revision {revision}: {count} operators");
+                        tracing::info!("operator list revision {revision}: {count} operators");
                     }
                 }
                 // The last valid list stays in force: replacing it with nothing would close
                 // every session, including the one an operator would use to repair the file.
                 Err(error) if !unreadable => {
                     unreadable = true;
-                    eprintln!(
+                    tracing::warn!(
                         "cannot reload the operator list from agent.toml; keeping the previous one: {error}"
                     );
                 }
@@ -466,7 +466,7 @@ async fn run_control_once(
     .await?;
     send_operators_report(&mut sender, &mut operator_changes).await?;
 
-    eprintln!("agent {name} connected to {relay}");
+    tracing::info!("agent {name} connected to {relay}");
 
     let mut heartbeat = tokio::time::interval(timeouts.heartbeat);
     heartbeat.tick().await;
@@ -526,7 +526,7 @@ async fn run_control_once(
                         let control: ControlMessage = match serde_json::from_str(&text) {
                             Ok(control) => control,
                             Err(error) => {
-                                eprintln!(
+                                tracing::warn!(
                                     "ignoring unrecognized control message ({})",
                                     describe_undecodable(&error)
                                 );
@@ -580,7 +580,7 @@ async fn run_control_once(
                                         Err(error) => Err(error),
                                     };
                                     if let Err(error) = probed {
-                                        eprintln!("probe {task_session_id} failed: {error}");
+                                        tracing::warn!("probe {task_session_id} failed: {error}");
                                     }
                                 });
 
@@ -643,7 +643,7 @@ async fn run_control_once(
                                     )
                                     .await
                                     {
-                                        eprintln!("{label} {task_session_id} failed: {error}");
+                                        tracing::warn!("{label} {task_session_id} failed: {error}");
                                     }
                                 });
 
@@ -658,7 +658,7 @@ async fn run_control_once(
                             } if version == CONTROL_PROTOCOL_VERSION => {
                                 let tracked = cancel_session(session_tasks, &session_id).await;
                                 if tracked {
-                                    eprintln!("session cancelled by relay: {session_id}");
+                                    tracing::info!("session cancelled by relay: {session_id}");
                                 }
                             }
                             _ => {}

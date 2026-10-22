@@ -145,7 +145,7 @@ impl AuditLog {
 
                 if let Err(error) = written {
                     unwritten += 1;
-                    eprintln!("session audit write failed: {error}");
+                    tracing::error!("session audit write failed: {error}");
                 }
             }
         });
@@ -213,13 +213,13 @@ impl AuditLog {
         let at = match crate::storage::unix_now() {
             Ok(at) => at,
             Err(error) => {
-                eprintln!("session audit record dropped: {error}");
+                tracing::error!("session audit record dropped: {error}");
                 return;
             }
         };
 
         if self.events.try_send(event(at)).is_err() {
-            eprintln!("session audit queue is full; an audit record was dropped");
+            tracing::error!("session audit queue is full; an audit record was dropped");
         }
     }
 }
@@ -658,12 +658,12 @@ pub async fn serve(bind: &str, db: &FsPath) -> Result<(), RevttyError> {
     let store = Store::open(db).await?;
     let interrupted = store.close_interrupted_sessions().await?;
     if interrupted > 0 {
-        eprintln!("marked {interrupted} sessions of a previous relay process as interrupted");
+        tracing::info!("marked {interrupted} sessions of a previous relay process as interrupted");
     }
     let state = RelayState::new(store)?;
     spawn_removal_sweep(state.clone());
 
-    eprintln!("revtty relay listening on {address}");
+    tracing::info!("revtty relay listening on {address}");
     serve_until(listener, state, shutdown).await
 }
 
@@ -689,7 +689,7 @@ async fn serve_until(
         }
         signal = shutdown => signal,
     };
-    eprintln!("{signal}: relay stopping");
+    tracing::info!("{signal}: relay stopping");
     lifecycle.begin_shutdown();
 
     let stopped = tokio::time::timeout(grace, async {
@@ -708,7 +708,7 @@ async fn serve_until(
     .await;
     match stopped {
         Ok(Ok(())) => {
-            eprintln!("relay stopped");
+            tracing::info!("relay stopped");
             Ok(())
         }
         Ok(Err(error)) => Err(error),
@@ -797,7 +797,7 @@ async fn enroll_agent(
         )
             .into_response(),
         Err(error) => {
-            eprintln!("enrollment rejected: {error}");
+            tracing::warn!("enrollment rejected: {error}");
             StatusCode::UNAUTHORIZED.into_response()
         }
     }
@@ -816,7 +816,7 @@ async fn operator_list_challenge(State(state): State<RelayState>) -> Response {
     let epoch = match state.store.enrollment_epoch().await {
         Ok(epoch) => epoch,
         Err(error) => {
-            eprintln!("operator list challenge lookup failed: {error}");
+            tracing::error!("operator list challenge lookup failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -832,7 +832,7 @@ fn issue_operator_challenge(state: &RelayState, scope: &ChallengeScope<'_>) -> R
         })
         .into_response(),
         Err(error) => {
-            eprintln!("operator challenge generation failed: {error}");
+            tracing::error!("operator challenge generation failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -900,7 +900,7 @@ async fn operator_auth(
         // Same answer as a bad signature: agent names stay private.
         Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => {
-            eprintln!("operator auth lookup failed: {error}");
+            tracing::error!("operator auth lookup failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -924,7 +924,7 @@ async fn operator_auth(
     let session_token = match SecretToken::generate("rvo") {
         Ok(token) => token,
         Err(error) => {
-            eprintln!("operator session token generation failed: {error}");
+            tracing::error!("operator session token generation failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -967,7 +967,7 @@ async fn operator_list(
     let (epoch, agents) = match state.store.list_agents_with_epoch().await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            eprintln!("operator list lookup failed: {error}");
+            tracing::error!("operator list lookup failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1064,7 +1064,7 @@ async fn operator_status(
         Ok(Some(agent)) => agent,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
-            eprintln!("operator status lookup failed: {error}");
+            tracing::error!("operator status lookup failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1186,7 +1186,7 @@ async fn consume_operator_session(
         Ok(true) => Some(session),
         Ok(false) => None,
         Err(error) => {
-            eprintln!("operator session check failed: {error}");
+            tracing::error!("operator session check failed: {error}");
             None
         }
     }
@@ -1210,13 +1210,13 @@ async fn persistent_agent_upgrade(
         Ok(Some(agent_id)) => agent_id,
         Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => {
-            eprintln!("agent authentication failed: {error}");
+            tracing::error!("agent authentication failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
 
     if let Err(error) = state.store.mark_seen(&agent_id, None).await {
-        eprintln!("failed to update agent presence: {error}");
+        tracing::error!("failed to update agent presence: {error}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -1254,7 +1254,7 @@ async fn agent_credential_check(
         Ok(Some(_)) => StatusCode::NO_CONTENT.into_response(),
         Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => {
-            eprintln!("agent credential check failed: {error}");
+            tracing::error!("agent credential check failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1286,7 +1286,7 @@ async fn agent_rotate(
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => {
-            eprintln!("agent {name} credential rotation failed: {error}");
+            tracing::error!("agent {name} credential rotation failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1307,13 +1307,13 @@ async fn agent_rotate_confirm(
 
     match state.store.confirm_rotation(&name, token).await {
         Ok(RotationConfirmation::Promoted) => {
-            eprintln!("agent {name} rotated its control credential");
+            tracing::info!("agent {name} rotated its control credential");
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(RotationConfirmation::AlreadyCurrent) => StatusCode::NO_CONTENT.into_response(),
         Ok(RotationConfirmation::Rejected) => StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => {
-            eprintln!("agent {name} credential rotation failed: {error}");
+            tracing::error!("agent {name} credential rotation failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1382,7 +1382,7 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String, agent_
             Ok(true) => {}
             Ok(false) => return,
             Err(error) => {
-                eprintln!("failed to register agent {name}: {error}");
+                tracing::error!("failed to register agent {name}: {error}");
                 return;
             }
         }
@@ -1400,10 +1400,10 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String, agent_
     }
 
     if let Err(error) = state.store.mark_seen(&agent_id, Some(&agent_version)).await {
-        eprintln!("failed to persist agent hello: {error}");
+        tracing::error!("failed to persist agent hello: {error}");
     }
 
-    eprintln!("agent online: {name}");
+    tracing::info!("agent online: {name}");
 
     let idle = tokio::time::sleep(timeouts.agent_idle);
     tokio::pin!(idle);
@@ -1431,7 +1431,7 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String, agent_
                     }
                 }
                 () = &mut idle => {
-                    eprintln!(
+                    tracing::warn!(
                         "agent {name} silent for {}s; dropping its control connection",
                         timeouts.agent_idle.as_secs()
                     );
@@ -1466,7 +1466,7 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String, agent_
                                         if let Err(error) =
                                             state.store.mark_seen(&agent_id, Some(&agent_version)).await
                                         {
-                                            eprintln!("failed to persist agent hello: {error}");
+                                            tracing::error!("failed to persist agent hello: {error}");
                                         }
                                     }
                                     ControlMessage::Heartbeat {
@@ -1484,7 +1484,7 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String, agent_
                                         }
 
                                         if let Err(error) = state.store.mark_seen(&agent_id, None).await {
-                                            eprintln!("failed to persist agent heartbeat: {error}");
+                                            tracing::error!("failed to persist agent heartbeat: {error}");
                                         }
                                     }
                                     ControlMessage::SessionAccept {
@@ -1557,7 +1557,7 @@ async fn handle_agent(socket: WebSocket, state: RelayState, name: String, agent_
         .is_some_and(|agent| agent.connection_id == connection_id)
     {
         agents.remove(&name);
-        eprintln!("agent offline: {name}");
+        tracing::info!("agent offline: {name}");
     }
 }
 
@@ -1574,7 +1574,7 @@ async fn receive_agent_hello(
         Ok(Some(Ok(Message::Text(text)))) => text,
         Ok(_) => return None,
         Err(_) => {
-            eprintln!("agent {name} sent no hello; closing its control connection");
+            tracing::warn!("agent {name} sent no hello; closing its control connection");
             return None;
         }
     };
@@ -1598,7 +1598,7 @@ async fn receive_agent_hello(
         _ => "expected hello as the first control message".to_owned(),
     };
 
-    eprintln!("agent {name} rejected: {rejection}");
+    tracing::warn!("agent {name} rejected: {rejection}");
     let _ = tokio::time::timeout(
         timeouts.control_send,
         sender.send(Message::Text(
@@ -1624,7 +1624,9 @@ async fn record_operators_report(
     operators: &[String],
 ) -> bool {
     if i64::try_from(revision).is_err() {
-        eprintln!("agent {name} reported an out-of-range operator list revision; report ignored");
+        tracing::warn!(
+            "agent {name} reported an out-of-range operator list revision; report ignored"
+        );
         return true;
     }
 
@@ -1636,13 +1638,13 @@ async fn record_operators_report(
                 public_key: encoded.clone(),
             }),
             _ => {
-                eprintln!("agent {name} reported an unusable operator key; report ignored");
+                tracing::warn!("agent {name} reported an unusable operator key; report ignored");
                 return true;
             }
         }
     }
     if reported.is_empty() {
-        eprintln!("agent {name} reported no operators; report ignored");
+        tracing::warn!("agent {name} reported no operators; report ignored");
         return true;
     }
 
@@ -1652,7 +1654,7 @@ async fn record_operators_report(
         .await
     {
         Ok(OperatorsReportOutcome::Applied { changed: true }) => {
-            eprintln!(
+            tracing::info!(
                 "agent {name} operators updated to revision {revision} ({} operators)",
                 operators.len()
             );
@@ -1660,11 +1662,11 @@ async fn record_operators_report(
         }
         Ok(OperatorsReportOutcome::Applied { changed: false }) => true,
         Ok(OperatorsReportOutcome::NotCurrent) => {
-            eprintln!("agent {name} reported operators on a replaced connection; closing it");
+            tracing::warn!("agent {name} reported operators on a replaced connection; closing it");
             false
         }
         Err(error) => {
-            eprintln!(
+            tracing::error!(
                 "failed to store operators of agent {name}: {error}; closing its control \
                  connection so that it reports them again"
             );
@@ -1747,7 +1749,7 @@ async fn handle_operator_session(
         Ok(()) = cancelled => {
             state.pending.lock().await.remove(&session_id);
             state.audit.ended(&session_id, "agent_removed");
-            eprintln!(
+            tracing::info!(
                 "{} {session_id} for {agent_name} closed: the agent was removed or re-enrolled",
                 kind.label()
             );
@@ -1755,7 +1757,7 @@ async fn handle_operator_session(
         () = task.stopping() => {
             state.pending.lock().await.remove(&session_id);
             state.audit.ended(&session_id, "interrupted");
-            eprintln!(
+            tracing::info!(
                 "{} {session_id} for {agent_name} closed: the relay is stopping",
                 kind.label()
             );
@@ -1776,7 +1778,7 @@ async fn run_operator_session(
     let agent_token = match SecretToken::generate("rvs") {
         Ok(token) => token,
         Err(error) => {
-            eprintln!("session token generation failed: {error}");
+            tracing::error!("session token generation failed: {error}");
             state.audit.ended(&session_id, "internal_error");
             return;
         }
@@ -1813,7 +1815,7 @@ async fn run_operator_session(
             state.pending.lock().await.remove(&session_id);
             state.audit.ended(&session_id, "agent_unresponsive");
             send_operator_session_error(&mut operator_socket, SESSION_NOT_ACCEPTED).await;
-            eprintln!(
+            tracing::warn!(
                 "{} offer could not be queued for {agent_name}: {session_id}",
                 kind.label()
             );
@@ -1821,12 +1823,12 @@ async fn run_operator_session(
         }
     }
 
-    eprintln!("{} requested for {agent_name}: {session_id}", kind.label());
+    tracing::info!("{} requested for {agent_name}: {session_id}", kind.label());
 
     match tokio::time::timeout_at(accept_deadline, decision_rx).await {
         Ok(Ok(AgentDecision::Accepted)) => {
             state.audit.accepted(&session_id);
-            eprintln!("{} accepted by {agent_name}: {session_id}", kind.label());
+            tracing::info!("{} accepted by {agent_name}: {session_id}", kind.label());
         }
         Ok(Ok(AgentDecision::Rejected(reason))) => {
             state.pending.lock().await.remove(&session_id);
@@ -1842,7 +1844,7 @@ async fn run_operator_session(
                 SessionRejectReason::InternalError => "agent could not start the session",
             };
             send_operator_session_error(&mut operator_socket, detail).await;
-            eprintln!(
+            tracing::info!(
                 "{} rejected by {agent_name}: {session_id} ({reason:?})",
                 kind.label()
             );
@@ -1853,7 +1855,7 @@ async fn run_operator_session(
             state.audit.ended(&session_id, "accept_timeout");
             send_session_cancel(&control, &session_id).await;
             send_operator_session_error(&mut operator_socket, SESSION_NOT_ACCEPTED).await;
-            eprintln!(
+            tracing::warn!(
                 "{} acceptance timed out for {agent_name}: {session_id}",
                 kind.label()
             );
@@ -1865,7 +1867,7 @@ async fn run_operator_session(
         Ok(Ok(agent_socket)) => {
             state.pending.lock().await.remove(&session_id);
             state.audit.paired(&session_id);
-            eprintln!("{} paired for {agent_name}: {session_id}", kind.label());
+            tracing::info!("{} paired for {agent_name}: {session_id}", kind.label());
             let end = bridge_websockets(operator_socket, agent_socket).await;
             state.audit.ended(&session_id, end.outcome());
         }
@@ -1878,7 +1880,7 @@ async fn run_operator_session(
                 "agent accepted the session but its data tunnel timed out",
             )
             .await;
-            eprintln!(
+            tracing::warn!(
                 "{} data tunnel timed out for {agent_name}: {session_id}",
                 kind.label()
             );
@@ -1952,7 +1954,7 @@ async fn sweep_removed_agents(state: &RelayState) {
         // Without an answer nothing is closed, rather than every connection; the next sweep
         // asks again.
         Err(error) => {
-            eprintln!("removal sweep failed: {error}");
+            tracing::error!("removal sweep failed: {error}");
             return;
         }
     };
@@ -1967,7 +1969,9 @@ async fn sweep_removed_agents(state: &RelayState) {
     state.agents.lock().await.retain(|name, agent| {
         let keep = !removed.contains(&agent.agent_id);
         if !keep {
-            eprintln!("agent {name} was removed or re-enrolled; closing its control connection");
+            tracing::info!(
+                "agent {name} was removed or re-enrolled; closing its control connection"
+            );
         }
         keep
     });

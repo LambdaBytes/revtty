@@ -314,7 +314,7 @@ impl AgentSshHandler {
         } = match spawn_command(command) {
             Ok(spawned) => spawned,
             Err(error) => {
-                eprintln!("command spawn failed: {error}");
+                tracing::error!("command spawn failed: {error}");
                 self.refuse_terminal(channel, session)?;
                 return Ok(());
             }
@@ -439,7 +439,7 @@ impl server::Handler for AgentSshHandler {
                 session.channel_success(channel)?;
             }
             Err(error) => {
-                eprintln!("PTY allocation failed: {error}");
+                tracing::error!("PTY allocation failed: {error}");
                 self.refuse_terminal(channel, session)?;
             }
         }
@@ -543,7 +543,7 @@ impl server::Handler for AgentSshHandler {
         let pty = match open_pty_io(master.as_ref()) {
             Ok(pty) => Arc::new(pty),
             Err(error) => {
-                eprintln!("PTY I/O setup failed: {error}");
+                tracing::error!("PTY I/O setup failed: {error}");
                 self.refuse_terminal(channel, session)?;
                 return Ok(());
             }
@@ -555,7 +555,7 @@ impl server::Handler for AgentSshHandler {
         let child = match slave.spawn_command(command) {
             Ok(child) => child,
             Err(error) => {
-                eprintln!("shell spawn failed: {error}");
+                tracing::error!("shell spawn failed: {error}");
                 self.refuse_terminal(channel, session)?;
                 return Ok(());
             }
@@ -841,7 +841,7 @@ async fn supervise_shell(mut supervisor: ShellSupervisor) {
                 Ok(Some(status)) => break ShellEnd::Exited(status.exit_code()),
                 Ok(None) => {}
                 Err(error) => {
-                    eprintln!("shell wait failed: {error}");
+                    tracing::error!("shell wait failed: {error}");
                     break ShellEnd::Exited(1);
                 }
             },
@@ -907,7 +907,7 @@ async fn terminate_child(child: &mut (dyn Child + Send + Sync)) {
     }
 
     if signal_if_running(child, libc::SIGKILL) && !wait_for_exit(child, KILL_REAP_WAIT).await {
-        eprintln!(
+        tracing::warn!(
             "shell {} did not exit after SIGKILL",
             child.process_id().unwrap_or_default()
         );
@@ -1119,7 +1119,7 @@ async fn supervise_command(supervisor: CommandSupervisor) {
                 Ok(false) => {}
                 Ok(true) => break CommandEnd::Exited,
                 Err(error) => {
-                    eprintln!("command wait failed: {error}");
+                    tracing::error!("command wait failed: {error}");
                     break CommandEnd::Stopped;
                 }
             },
@@ -1150,8 +1150,8 @@ async fn supervise_command(supervisor: CommandSupervisor) {
             // Reaps the leader. What it left running in its group stays, as with a shell.
             match child.try_wait() {
                 Ok(Some(status)) => report_exit(&handle, channel, status).await,
-                Ok(None) => eprintln!("command {} exited but cannot be reaped", child.id()),
-                Err(error) => eprintln!("command wait failed: {error}"),
+                Ok(None) => tracing::warn!("command {} exited but cannot be reaped", child.id()),
+                Err(error) => tracing::error!("command wait failed: {error}"),
             }
             let _ = handle.eof(channel).await;
             let _ = handle.close(channel).await;
@@ -1224,7 +1224,7 @@ async fn end_process_group(leader: &mut std::process::Child, output: [&JoinHandl
 
     signal_group(leader, libc::SIGKILL);
     if !wait_for_exit(leader, KILL_REAP_WAIT).await {
-        eprintln!("command {} did not exit after SIGKILL", leader.id());
+        tracing::warn!("command {} did not exit after SIGKILL", leader.id());
     }
 }
 
@@ -1440,7 +1440,7 @@ where
         }
         revoked = operator_revoked(&mut changes, &authenticated) => {
             let fingerprint = revoked.fingerprint(HashAlg::Sha256);
-            eprintln!("operator {fingerprint} was revoked; closing its session");
+            tracing::info!("operator {fingerprint} was revoked; closing its session");
             // Dropping the session would leave russh running; ending its transport stops it,
             // and dropping its handler tears the shell down.
             transport.abort();
@@ -1448,7 +1448,7 @@ where
                 .await
                 .is_err()
             {
-                eprintln!(
+                tracing::warn!(
                     "session of revoked operator {fingerprint} did not end within {}s",
                     REVOKED_SESSION_WAIT.as_secs()
                 );
