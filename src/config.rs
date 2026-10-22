@@ -24,6 +24,22 @@ impl Paths {
         })
     }
 
+    /// The config directory alone, for commands that need nothing else: unlike `discover`, it
+    /// needs no home directory when REVTTY_CONFIG_DIR is set, and is `None` when neither gives
+    /// one.
+    pub fn config_dir_only() -> Result<Option<PathBuf>, RevttyError> {
+        match ProjectDirs::from("io", "LambdaBytes", "revtty") {
+            Some(dirs) => {
+                path_override("REVTTY_CONFIG_DIR", dirs.config_dir().to_path_buf()).map(Some)
+            }
+            // Without a home directory only the override can name one.
+            None if std::env::var_os("REVTTY_CONFIG_DIR").is_some() => {
+                path_override("REVTTY_CONFIG_DIR", PathBuf::new()).map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
     #[cfg(test)]
     pub fn new(config_dir: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Self {
         Self {

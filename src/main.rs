@@ -9,6 +9,7 @@ mod logging;
 mod pairing;
 mod protocol;
 mod relay;
+mod settings;
 mod storage;
 mod token;
 mod transport;

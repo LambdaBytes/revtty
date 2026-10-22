@@ -17,8 +17,9 @@ pub enum Command {
     /// List enrolled machines authorized for this operator.
     List {
         /// Relay base URL.
-        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
-        relay: String,
+        /// Else REVTTY_RELAY, else `relay` under [operator] in config.toml.
+        #[arg(long, env = "REVTTY_RELAY")]
+        relay: Option<String>,
 
         /// Print the result as one line of JSON (see the README).
         #[arg(long)]
@@ -31,8 +32,9 @@ pub enum Command {
         target: String,
 
         /// Relay base URL.
-        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
-        relay: String,
+        /// Else REVTTY_RELAY, else `relay` under [operator] in config.toml.
+        #[arg(long, env = "REVTTY_RELAY")]
+        relay: Option<String>,
 
         /// Agent host key fingerprint (SHA256:...) to pin on first contact, as printed by
         /// `revtty agent status` on the target.
@@ -50,8 +52,9 @@ pub enum Command {
         target: String,
 
         /// Relay base URL. http(s) is converted to ws(s).
-        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
-        relay: String,
+        /// Else REVTTY_RELAY, else `relay` under [operator] in config.toml.
+        #[arg(long, env = "REVTTY_RELAY")]
+        relay: Option<String>,
 
         /// Agent host key fingerprint (SHA256:...) to pin on first contact, as printed by
         /// `revtty agent status` on the target.
@@ -69,8 +72,9 @@ pub enum Command {
         target: String,
 
         /// Relay base URL. http(s) is converted to ws(s).
-        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
-        relay: String,
+        /// Else REVTTY_RELAY, else `relay` under [operator] in config.toml.
+        #[arg(long, env = "REVTTY_RELAY")]
+        relay: Option<String>,
 
         /// Agent host key fingerprint (SHA256:...) to pin on first contact, as printed by
         /// `revtty agent status` on the target.
@@ -84,8 +88,9 @@ pub enum Command {
         target: String,
 
         /// Relay base URL. http(s) is converted to ws(s).
-        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
-        relay: String,
+        /// Else REVTTY_RELAY, else `relay` under [operator] in config.toml.
+        #[arg(long, env = "REVTTY_RELAY")]
+        relay: Option<String>,
 
         /// Agent host key fingerprint (SHA256:...) to pin on first contact, as printed by
         /// `revtty agent status` on the target. exec never asks for it.
@@ -114,8 +119,9 @@ pub enum Command {
     /// Run local connectivity and configuration checks.
     Doctor {
         /// Relay base URL.
-        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
-        relay: String,
+        /// Else REVTTY_RELAY, else `relay` under [operator] in config.toml.
+        #[arg(long, env = "REVTTY_RELAY")]
+        relay: Option<String>,
     },
 
     /// Wrap an enrollment token from `revtty relay enroll` in a pairing code for the target,
@@ -130,8 +136,9 @@ pub enum Command {
         token: String,
 
         /// Relay base URL the target enrolls with and this operator connects through.
-        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
-        relay: String,
+        /// Else REVTTY_RELAY, else `relay` under [operator] in config.toml.
+        #[arg(long, env = "REVTTY_RELAY")]
+        relay: Option<String>,
     },
 
     /// Forget a machine's pinned host key, after it was reinstalled and re-enrolled; a
@@ -141,8 +148,9 @@ pub enum Command {
         target: String,
 
         /// Relay base URL the key was pinned for.
-        #[arg(long, default_value = "ws://127.0.0.1:8787", env = "REVTTY_RELAY")]
-        relay: String,
+        /// Else REVTTY_RELAY, else `relay` under [operator] in config.toml.
+        #[arg(long, env = "REVTTY_RELAY")]
+        relay: Option<String>,
     },
 
     /// Manage or run the persistent target agent.
@@ -230,8 +238,9 @@ pub enum RelayCommand {
     /// Initialize or migrate the relay SQLite database.
     Init {
         /// Relay SQLite database path.
-        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
-        db: PathBuf,
+        /// Else REVTTY_DB, else `db` under [relay] in config.toml, else revtty.db.
+        #[arg(long, env = "REVTTY_DB")]
+        db: Option<PathBuf>,
     },
 
     /// Create a single-use enrollment token from the relay host.
@@ -253,8 +262,9 @@ pub enum RelayCommand {
         replace: bool,
 
         /// Relay SQLite database path.
-        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
-        db: PathBuf,
+        /// Else REVTTY_DB, else `db` under [relay] in config.toml, else revtty.db.
+        #[arg(long, env = "REVTTY_DB")]
+        db: Option<PathBuf>,
     },
 
     /// Remove an enrolled agent and its unused enrollments; the session audit is kept.
@@ -263,26 +273,30 @@ pub enum RelayCommand {
         name: String,
 
         /// Relay SQLite database path.
-        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
-        db: PathBuf,
+        /// Else REVTTY_DB, else `db` under [relay] in config.toml, else revtty.db.
+        #[arg(long, env = "REVTTY_DB")]
+        db: Option<PathBuf>,
     },
 
     /// List agents persisted by the relay.
     Agents {
         /// Relay SQLite database path.
-        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
-        db: PathBuf,
+        /// Else REVTTY_DB, else `db` under [relay] in config.toml, else revtty.db.
+        #[arg(long, env = "REVTTY_DB")]
+        db: Option<PathBuf>,
     },
 
     /// Serve the relay.
     Serve {
         /// Bind address. Keep loopback when terminating TLS with Caddy.
-        #[arg(long, default_value = "127.0.0.1:8787")]
-        bind: String,
+        /// Else `bind` under [relay] in config.toml, else 127.0.0.1:8787.
+        #[arg(long)]
+        bind: Option<String>,
 
         /// Relay SQLite database path used by /v1 endpoints.
-        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
-        db: PathBuf,
+        /// Else REVTTY_DB, else `db` under [relay] in config.toml, else revtty.db.
+        #[arg(long, env = "REVTTY_DB")]
+        db: Option<PathBuf>,
     },
 
     /// Show recent session audit records.
@@ -292,15 +306,17 @@ pub enum RelayCommand {
         limit: u32,
 
         /// Relay SQLite database path.
-        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
-        db: PathBuf,
+        /// Else REVTTY_DB, else `db` under [relay] in config.toml, else revtty.db.
+        #[arg(long, env = "REVTTY_DB")]
+        db: Option<PathBuf>,
     },
 
     /// Run relay-specific diagnostics.
     Doctor {
         /// Relay SQLite database path.
-        #[arg(long, default_value = "revtty.db", env = "REVTTY_DB")]
-        db: PathBuf,
+        /// Else REVTTY_DB, else `db` under [relay] in config.toml, else revtty.db.
+        #[arg(long, env = "REVTTY_DB")]
+        db: Option<PathBuf>,
     },
 }
 

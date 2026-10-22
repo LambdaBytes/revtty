@@ -156,7 +156,20 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 | `relay remove NAME` | relay | Remove an agent and its unused enrollments; the audit is kept. |
 | `relay agents`, `relay sessions [--limit N]`, `relay doctor` | relay | Enrolled agents, session audit, diagnostics. |
 
-`--relay` accepts `https://` or `wss://`, and plain `http://` or `ws://` only for a relay on the same machine (`localhost`, `127.0.0.0/8` or `[::1]`), and a redirect to any other plain URL is not followed: every request carries a credential that only TLS protects. For the operator commands it defaults to `$REVTTY_RELAY`, else `ws://127.0.0.1:8787`; `agent enroll` requires it explicitly and the agent then keeps it in `agent.toml`. Relay commands take `--db`, defaulting to `$REVTTY_DB`, else `revtty.db`.
+`--relay` accepts `https://` or `wss://`, and plain `http://` or `ws://` only for a relay on the same machine (`localhost`, `127.0.0.0/8` or `[::1]`), and a redirect to any other plain URL is not followed: every request carries a credential that only TLS protects. For the operator commands it defaults to `$REVTTY_RELAY`, else to `relay` under `[operator]` in `config.toml`; there is no built-in relay, and without one these commands fail before sending anything. `agent enroll` requires it explicitly and the agent then keeps it in `agent.toml`. Relay commands take `--db`, defaulting to `$REVTTY_DB`, else to `db` under `[relay]`, else `revtty.db`; `relay serve --bind` defaults to `bind` under `[relay]`, else `127.0.0.1:8787`.
+
+`config.toml`, in the config directory, is optional and holds no secrets:
+
+```toml
+[operator]
+relay = "wss://relay.example.com"
+
+[relay]
+bind = "127.0.0.1:8787"
+db = "/var/lib/revtty-relay/revtty.db"
+```
+
+Flags win over environment variables, which win over the file. The commands that read it check all of it before anything else: an unknown key, a `db` that is not absolute, a `bind` that is not an IP address and a port, a file that is not a regular file, or a file or directory that other users could modify is an error, and errors never quote the file. The relay commands look for it in `REVTTY_CONFIG_DIR`, else in the user's config directory, and need no home directory.
 
 ## JSON output
 
@@ -198,6 +211,7 @@ The last operator of an agent cannot be revoked.
 
 | Role | Files | Location |
 |---|---|---|
+| operator, relay | `config.toml` (optional settings) | config directory |
 | operator | `id_ed25519`, `id_ed25519.pub`, `known_hosts`, `pairings` (secrets of pairing codes not used yet) | config directory |
 | agent | `agent.toml` (holds the control credential and the operator list), `agent.lock`, `agent.run.lock` | config directory |
 | agent | `agent_ed25519`, `agent_ed25519.pub` (host key) | state directory |

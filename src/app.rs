@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use crate::cli::{AgentCommand, Args, Command, OperatorCommand, RelayCommand};
+use crate::config::Paths;
 use crate::error::RevttyError;
+use crate::settings::Settings;
 
 /// Runs one command and returns the process exit code.
 pub async fn run(args: Args) -> Result<u8, RevttyError> {
@@ -11,7 +13,10 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
             target,
             relay,
             host_key,
-        } => return crate::client::connect(&target, &relay, host_key.as_deref()).await,
+        } => {
+            let relay = operator_relay(relay)?;
+            return crate::client::connect(&target, &relay, host_key.as_deref()).await;
+        }
         // Exits with the remote command's status, like ssh.
         Command::Exec {
             target,
@@ -24,7 +29,7 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
         } => {
             return crate::client::exec(
                 &target,
-                &relay,
+                &operator_relay(relay)?,
                 host_key.as_deref(),
                 timeout.map(Duration::from_secs),
                 !no_stdin,
@@ -34,26 +39,32 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
             .await;
         }
         Command::Init => crate::client::init(),
-        Command::List { relay, json } => crate::client::list(&relay, json).await,
+        Command::List { relay, json } => crate::client::list(&operator_relay(relay)?, json).await,
         Command::Status {
             target,
             relay,
             host_key,
             json,
-        } => crate::client::status(&target, &relay, host_key.as_deref(), json).await,
+        } => {
+            crate::client::status(&target, &operator_relay(relay)?, host_key.as_deref(), json).await
+        }
         Command::Probe {
             target,
             relay,
             host_key,
             json,
-        } => crate::client::probe(&target, &relay, host_key.as_deref(), json).await,
-        Command::Doctor { relay } => crate::client::doctor(&relay).await,
+        } => {
+            crate::client::probe(&target, &operator_relay(relay)?, host_key.as_deref(), json).await
+        }
+        Command::Doctor { relay } => crate::client::doctor(&operator_relay(relay)?).await,
         Command::Pair {
             target,
             token,
             relay,
-        } => crate::client::pair(&target, &token, &relay),
-        Command::Forget { target, relay } => crate::client::forget(&target, &relay),
+        } => crate::client::pair(&target, &token, &operator_relay(relay)?),
+        Command::Forget { target, relay } => {
+            crate::client::forget(&target, &operator_relay(relay)?)
+        }
         Command::Agent { command } => match command {
             AgentCommand::Enroll {
                 relay,
@@ -85,25 +96,50 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
                 }
             },
         },
-        Command::Relay { command } => match command {
-            RelayCommand::Init { db } => crate::relay::init(&db).await,
-            RelayCommand::Enroll {
-                name,
-                operator_key,
-                ttl,
-                replace,
-                db,
-            } => crate::relay::create_enrollment(&db, &name, &operator_key, ttl, replace).await,
-            RelayCommand::Remove { name, db } => crate::relay::remove_agent(&db, &name).await,
-            RelayCommand::Agents { db } => crate::relay::list_agents(&db).await,
-            RelayCommand::Sessions { limit, db } => crate::relay::list_sessions(&db, limit).await,
-            RelayCommand::Serve { bind, db } => {
-                crate::logging::init_service_logging()?;
-                crate::relay::serve(&bind, &db).await
+        Command::Relay { command } => {
+            // Nothing else of the config directory: a relay may run without a home directory.
+            let settings = Settings::load(Paths::config_dir_only()?.as_deref())?;
+            match command {
+                RelayCommand::Init { db } => crate::relay::init(&settings.relay_db(db)).await,
+                RelayCommand::Enroll {
+                    name,
+                    operator_key,
+                    ttl,
+                    replace,
+                    db,
+                } => {
+                    crate::relay::create_enrollment(
+                        &settings.relay_db(db),
+                        &name,
+                        &operator_key,
+                        ttl,
+                        replace,
+                    )
+                    .await
+                }
+                RelayCommand::Remove { name, db } => {
+                    crate::relay::remove_agent(&settings.relay_db(db), &name).await
+                }
+                RelayCommand::Agents { db } => {
+                    crate::relay::list_agents(&settings.relay_db(db)).await
+                }
+                RelayCommand::Sessions { limit, db } => {
+                    crate::relay::list_sessions(&settings.relay_db(db), limit).await
+                }
+                RelayCommand::Serve { bind, db } => {
+                    crate::logging::init_service_logging()?;
+                    crate::relay::serve(&settings.relay_bind(bind), &settings.relay_db(db)).await
+                }
+                RelayCommand::Doctor { db } => crate::relay::doctor(&settings.relay_db(db)).await,
             }
-            RelayCommand::Doctor { db } => crate::relay::doctor(&db).await,
-        },
+        }
     };
 
     completed.map(|()| 0)
+}
+
+/// The relay an operator command uses, checked with the rest of `config.toml` before anything
+/// is sent.
+fn operator_relay(given: Option<String>) -> Result<String, RevttyError> {
+    Settings::load(Some(&Paths::discover()?.config_dir))?.operator_relay(given)
 }

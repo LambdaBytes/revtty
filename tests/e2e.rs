@@ -2088,6 +2088,114 @@ fn errors_name_their_kind_and_keep_their_exit_status() {
     assert!(line.starts_with("error (DNS): "), "{line}");
 }
 
+/// Writes `config.toml` for `role`, in a config directory private to the user as revtty
+/// creates it, and with the mode an editor gives it under umask 022.
+fn write_settings(role: &Role, content: &str) {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&role.config)
+        .expect("create config directory");
+    let path = role.config.join("config.toml");
+    std::fs::write(&path, content).expect("write config.toml");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("set config.toml mode");
+}
+
+#[test]
+fn operator_and_relay_commands_take_their_settings_from_config_toml() {
+    let root = TempRoot::new();
+    let (operator, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+    enroll_agent(&root, &relay_role, &operator, &agent, &url);
+
+    // No relay anywhere: there is no default to fall back on.
+    let (status, line) = failure(&operator, &["list"]);
+    assert_eq!(status, Some(1), "{line}");
+    assert!(line.starts_with("error: no relay configured"), "{line}");
+    for way in ["--relay", "REVTTY_RELAY", "[operator]", "config.toml"] {
+        assert!(line.contains(way), "{line}");
+    }
+
+    write_settings(&operator, &format!("[operator]\nrelay = \"{url}\"\n"));
+    let listed = operator.run(&["list"]);
+    assert!(listed.contains(AGENT_NAME), "{listed}");
+    // REVTTY_RELAY wins over the file.
+    let mut overridden = operator.command();
+    let output = overridden
+        .args(["list"])
+        .env("REVTTY_RELAY", "https://revtty.invalid")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run revtty");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error (DNS): "), "{stderr}");
+
+    // A broken file fails a command even when its flags give every value.
+    write_settings(
+        &operator,
+        "[operator]\nrelay_url = \"https://relay.example.com\"\n",
+    );
+    let (status, line) = failure(&operator, &["list", "--relay", &url]);
+    assert_eq!(status, Some(1), "{line}");
+    assert!(line.contains("config.toml is invalid at line 2"), "{line}");
+
+    // The relay's database from the file, unless --db names another.
+    let db = root.path("relay.db");
+    write_settings(
+        &relay_role,
+        &format!("[relay]\ndb = \"{}\"\n", db.to_str().expect("utf-8 path")),
+    );
+    let agents = relay_role.run(&["relay", "agents"]);
+    assert!(agents.contains(AGENT_NAME), "{agents}");
+    let other = root.path("other.db");
+    let other = other.to_str().expect("utf-8 path");
+    relay_role.run(&["relay", "init", "--db", other]);
+    let none = relay_role.run(&["relay", "agents", "--db", other]);
+    assert!(!none.contains(AGENT_NAME), "{none}");
+    let output = relay_role
+        .command()
+        .args(["relay", "agents"])
+        .env("REVTTY_DB", other)
+        .output()
+        .expect("run revtty");
+    assert!(output.status.success());
+    let from_env = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !from_env.contains(AGENT_NAME),
+        "REVTTY_DB lost to the file: {from_env}"
+    );
+
+    // Relay commands look up the config directory alone: a state directory they never use
+    // cannot fail them.
+    let output = relay_role
+        .command()
+        .args(["relay", "agents"])
+        .env("REVTTY_STATE_DIR", "relative/state")
+        .output()
+        .expect("run revtty");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+
+    // `relay serve` listens where the file says.
+    write_settings(
+        &relay_role,
+        &format!(
+            "[relay]\nbind = \"127.0.0.1:0\"\ndb = \"{}\"\n",
+            db.to_str().expect("utf-8 path")
+        ),
+    );
+    let mut serve = relay_role.command();
+    serve.args(["relay", "serve"]);
+    let served = Running::spawn(serve);
+    let log = served.wait_for_log("listening on ", Duration::from_secs(15));
+    assert!(log.contains("listening on 127.0.0.1:"), "{log}");
+    assert!(!log.contains("listening on 127.0.0.1:8787"), "{log}");
+}
+
 #[test]
 fn exec_on_an_agent_that_predates_it_says_so() {
     let root = TempRoot::new();
