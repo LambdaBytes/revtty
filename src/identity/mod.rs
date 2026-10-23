@@ -1,15 +1,17 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use ssh_key::known_hosts::{Entry as KnownHostEntry, HostPatterns};
 use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, HashAlg, KnownHosts, LineEnding, PrivateKey, PublicKey};
+use uuid::Uuid;
 
 use crate::config::Paths;
 use crate::error::{ErrorKind, RevttyError};
@@ -147,6 +149,135 @@ pub fn ensure_operator(paths: &Paths) -> Result<OperatorIdentity, RevttyError> {
         fingerprint: public_key.fingerprint(HashAlg::Sha256).to_string(),
         created,
     })
+}
+
+/// Makes the OpenSSH Ed25519 private key at `source` the operator identity, as a copy of its
+/// own: published whole and never in place of an identity that is already here. Importing the
+/// key that is already the identity changes nothing.
+pub fn import_operator(paths: &Paths, source: &Path) -> Result<OperatorIdentity, RevttyError> {
+    let key = read_importable_key(source)?;
+    crate::config::create_private_dir(&paths.config_dir)
+        .map_err(|error| RevttyError::runtime("create operator config directory", error))?;
+    let private_key_path = paths.config_dir.join(OPERATOR_KEY_FILE);
+
+    // Written whole under a name of its own, then linked into place: a reader never sees part
+    // of the key, and of two imports at once only one publishes, since a link never replaces
+    // a file.
+    let temp = paths.config_dir.join(format!(
+        ".{OPERATOR_KEY_FILE}.import-{}.tmp",
+        Uuid::new_v4().simple()
+    ));
+    if let Err(error) = write_private_key(&temp, &key) {
+        // Whatever part of the key it holds goes with it.
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    let linked = fs::hard_link(&temp, &private_key_path);
+    let removed = fs::remove_file(&temp).map_err(|error| {
+        RevttyError::runtime(
+            &format!(
+                "remove the temporary copy {} of the operator private key; remove it by hand",
+                temp.display()
+            ),
+            error,
+        )
+    });
+    let created = match linked {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            let published = RevttyError::runtime("publish operator private key", error);
+            return Err(match removed {
+                Ok(()) => published,
+                Err(left) => left.reworded(format!("{published}; and {left}")),
+            });
+        }
+    };
+    removed?;
+    // Also when another import published it: one that died before syncing leaves an identity
+    // that a power loss could still take, and this one reports it as here.
+    File::open(&paths.config_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            RevttyError::runtime("sync the directory of the operator private key", error)
+        })?;
+
+    // The identity that is here now, whichever import published it.
+    let identity = ensure_operator(paths)?;
+    let imported = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+    if identity.fingerprint != imported {
+        return Err(RevttyError::message(format!(
+            "an operator identity is already here ({}, {}), and {} is another key ({imported}). \
+             Agents authorize the identity that is here: to use the other key instead, remove \
+             {} and {} first, knowing that agents enrolled for the current key will refuse it",
+            identity.fingerprint,
+            private_key_path.display(),
+            source.display(),
+            private_key_path.display(),
+            identity.public_key_path.display()
+        )));
+    }
+
+    Ok(OperatorIdentity {
+        created,
+        ..identity
+    })
+}
+
+/// The key at `source`, if revtty can use it as an operator identity.
+fn read_importable_key(source: &Path) -> Result<PrivateKey, RevttyError> {
+    let shown = source.display();
+    // Checked on what was opened, not on the path again, which another process could change in
+    // between. Opened without blocking, as opening a FIFO waits for a writer; a regular file
+    // reads the same either way.
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let mut file = options
+        .open(source)
+        .map_err(|error| RevttyError::runtime(&format!("open {shown}"), error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| RevttyError::runtime(&format!("inspect {shown}"), error))?;
+    // A device could never end the read.
+    if !metadata.is_file() {
+        return Err(RevttyError::message(format!(
+            "{shown} is not a regular file"
+        )));
+    }
+    // As ssh refuses such a key: whoever else can read it may have a copy.
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(RevttyError::message(format!(
+                "{shown} is accessible by other users (mode {mode:o}); run chmod 600 {shown}"
+            )));
+        }
+    }
+
+    // Cleared when dropped, as ssh-key does with a key file it reads.
+    let mut encoded = String::new();
+    file.read_to_string(&mut encoded)
+        .map_err(|error| RevttyError::runtime(&format!("read {shown}"), error))?;
+    let encoded = SecretString::from(encoded);
+    let key = PrivateKey::from_openssh(encoded.expose_secret()).map_err(|error| {
+        RevttyError::runtime(&format!("read {shown} as an OpenSSH private key"), error)
+    })?;
+    if key.is_encrypted() {
+        return Err(RevttyError::message(format!(
+            "{shown} is protected by a passphrase, which revtty does not support; use a key \
+             without one, or `revtty init` without --key to create one"
+        )));
+    }
+    if key.algorithm() != Algorithm::Ed25519 {
+        return Err(RevttyError::message(format!(
+            "v1 requires an Ed25519 operator key; {shown} is {}",
+            key.algorithm()
+        )));
+    }
+    Ok(key)
 }
 
 /// Checks the relay-supplied host key of an agent against the operator's pin without ever
@@ -646,19 +777,24 @@ fn secure_private_key_permissions(path: &Path) -> Result<(), RevttyError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier};
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use ssh_key::rand_core::OsRng;
-    use ssh_key::{Algorithm, PrivateKey};
+    use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey};
     use uuid::Uuid;
 
     use std::io::Write;
 
     use super::{
         HostKeyTrust, check_agent_host_key, ensure_operator, forget_agent_host_key,
-        known_host_alias, pairings_without, pin_agent_host_key, save_pairing, trust_agent_host_key,
+        import_operator, known_host_alias, pairings_without, pin_agent_host_key, save_pairing,
+        trust_agent_host_key,
     };
     use crate::config::Paths;
     use crate::pairing::PairingSecret;
@@ -1056,6 +1192,303 @@ mod tests {
         }
 
         fs::remove_dir_all(root).expect("clean identity test directory");
+    }
+
+    /// `content` as a private key file of the user's, private as ssh-keygen writes one.
+    fn key_file(root: &Path, name: &str, content: &str) -> PathBuf {
+        fs::create_dir_all(root).expect("create key directory");
+        let path = root.join(name);
+        fs::write(&path, content).expect("write key file");
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("set key mode");
+        path
+    }
+
+    fn ed25519_key(comment: &str) -> PrivateKey {
+        let mut key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).expect("generate key");
+        key.set_comment(comment);
+        key
+    }
+
+    fn openssh(key: &PrivateKey) -> String {
+        key.to_openssh(LineEnding::LF)
+            .expect("encode key")
+            .to_string()
+    }
+
+    /// The file of an Ed25519 key protected by a passphrase, as `ssh-keygen -N` writes it
+    /// (aes256-ctr, bcrypt). Built by hand: ssh-key encrypts only with a feature revtty does
+    /// not use, and nothing tells random ciphertext from a real one before decrypting it.
+    fn passphrase_protected_key() -> String {
+        fn string(out: &mut Vec<u8>, bytes: &[u8]) {
+            out.extend_from_slice(&u32::try_from(bytes.len()).expect("length").to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+
+        let public = ed25519_key("")
+            .public_key()
+            .to_bytes()
+            .expect("public key blob");
+        let mut kdf_options = Vec::new();
+        string(&mut kdf_options, &[7; 16]);
+        kdf_options.extend_from_slice(&16_u32.to_be_bytes());
+
+        let mut body = b"openssh-key-v1\0".to_vec();
+        string(&mut body, b"aes256-ctr");
+        string(&mut body, b"bcrypt");
+        string(&mut body, &kdf_options);
+        body.extend_from_slice(&1_u32.to_be_bytes());
+        string(&mut body, &public);
+        string(&mut body, &[0x5a; 160]);
+
+        let encoded = STANDARD.encode(body);
+        let lines = encoded
+            .as_bytes()
+            .chunks(70)
+            .map(|line| std::str::from_utf8(line).expect("base64 is ASCII"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{lines}\n-----END OPENSSH PRIVATE KEY-----\n")
+    }
+
+    /// An RSA private key file: its numbers are not a real key, which no check here needs.
+    fn rsa_key() -> String {
+        use ssh_key::Mpint;
+        use ssh_key::private::{KeypairData, RsaKeypair, RsaPrivateKey};
+        use ssh_key::public::RsaPublicKey;
+
+        let number = |byte: u8| Mpint::from_positive_bytes(&[byte; 256]).expect("number");
+        let keypair = RsaKeypair {
+            public: RsaPublicKey {
+                e: Mpint::from_positive_bytes(&[1, 0, 1]).expect("exponent"),
+                n: number(0xc3),
+            },
+            private: RsaPrivateKey {
+                d: number(0x51),
+                iqmp: number(0x52),
+                p: number(0x53),
+                q: number(0x54),
+            },
+        };
+        openssh(&PrivateKey::new(KeypairData::Rsa(keypair), "rsa").expect("RSA key"))
+    }
+
+    fn leftovers(paths: &Paths) -> Vec<String> {
+        fs::read_dir(&paths.config_dir)
+            .expect("list config directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.contains("import"))
+            .collect()
+    }
+
+    #[test]
+    fn an_existing_key_is_imported_as_a_private_copy() {
+        let (root, paths) = temp_paths("import");
+        let key = ed25519_key("me@laptop");
+        let source = key_file(&root.join("ssh"), "id_ed25519", &openssh(&key));
+
+        let imported = import_operator(&paths, &source).expect("import key");
+        assert!(imported.created);
+        assert_eq!(
+            imported.fingerprint,
+            key.public_key().fingerprint(HashAlg::Sha256).to_string()
+        );
+        let copy = PrivateKey::read_openssh_file(&imported.private_key_path).expect("read copy");
+        assert_eq!(copy.public_key().key_data(), key.public_key().key_data());
+        assert_eq!(copy.comment(), "me@laptop");
+        let public = fs::read_to_string(&imported.public_key_path).expect("read public key");
+        assert!(public.starts_with("ssh-ed25519 "), "{public}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = fs::metadata(&imported.private_key_path).expect("copy metadata");
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            // A copy, not a link to the source the user may change or remove.
+            assert_eq!(metadata.nlink(), 1);
+            assert_eq!(fs::metadata(&source).expect("source metadata").nlink(), 1);
+        }
+
+        // Importing it again, or loading it, changes nothing.
+        let again = import_operator(&paths, &source).expect("import the same key again");
+        assert!(!again.created);
+        assert_eq!(again.fingerprint, imported.fingerprint);
+        assert_eq!(
+            ensure_operator(&paths).expect("load identity").fingerprint,
+            imported.fingerprint
+        );
+        assert!(leftovers(&paths).is_empty(), "{:?}", leftovers(&paths));
+
+        fs::remove_dir_all(root).expect("clean identity test directory");
+    }
+
+    #[test]
+    fn unusable_keys_are_refused_and_nothing_is_written() {
+        let (root, paths) = temp_paths("import-refused");
+        let ssh = root.join("ssh");
+
+        let protected = passphrase_protected_key();
+        assert!(
+            PrivateKey::from_openssh(&protected)
+                .expect("parse the protected key")
+                .is_encrypted(),
+            "the fixture is not a protected key"
+        );
+        let readable = key_file(&ssh, "readable", &openssh(&ed25519_key("readable")));
+        #[cfg(unix)]
+        fs::set_permissions(&readable, fs::Permissions::from_mode(0o644)).expect("set mode");
+        let public = key_file(
+            &ssh,
+            "id_ed25519.pub",
+            &ed25519_key("")
+                .public_key()
+                .to_openssh()
+                .expect("public key"),
+        );
+
+        for (source, expected) in [
+            (
+                key_file(&ssh, "protected", &protected),
+                "protected by a passphrase",
+            ),
+            (key_file(&ssh, "rsa", &rsa_key()), "requires an Ed25519"),
+            (readable, "accessible by other users"),
+            (public, "as an OpenSSH private key"),
+            (ssh.clone(), "is not a regular file"),
+        ] {
+            let error = import_operator(&paths, &source)
+                .err()
+                .unwrap_or_else(|| panic!("imported {}", source.display()))
+                .to_string();
+            assert!(error.contains(expected), "{}: {error}", source.display());
+            assert!(
+                !paths.config_dir.exists(),
+                "{} left something in the config directory",
+                source.display()
+            );
+        }
+
+        fs::remove_dir_all(root).expect("clean identity test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_being_read() {
+        let (root, paths) = temp_paths("import-fifo");
+        fs::create_dir_all(&root).expect("create test directory");
+        let fifo = root.join("fifo");
+        let encoded = std::ffi::CString::new(fifo.to_str().expect("utf-8 path")).expect("path");
+        // SAFETY: `encoded` is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(
+            unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) },
+            0,
+            "mkfifo"
+        );
+
+        // Reading a FIFO nobody writes blocks: on a thread, so that the test fails instead.
+        let (sent, outcome) = std::sync::mpsc::channel();
+        let thread_paths = paths.clone();
+        std::thread::spawn(move || {
+            let _ = sent.send(
+                import_operator(&thread_paths, &fifo)
+                    .err()
+                    .map(|error| error.to_string()),
+            );
+        });
+        let error = outcome
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("import blocked on the FIFO")
+            .expect("FIFO imported");
+        assert!(error.contains("is not a regular file"), "{error}");
+
+        fs::remove_dir_all(root).expect("clean identity test directory");
+    }
+
+    #[test]
+    fn another_key_never_replaces_the_identity() {
+        let (root, paths) = temp_paths("import-conflict");
+        let current = ensure_operator(&paths).expect("create identity");
+        let other = ed25519_key("other");
+        let source = key_file(&root.join("ssh"), "other", &openssh(&other));
+        let before = fs::read(&current.private_key_path).expect("read identity");
+
+        let error = import_operator(&paths, &source)
+            .err()
+            .expect("another key imported")
+            .to_string();
+        assert!(error.contains(&current.fingerprint), "{error}");
+        assert!(
+            error.contains(&other.public_key().fingerprint(HashAlg::Sha256).to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(&current.private_key_path).expect("read identity"),
+            before
+        );
+        assert!(leftovers(&paths).is_empty(), "{:?}", leftovers(&paths));
+
+        fs::remove_dir_all(root).expect("clean identity test directory");
+    }
+
+    #[test]
+    fn concurrent_imports_publish_one_whole_key() {
+        for same_key in [true, false] {
+            let (root, paths) = temp_paths("import-concurrent");
+            let first = ed25519_key("first");
+            let second = if same_key {
+                first.clone()
+            } else {
+                ed25519_key("second")
+            };
+            let sources = [
+                key_file(&root.join("ssh"), "first", &openssh(&first)),
+                key_file(&root.join("ssh"), "second", &openssh(&second)),
+            ];
+
+            let barrier = Arc::new(Barrier::new(2));
+            let outcomes = sources
+                .map(|source| {
+                    let paths = paths.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        import_operator(&paths, &source)
+                            .map(|identity| identity.created)
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .map(|thread| thread.join().expect("import thread"));
+
+            let published = PrivateKey::read_openssh_file(&paths.config_dir.join("id_ed25519"))
+                .expect("a whole key is published");
+            let created = outcomes
+                .iter()
+                .filter(|outcome| outcome == &&Ok(true))
+                .count();
+            assert_eq!(created, 1, "same_key={same_key}: {outcomes:?}");
+            if same_key {
+                assert!(outcomes.contains(&Ok(false)), "{outcomes:?}");
+            } else {
+                let refused = outcomes
+                    .iter()
+                    .find_map(|outcome| outcome.as_ref().err())
+                    .expect("the other key was refused");
+                assert!(refused.contains("another key"), "{refused}");
+                assert!(
+                    [&first, &second].iter().any(|key| key.public_key().key_data()
+                        == published.public_key().key_data())
+                );
+            }
+            assert!(leftovers(&paths).is_empty(), "{:?}", leftovers(&paths));
+
+            fs::remove_dir_all(root).expect("clean identity test directory");
+        }
     }
 
     const RELAY: &str = "https://relay.example.com";

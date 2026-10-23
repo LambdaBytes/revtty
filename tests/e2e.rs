@@ -2105,6 +2105,62 @@ fn write_settings(role: &Role, content: &str) {
 }
 
 #[test]
+fn an_imported_key_is_the_operator_identity() {
+    let root = TempRoot::new();
+    let (_, agent, relay_role) = prepare(&root);
+    let (_relay, url) = start_relay(&root, &relay_role);
+
+    // A key the operator already has, private as ssh-keygen writes it.
+    let mut key =
+        ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .expect("generate key");
+    key.set_comment("me@laptop");
+    let source = root.path("ssh/id_ed25519");
+    std::fs::create_dir_all(source.parent().expect("key directory")).expect("create key dir");
+    std::fs::write(
+        &source,
+        key.to_openssh(ssh_key::LineEnding::LF).expect("encode key"),
+    )
+    .expect("write key");
+    std::fs::set_permissions(&source, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("set key mode");
+    let fingerprint = key
+        .public_key()
+        .fingerprint(ssh_key::HashAlg::Sha256)
+        .to_string();
+
+    let operator = Role::new(&root, "importer");
+    let source = source.to_str().expect("utf-8 path");
+    let imported = operator.run(&["init", "--key", source]);
+    assert!(imported.contains("identity imported"), "{imported}");
+    assert!(imported.contains(&fingerprint), "{imported}");
+    let again = operator.run(&["init", "--key", source]);
+    assert!(again.contains("identity existing"), "{again}");
+
+    // Agents enrolled for the imported key accept this operator.
+    let host_key = enroll_agent(&root, &relay_role, &operator, &agent, &url);
+    let _agent_process = start_agent(&root, &agent);
+    let listed = operator.run(&["list", "--relay", &url]);
+    assert!(listed.contains(AGENT_NAME), "{listed}");
+    let probe = operator.run(&[
+        "probe",
+        AGENT_NAME,
+        "--relay",
+        &url,
+        "--host-key",
+        &host_key,
+    ]);
+    assert!(probe.contains("status   reachable"), "{probe}");
+
+    // Another key never replaces it.
+    let other = Role::new(&root, "other");
+    other.run(&["init"]);
+    let (status, line) = failure(&other, &["init", "--key", source]);
+    assert_eq!(status, Some(1), "{line}");
+    assert!(line.contains("another key"), "{line}");
+}
+
+#[test]
 fn operator_and_relay_commands_take_their_settings_from_config_toml() {
     let root = TempRoot::new();
     let (operator, agent, relay_role) = prepare(&root);

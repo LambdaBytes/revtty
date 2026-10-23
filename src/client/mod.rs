@@ -2,7 +2,7 @@ mod json;
 mod ssh;
 
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ssh_key::{HashAlg, LineEnding, PrivateKey};
@@ -22,16 +22,19 @@ use crate::transport::{
     refusal_kind, relay_client, valid_name,
 };
 
-pub fn init() -> Result<(), RevttyError> {
+pub fn init(key: Option<&Path>) -> Result<(), RevttyError> {
     let paths = Paths::discover()?;
-    let identity = crate::identity::ensure_operator(&paths)?;
+    let identity = match key {
+        Some(key) => crate::identity::import_operator(&paths, key)?,
+        None => crate::identity::ensure_operator(&paths)?,
+    };
 
     println!(
         "identity {}",
-        if identity.created {
-            "created"
-        } else {
-            "existing"
+        match (identity.created, key) {
+            (true, Some(_)) => "imported",
+            (true, None) => "created",
+            (false, _) => "existing",
         }
     );
     println!("fingerprint {}", identity.fingerprint);

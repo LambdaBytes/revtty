@@ -137,7 +137,7 @@ On the relay host, `revtty relay sessions --db revtty.db` shows the audited sess
 
 | Command | Role | What it does |
 |---|---|---|
-| `init` | operator | Create or show the operator identity. |
+| `init [--key PRIVATE_KEY]` | operator | Create or show the operator identity; `--key` makes an existing OpenSSH Ed25519 key without a passphrase the identity instead, as a copy, and never replaces one already there. |
 | `list --relay URL [--json]` | operator | Agents enrolled for this operator key, with presence and capacity. |
 | `status NAME --relay URL [--host-key FP] [--json]` | operator | One agent's status. |
 | `probe NAME --relay URL [--host-key FP] [--json]` | operator | Round trip through the agent over SSH: name, OS, architecture, version. |

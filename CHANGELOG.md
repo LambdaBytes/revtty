@@ -49,6 +49,7 @@ The format follows Keep a Changelog principles and the project intends to use Se
 - `revtty exec NAME -- COMMAND`: runs one command without a terminal over a new `exec_offer` session (`/v1/exec/{name}`, audited as `exec`). Separate stdout and stderr, forwarded stdin (`-n` to close it), the command's exit status, `--timeout` and Ctrl-C; it never asks for a host key. The agent runs the command in its own process group and ends that group when the session ends first; the relay never sees the command.
 - `--json` on `list`, `status`, `probe` and `exec`: one line of JSON on stdout, with every field always present. `exec --json` keeps up to 16 MiB of each output stream, as UTF-8 text or base64, and prints it with the exit status or signal, at `--timeout` and Ctrl-C too.
 - `agent operator add -` reads the key from stdin, so that an operator can authorize and revoke keys on a target with `revtty exec`; the README describes rotating an operator key that way.
+- `revtty init --key PRIVATE_KEY` makes an existing OpenSSH Ed25519 key the operator identity, as a copy written whole and linked into place. It refuses a key protected by a passphrase, another algorithm, a key file other users can read and anything but a regular file, and never replaces an identity already there: importing the same key again changes nothing, another one is refused with both fingerprints.
 
 ### Changed
 

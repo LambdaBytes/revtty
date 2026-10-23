@@ -12,7 +12,12 @@ pub struct Args {
 #[derive(Subcommand)]
 pub enum Command {
     /// Initialize local operator state.
-    Init,
+    Init {
+        /// Make this existing OpenSSH Ed25519 private key, without a passphrase, the operator
+        /// identity; revtty keeps its own copy. An identity already here is never replaced.
+        #[arg(long, value_name = "PRIVATE_KEY")]
+        key: Option<PathBuf>,
+    },
 
     /// List enrolled machines authorized for this operator.
     List {
@@ -324,6 +329,15 @@ pub enum RelayCommand {
 mod tests {
     use super::Args;
     use clap::Parser;
+
+    #[test]
+    fn parses_init_with_a_key_to_import() {
+        assert!(Args::try_parse_from(["revtty", "init"]).is_ok());
+        assert!(
+            Args::try_parse_from(["revtty", "init", "--key", "/home/me/.ssh/id_ed25519"]).is_ok()
+        );
+        assert!(Args::try_parse_from(["revtty", "init", "--key"]).is_err());
+    }
 
     #[test]
     fn parses_list() {

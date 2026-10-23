@@ -38,7 +38,7 @@ pub async fn run(args: Args) -> Result<u8, RevttyError> {
             )
             .await;
         }
-        Command::Init => crate::client::init(),
+        Command::Init { key } => crate::client::init(key.as_deref()),
         Command::List { relay, json } => crate::client::list(&operator_relay(relay)?, json).await,
         Command::Status {
             target,
